@@ -118,6 +118,9 @@ jobs:
           merge-multiple: true
           path: dist/
 
+      - name: Generate checksums
+        run: cd dist && sha256sum *.deb *.rpm > SHA256SUMS
+
       # podman 4.x does not support index-level --annotation on manifest
       # create; per-image labels are set via LABEL in the Containerfile.
       - name: Push multi-arch OCI manifest
@@ -153,6 +156,7 @@ jobs:
             --notes-file release-notes.md \
             --draft \
             dist/*.deb \
-            dist/*.rpm
+            dist/*.rpm \
+            dist/SHA256SUMS
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

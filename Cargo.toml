@@ -2,9 +2,16 @@
 name = "hypershunt"
 version = "1.0.0-rc7"
 edition = "2024"
+rust-version = "1.87"
 description = "HTTP server and reverse proxy"
 authors = ["Michael Paddon <michael@paddon.org>"]
 license = "BSD-2-Clause"
+readme = "README.md"
+repository = "https://github.com/MichaelPaddon/hypershunt"
+homepage = "https://github.com/MichaelPaddon/hypershunt"
+documentation = "https://github.com/MichaelPaddon/hypershunt/tree/main/docs"
+keywords = ["http", "reverse-proxy", "server", "tls", "http3"]
+categories = ["network-programming", "web-programming::http-server"]
 
 [[bin]]
 name = "hypershunt"
@@ -202,12 +209,28 @@ source = "hypershunt.kdl"
 dest   = "etc/hypershunt.kdl"
 mode   = "644"
 
-# Bundled documentation site, installed verbatim from the repo's
-# `docs/` directory.  cargo-deb 3.x walks the `**` glob so adding
-# files under `docs/` requires no Cargo.toml edit.
+# Bundled documentation site (docsify-rendered Markdown + assets).
+# Enumerated rather than a single `docs/**/*` glob so the raw man page
+# `docs/hypershunt.1` is NOT duplicated here -- it ships as the man page
+# (next asset).  `docs/manual.md` is kept; it's a docsify nav entry.
 [[package.metadata.deb.assets]]
-source = "docs/**/*"
+source = "docs/*.md"
 dest   = "usr/share/doc/hypershunt/site/"
+mode   = "644"
+
+[[package.metadata.deb.assets]]
+source = "docs/index.html"
+dest   = "usr/share/doc/hypershunt/site/"
+mode   = "644"
+
+[[package.metadata.deb.assets]]
+source = "docs/*.png"
+dest   = "usr/share/doc/hypershunt/site/"
+mode   = "644"
+
+[[package.metadata.deb.assets]]
+source = "docs/vendor/**/*"
+dest   = "usr/share/doc/hypershunt/site/vendor/"
 mode   = "644"
 
 [[package.metadata.deb.assets]]
@@ -234,7 +257,7 @@ conf-files = ["/etc/hypershunt.kdl",
 # -- RPM package ---------------------------------------------------
 # Build with:  cargo generate-rpm   (after cargo build --release)
 # Output:      target/generate-rpm/hypershunt-<version>-1.<arch>.rpm
-# Or simply:   make rpm
+# See BUILD.md for the full packaging instructions.
 
 [package.metadata.generate-rpm]
 post_install_script  = "packaging/rpm/postinst.sh"
@@ -257,12 +280,28 @@ dest   = "/etc/hypershunt.kdl"
 mode   = "644"
 config = true
 
-# Bundled documentation site, installed verbatim from the repo's
-# `docs/` directory.  cargo-generate-rpm 0.x supports glob source
-# paths with `**` for recursive matching.
+# Bundled documentation site (docsify-rendered Markdown + assets).
+# Enumerated rather than a single `docs/**/*` glob so the raw man page
+# `docs/hypershunt.1` is NOT duplicated here -- it ships as the man page
+# (next asset).  `docs/manual.md` is kept; it's a docsify nav entry.
 [[package.metadata.generate-rpm.assets]]
-source = "docs/**/*"
+source = "docs/*.md"
 dest   = "/usr/share/doc/hypershunt/site/"
+mode   = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "docs/index.html"
+dest   = "/usr/share/doc/hypershunt/site/"
+mode   = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "docs/*.png"
+dest   = "/usr/share/doc/hypershunt/site/"
+mode   = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "docs/vendor/**/*"
+dest   = "/usr/share/doc/hypershunt/site/vendor/"
 mode   = "644"
 
 [[package.metadata.generate-rpm.assets]]

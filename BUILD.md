@@ -6,8 +6,9 @@ need a couple of extra tools.
 
 ## Prerequisites
 
-- **Rust** — a recent stable toolchain. The crate uses edition 2024, so
-  Rust 1.85 or newer. Install via [rustup](https://rustup.rs).
+- **Rust** — a recent stable toolchain. The crate's MSRV is **1.87**
+  (set as `rust-version` in `Cargo.toml`). Install via
+  [rustup](https://rustup.rs).
 - **System libraries** (build-time):
   - `cmake`, `clang`, `perl`, `pkg-config` — required to build the
     `aws-lc-rs` crypto backend.
