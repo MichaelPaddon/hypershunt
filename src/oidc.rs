@@ -562,7 +562,7 @@ impl OidcProvider {
             return_to,
             created: Instant::now(),
         };
-        self.states.lock().unwrap().insert(state_id.clone(), entry);
+        self.states.lock().expect("oidc state mutex").insert(state_id.clone(), entry);
 
         Some((auth_url, state_id))
     }
@@ -792,7 +792,7 @@ impl OidcProvider {
         let sid = if self.cfg.refresh {
             token_response.refresh_token().map(|rt| {
                 let id = CsrfToken::new_random().secret().clone();
-                self.refreshes.lock().unwrap().insert(
+                self.refreshes.lock().expect("oidc refresh mutex").insert(
                     id.clone(),
                     RefreshEntry {
                         refresh_token: rt.clone(),
@@ -826,13 +826,13 @@ impl OidcProvider {
             .client()
             .ok_or_else(|| anyhow!("OIDC provider not ready"))?;
         let rt = {
-            let map = self.refreshes.lock().unwrap();
+            let map = self.refreshes.lock().expect("oidc refresh mutex");
             let entry = map.get(sid).ok_or_else(|| {
                 anyhow!("unknown OIDC refresh session")
             })?;
             if Instant::now() > entry.expires_at {
                 drop(map);
-                self.refreshes.lock().unwrap().remove(sid);
+                self.refreshes.lock().expect("oidc refresh mutex").remove(sid);
                 bail!("refresh session expired");
             }
             entry.refresh_token.clone()
@@ -850,7 +850,7 @@ impl OidcProvider {
             .inspect_err(|_| {
                 // The IdP's "no" is permanent for this token --
                 // a revoked refresh token never becomes valid again.
-                self.refreshes.lock().unwrap().remove(sid);
+                self.refreshes.lock().expect("oidc refresh mutex").remove(sid);
             })
             .context("OIDC refresh exchange failed")?;
 
@@ -901,7 +901,7 @@ impl OidcProvider {
         let new_sid = match token_response.refresh_token() {
             Some(new_rt) => {
                 let id = CsrfToken::new_random().secret().clone();
-                let mut map = self.refreshes.lock().unwrap();
+                let mut map = self.refreshes.lock().expect("oidc refresh mutex");
                 map.remove(sid);
                 map.insert(
                     id.clone(),
@@ -921,7 +921,7 @@ impl OidcProvider {
                 // freshen the subject/sid since the IdP may have
                 // rotated session identifiers without rotating the
                 // refresh token.
-                let mut map = self.refreshes.lock().unwrap();
+                let mut map = self.refreshes.lock().expect("oidc refresh mutex");
                 if let Some(e) = map.get_mut(sid) {
                     e.expires_at = Instant::now() + self.refresh_ttl;
                     e.id_token = new_id_token_str;
@@ -968,7 +968,7 @@ impl OidcProvider {
 
     #[cfg(test)]
     fn refresh_count(&self) -> usize {
-        self.refreshes.lock().unwrap().len()
+        self.refreshes.lock().expect("oidc refresh mutex").len()
     }
 }
 #[cfg(test)]
@@ -1176,7 +1176,7 @@ pub(crate) mod tests {
     #[test]
     fn refresh_store_evicts_expired_entries() {
         let p = provider_for_store(Duration::from_millis(1));
-        p.refreshes.lock().unwrap().insert(
+        p.refreshes.lock().expect("oidc refresh mutex").insert(
             "sid".into(),
             RefreshEntry {
                 refresh_token: RefreshToken::new("rt".into()),
@@ -1195,7 +1195,7 @@ pub(crate) mod tests {
     #[test]
     fn take_logout_session_returns_stored_id_token() {
         let p = provider_for_store(Duration::from_secs(60));
-        p.refreshes.lock().unwrap().insert(
+        p.refreshes.lock().expect("oidc refresh mutex").insert(
             "sid".into(),
             RefreshEntry {
                 refresh_token: RefreshToken::new("rt".into()),
@@ -1233,7 +1233,7 @@ pub(crate) mod tests {
             .unwrap()
             .as_secs()
             + 600;
-        p.bearer_cache.lock().unwrap().put(
+        p.bearer_cache.lock().expect("oidc bearer cache mutex").put(
             key,
             BearerCacheEntry {
                 identity: id.clone(),
@@ -1250,7 +1250,7 @@ pub(crate) mod tests {
         let p = provider_for_store(Duration::from_secs(60));
         let token = "anything";
         let key: [u8; 32] = sha2::Sha256::digest(token.as_bytes()).into();
-        p.bearer_cache.lock().unwrap().put(
+        p.bearer_cache.lock().expect("oidc bearer cache mutex").put(
             key,
             BearerCacheEntry {
                 identity: Identity {
@@ -1266,7 +1266,7 @@ pub(crate) mod tests {
         // an error, not a cache hit.  Either way, the cache entry
         // must be gone afterwards.
         assert!(p.validate_bearer_token(token).is_err());
-        assert!(p.bearer_cache.lock().unwrap().peek(&key).is_none());
+        assert!(p.bearer_cache.lock().expect("oidc bearer cache mutex").peek(&key).is_none());
     }
 
     #[test]
@@ -1358,7 +1358,7 @@ pub(crate) mod tests {
     #[test]
     fn refresh_store_keeps_live_entries() {
         let p = provider_for_store(Duration::from_secs(60));
-        p.refreshes.lock().unwrap().insert(
+        p.refreshes.lock().expect("oidc refresh mutex").insert(
             "sid".into(),
             RefreshEntry {
                 refresh_token: RefreshToken::new("rt".into()),

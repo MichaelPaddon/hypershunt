@@ -114,7 +114,7 @@ impl OidcProvider {
         // remove every entry for that user (RP-implementation
         // recommended by §2.6).
         let removed = {
-            let mut map = self.refreshes.lock().unwrap();
+            let mut map = self.refreshes.lock().expect("oidc refresh mutex");
             let before = map.len();
             match (sid, sub) {
                 (Some(sid_val), _) => {
@@ -137,7 +137,7 @@ impl OidcProvider {
         let ttl =
             Duration::from_secs(self.cfg.backchannel_jti_ttl_secs);
         let now = Instant::now();
-        let mut map = self.seen_jtis.lock().unwrap();
+        let mut map = self.seen_jtis.lock().expect("oidc jti mutex");
         // Opportunistic prune of long-stale entries so the map
         // doesn't grow unboundedly between scheduled evictions.
         map.retain(|_, expires_at| *expires_at > now);

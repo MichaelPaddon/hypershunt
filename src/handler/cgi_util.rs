@@ -2,11 +2,14 @@
 // build_cgi_env() constructs the standard CGI environment variables;
 // parse_cgi_response() converts script output into an HTTP response.
 
-use crate::error::{HttpResponse, bytes_body};
+use crate::error::{HttpResponse, bytes_body, response_502};
+use crate::error::ReqBody;
 use crate::metrics::Metrics;
+use bytes::Bytes;
+use http_body_util::BodyExt;
 use hyper::{Response, StatusCode};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 // -- In-flight gauge guard -----------------------------------------
 
@@ -34,6 +37,23 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         (self.sel)(&self.metrics).fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+// -- Body collection -----------------------------------------------
+
+/// Collect a streaming request body into bytes.  Increments `errors`
+/// and returns an `Err(502)` response if the body stream fails.
+/// Used by the CGI-family handlers (CGI, FastCGI, SCGI) so the error
+/// path is not repeated three times.
+pub async fn collect_body(
+    body: ReqBody,
+    errors: &AtomicU64,
+) -> Result<Bytes, HttpResponse> {
+    BodyExt::collect(body).await.map(|c| c.to_bytes()).map_err(|e| {
+        errors.fetch_add(1, Ordering::Relaxed);
+        tracing::error!("failed to read request body: {e}");
+        response_502()
+    })
 }
 
 // -- CGI environment -----------------------------------------------

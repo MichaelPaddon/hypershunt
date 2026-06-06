@@ -235,7 +235,7 @@ impl HypershuntService {
                 path.strip_prefix("/.well-known/acme-challenge/")
             {
                 let key_auth =
-                    state.acme_challenges.lock().unwrap().get(token).cloned();
+                    state.acme_challenges.lock().expect("acme challenges mutex").get(token).cloned();
                 if let Some(body) = key_auth {
                     let resp = Response::builder()
                         .status(StatusCode::OK)

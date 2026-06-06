@@ -2,14 +2,13 @@
 // scripts under the configured document root.  Unix only; uses execve(2)
 // via std::process::Command with a CGI-standard environment.
 
-use super::cgi_util::{InFlightGuard, build_cgi_env, parse_cgi_response};
+use super::cgi_util::{InFlightGuard, build_cgi_env, collect_body, parse_cgi_response};
 use crate::error::{HttpResponse, response_404, response_502};
 use crate::error::ReqBody;
 use crate::handler::Handler;
 use crate::headers::RequestContext;
 use crate::metrics::Metrics;
 use async_trait::async_trait;
-use http_body_util::BodyExt;
 use hyper::Request;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -18,6 +17,11 @@ use std::sync::atomic::Ordering;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+pub struct CgiHandler {
+    root: PathBuf,
+    metrics: Arc<Metrics>,
+}
+
 #[async_trait]
 impl Handler for CgiHandler {
     async fn handle(
@@ -25,28 +29,6 @@ impl Handler for CgiHandler {
         req: Request<ReqBody>,
         matched_prefix: &str,
         _ctx: &RequestContext<'_>,
-    ) -> HttpResponse {
-        self.serve(req, matched_prefix).await
-    }
-}
-
-pub struct CgiHandler {
-    root: PathBuf,
-    metrics: Arc<Metrics>,
-}
-
-impl CgiHandler {
-    pub fn new(root: &str, metrics: Arc<Metrics>) -> Self {
-        Self {
-            root: PathBuf::from(root),
-            metrics,
-        }
-    }
-
-    pub async fn serve(
-        &self,
-        req: Request<ReqBody>,
-        matched_prefix: &str,
     ) -> HttpResponse {
         self.metrics.cgi_requests_total.fetch_add(1, Ordering::Relaxed);
         let _guard = InFlightGuard::new(
@@ -72,15 +54,14 @@ impl CgiHandler {
             }
         };
 
-        let body_bytes = match BodyExt::collect(body).await {
-            Ok(c) => c.to_bytes(),
-            Err(e) => {
-                self.metrics
-                    .cgi_errors_total
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::error!("failed to read request body: {e}");
-                return response_502();
-            }
+        let body_bytes = match collect_body(
+            body,
+            &self.metrics.cgi_errors_total,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(resp) => return resp,
         };
 
         // No index for CGI -- build_cgi_env called with None.
@@ -161,6 +142,15 @@ impl CgiHandler {
                 );
                 response_502()
             }
+        }
+    }
+}
+
+impl CgiHandler {
+    pub fn new(root: &str, metrics: Arc<Metrics>) -> Self {
+        Self {
+            root: PathBuf::from(root),
+            metrics,
         }
     }
 }

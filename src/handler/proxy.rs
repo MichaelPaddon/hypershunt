@@ -121,17 +121,6 @@ pub struct ProxyHandler {
     metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
-#[async_trait]
-impl Handler for ProxyHandler {
-    async fn handle(
-        &self,
-        req: Request<ReqBody>,
-        matched_prefix: &str,
-        _ctx: &RequestContext<'_>,
-    ) -> HttpResponse {
-        self.serve(req, matched_prefix).await
-    }
-}
 
 impl ProxyHandler {
     /// Single-upstream constructor.  Retained as the entry point for
@@ -271,10 +260,15 @@ impl ProxyHandler {
         self.inners[0].prepare_backend_request(req, matched_prefix)
     }
 
-    pub async fn serve(
+}
+
+#[async_trait]
+impl Handler for ProxyHandler {
+    async fn handle(
         &self,
         mut req: Request<ReqBody>,
         matched_prefix: &str,
+        _ctx: &RequestContext<'_>,
     ) -> HttpResponse {
         let peer_ip = req
             .extensions()
@@ -382,7 +376,9 @@ impl ProxyHandler {
         }
         last_resp.unwrap_or_else(response_502)
     }
+}
 
+impl ProxyHandler {
     fn upstream_index(
         &self,
         target: &Arc<crate::lb::Upstream>,
@@ -703,10 +699,27 @@ mod skip_verify_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::headers::RequestContext;
     use hyper::header::HeaderValue;
 
     fn uri(s: &str) -> Uri {
         s.parse().unwrap()
+    }
+
+    fn dummy_ctx() -> RequestContext<'static> {
+        RequestContext {
+            client_ip: "127.0.0.1",
+            username: "",
+            groups: "",
+            method: "GET",
+            path: "/",
+            query: "",
+            path_and_query: "/",
+            host: "localhost",
+            scheme: "http",
+            client_cert_subject: "",
+            client_cert_sans: "",
+        }
     }
 
     // -- ProxyHandler::new scheme validation ----------------------
@@ -965,7 +978,7 @@ mod tests {
                                 use http_body_util::BodyExt;
                                 let req = req.map(|b| b.boxed_unsync());
                                 Ok::<_, std::convert::Infallible>(
-                                    h.serve(req, "/").await,
+                                    h.handle(req, "/", &dummy_ctx()).await,
                                 )
                             }
                         },
@@ -1052,7 +1065,7 @@ mod tests {
                                 use http_body_util::BodyExt;
                                 let req = req.map(|b| b.boxed_unsync());
                                 Ok::<_, std::convert::Infallible>(
-                                    h.serve(req, "/").await,
+                                    h.handle(req, "/", &dummy_ctx()).await,
                                 )
                             }
                         },
@@ -1212,7 +1225,7 @@ mod tests {
                     .boxed_unsync(),
             )
             .unwrap();
-        let resp = h.serve(req, "/").await;
+        let resp = h.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status().as_u16(), 200);
         assert_eq!(
             metrics
@@ -1258,7 +1271,7 @@ mod tests {
                     .boxed_unsync(),
             )
             .unwrap();
-        let resp = h.serve(req, "/").await;
+        let resp = h.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status().as_u16(), 503);
         assert_eq!(
             metrics
@@ -1305,7 +1318,7 @@ mod tests {
                     .boxed_unsync(),
             )
             .unwrap();
-        let resp = h.serve(req, "/").await;
+        let resp = h.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status().as_u16(), 500);
         assert_eq!(
             metrics
@@ -1436,7 +1449,7 @@ mod tests {
                     .boxed_unsync(),
             )
             .unwrap();
-        let resp = h.serve(req, "/").await;
+        let resp = h.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status().as_u16(), 200);
         let collected =
             resp.into_body().collect().await.unwrap().to_bytes();
@@ -1495,10 +1508,10 @@ mod tests {
                 .unwrap()
         };
         // First two requests hit upstreams and eject them.
-        let _ = h.serve(mk_req(), "/").await;
-        let _ = h.serve(mk_req(), "/").await;
+        let _ = h.handle(mk_req(), "/", &dummy_ctx()).await;
+        let _ = h.handle(mk_req(), "/", &dummy_ctx()).await;
         // Third: every upstream ejected -> pool.pick returns None.
-        let resp = h.serve(mk_req(), "/").await;
+        let resp = h.handle(mk_req(), "/", &dummy_ctx()).await;
         assert_eq!(resp.status().as_u16(), 502);
         assert!(
             metrics
@@ -1561,7 +1574,7 @@ mod tests {
                     .boxed_unsync(),
             )
             .unwrap();
-        let resp = h.serve(req, "/").await;
+        let resp = h.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status().as_u16(), 200);
         assert_eq!(
             metrics

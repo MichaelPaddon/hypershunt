@@ -484,7 +484,7 @@ impl InnerProxyClient {
         let on_upgrade_arc = marker.on_upgrade.clone();
         let inbound = marker.inbound;
         tokio::spawn(async move {
-            let inbound_on = match on_upgrade_arc.lock().unwrap().take() {
+            let inbound_on = match on_upgrade_arc.lock().expect("proxy upgrade mutex").take() {
                 Some(f) => f,
                 None => return,
             };

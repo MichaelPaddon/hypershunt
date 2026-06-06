@@ -14,17 +14,6 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-#[async_trait]
-impl Handler for StaticHandler {
-    async fn handle(
-        &self,
-        req: Request<ReqBody>,
-        matched_prefix: &str,
-        _ctx: &RequestContext<'_>,
-    ) -> HttpResponse {
-        self.serve(req, matched_prefix).await
-    }
-}
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame};
@@ -95,10 +84,15 @@ impl StaticHandler {
         }
     }
 
-    pub async fn serve(
+}
+
+#[async_trait]
+impl Handler for StaticHandler {
+    async fn handle(
         &self,
         req: Request<ReqBody>,
         matched_prefix: &str,
+        _ctx: &RequestContext<'_>,
     ) -> HttpResponse {
         let uri_path = req.uri().path();
 
@@ -317,7 +311,9 @@ impl StaticHandler {
             }
         }
     }
+}
 
+impl StaticHandler {
     async fn resolve_index(&self, dir: &Path) -> Option<PathBuf> {
         for name in &self.index_files {
             let candidate = dir.join(name);
@@ -886,7 +882,25 @@ fn is_not_modified(req: &Request<ReqBody>, etag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::headers::RequestContext;
     use std::path::Path;
+
+    /// Dummy `RequestContext` for tests where context is not inspected.
+    fn dummy_ctx() -> RequestContext<'static> {
+        RequestContext {
+            client_ip: "127.0.0.1",
+            username: "",
+            groups: "",
+            method: "GET",
+            path: "/",
+            query: "",
+            path_and_query: "/",
+            host: "localhost",
+            scheme: "http",
+            client_cert_subject: "",
+            client_cert_sans: "",
+        }
+    }
 
     /// Fresh metrics sink for handler constructors in tests.
     fn test_metrics() -> Arc<Metrics> {
@@ -1285,7 +1299,7 @@ mod tests {
             .uri("/")
             .body(empty_req_body())
             .unwrap();
-        let resp = handler.serve(req, "/").await;
+        let resp = handler.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = http_body_util::BodyExt::collect(resp.into_body())
             .await
@@ -1312,7 +1326,7 @@ mod tests {
             .uri("/")
             .body(empty_req_body())
             .unwrap();
-        let resp = handler.serve(req, "/").await;
+        let resp = handler.handle(req, "/", &dummy_ctx()).await;
         let body = http_body_util::BodyExt::collect(resp.into_body())
             .await
             .unwrap()
@@ -1339,7 +1353,7 @@ mod tests {
             .uri("/sub")
             .body(empty_req_body())
             .unwrap();
-        let resp = handler.serve(req, "/").await;
+        let resp = handler.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY);
         assert_eq!(
             resp.headers().get("Location").unwrap(),
@@ -1365,7 +1379,7 @@ mod tests {
             .uri("/")
             .body(empty_req_body())
             .unwrap();
-        let resp = handler.serve(req, "/").await;
+        let resp = handler.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -1382,7 +1396,7 @@ mod tests {
             .uri("/")
             .body(empty_req_body())
             .unwrap();
-        let resp = h.serve(req, "/").await;
+        let resp = h.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status(), StatusCode::FOUND);
         assert_eq!(
             resp.headers().get(hyper::header::LOCATION).unwrap(),
@@ -1405,7 +1419,7 @@ mod tests {
             .uri("/")
             .body(empty_req_body())
             .unwrap();
-        let resp = h.serve(req, "/").await;
+        let resp = h.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -1421,7 +1435,7 @@ mod tests {
             .uri("/random/path")
             .body(empty_req_body())
             .unwrap();
-        let resp = h.serve(req, "/").await;
+        let resp = h.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

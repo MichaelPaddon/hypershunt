@@ -34,7 +34,7 @@ impl OidcProvider {
         // Fast path: cached identity if still within token validity.
         let key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         {
-            let mut cache = self.bearer_cache.lock().unwrap();
+            let mut cache = self.bearer_cache.lock().expect("oidc bearer cache mutex");
             if let Some(entry) = cache.get(&key) {
                 if entry.expires_at > now {
                     return Ok(entry.identity.clone());
@@ -121,7 +121,7 @@ impl OidcProvider {
         let identity = Identity { username, groups };
 
         // Cache the verified identity until the token's own exp.
-        self.bearer_cache.lock().unwrap().put(
+        self.bearer_cache.lock().expect("oidc bearer cache mutex").put(
             key,
             BearerCacheEntry {
                 identity: identity.clone(),

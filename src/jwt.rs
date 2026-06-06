@@ -167,7 +167,7 @@ impl JwtManager {
 
         // Fast path: return cached identity if not yet expired.
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock().expect("jwt cache mutex");
             if let Some(cached) = cache.get(&key) {
                 if cached.exp > now {
                     return JwtResult::Valid(cached.identity.clone());
@@ -261,7 +261,7 @@ impl JwtManager {
             .unwrap_or_default();
 
         let identity = Identity { username, groups };
-        self.cache.lock().unwrap().put(
+        self.cache.lock().expect("jwt cache mutex").put(
             key,
             CachedToken {
                 identity: identity.clone(),

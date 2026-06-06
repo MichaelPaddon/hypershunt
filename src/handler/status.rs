@@ -23,17 +23,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod render_html;
 mod render_json;
 
-#[async_trait]
-impl Handler for StatusHandler {
-    async fn handle(
-        &self,
-        req: Request<ReqBody>,
-        matched_prefix: &str,
-        _ctx: &RequestContext<'_>,
-    ) -> HttpResponse {
-        self.serve(req, matched_prefix).await
-    }
-}
 
 // -- Server summary ------------------------------------------------
 
@@ -314,10 +303,15 @@ impl StatusHandler {
         rows
     }
 
-    pub async fn serve(
+}
+
+#[async_trait]
+impl Handler for StatusHandler {
+    async fn handle(
         &self,
         req: Request<ReqBody>,
         matched_prefix: &str,
+        _ctx: &RequestContext<'_>,
     ) -> HttpResponse {
         // Logo requests are intercepted before content-negotiation so
         // the browser can cache the PNG asset independently of the page.
@@ -1310,7 +1304,6 @@ mod tests {
     #[tokio::test]
     async fn serve_logo_304_on_matching_etag() {
         use http_body_util::BodyExt;
-        use hyper::header::HeaderValue;
         use hyper::HeaderMap;
         // First request to learn the ETag.
         let resp =
