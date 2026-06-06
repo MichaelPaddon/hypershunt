@@ -317,7 +317,10 @@ impl ProxyHandler {
             };
             let idx = self.upstream_index(&upstream);
             let _guard = upstream.in_flight_guard();
+            let req_bytes = content_length(req.headers());
+            let start = std::time::Instant::now();
             let resp = self.inners[idx].serve(req, matched_prefix).await;
+            self.record_upstream(start, req_bytes, &resp);
             self.record_outcome(&upstream, resp.status().as_u16());
             return resp;
         }
@@ -357,9 +360,11 @@ impl ProxyHandler {
             .map_err(|never| match never {})
             .boxed_unsync();
             let attempt_req = Request::from_parts(parts.clone(), body);
+            let start = std::time::Instant::now();
             let resp = self.inners[idx]
                 .serve(attempt_req, matched_prefix)
                 .await;
+            self.record_upstream(start, collected.len() as u64, &resp);
             let status = resp.status().as_u16();
             self.record_outcome(&upstream, status);
             let trigger = self.should_retry(status);
@@ -390,6 +395,28 @@ impl ProxyHandler {
             .expect("upstream from pool exists in pool.upstreams")
     }
 
+    /// Record one upstream round-trip: response latency, plus body
+    /// bytes relayed in each direction.  Byte counts come from the
+    /// `Content-Length` headers and so undercount chunked/streamed
+    /// bodies that omit the header -- an accepted approximation that
+    /// avoids wrapping every body in a counting adapter.
+    fn record_upstream(
+        &self,
+        start: std::time::Instant,
+        req_bytes: u64,
+        resp: &HttpResponse,
+    ) {
+        if let Some(m) = &self.metrics {
+            m.record_proxy_upstream_latency(start.elapsed().as_millis());
+            m.proxy_upstream_bytes_out_total
+                .fetch_add(req_bytes, std::sync::atomic::Ordering::Relaxed);
+            m.proxy_upstream_bytes_in_total.fetch_add(
+                content_length(resp.headers()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
     fn record_outcome(
         &self,
         upstream: &crate::lb::Upstream,
@@ -408,6 +435,17 @@ impl ProxyHandler {
         // fallback case.
         self.retry_on_status.contains(&status)
     }
+}
+
+/// Parse a `Content-Length` header into a byte count, or 0 when it is
+/// absent or unparseable (e.g. chunked transfer).  Used for best-effort
+/// upstream throughput accounting.
+fn content_length(headers: &hyper::HeaderMap) -> u64 {
+    headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Minimal hyper-util-backed health prober.  One probe-client is

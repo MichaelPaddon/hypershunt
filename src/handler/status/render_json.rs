@@ -1,7 +1,7 @@
 // JSON status-page renderer.  Output schema mirrors what the JavaScript
 // in render_html.rs polls on a 3-second interval.
 
-use super::ServerSummary;
+use super::{ServerSummary, UpstreamRow};
 use crate::cert::state::CertState;
 use crate::error::{HttpResponse, bytes_body};
 use crate::metrics::{Snapshot, SparklineData, TimePeriod};
@@ -15,6 +15,7 @@ pub(super) fn render_json(
     period: TimePeriod,
     sum: &ServerSummary,
     certs: &[CertState],
+    upstreams: &[UpstreamRow],
 ) -> HttpResponse {
     let listeners: Vec<_> = sum
         .listeners
@@ -111,6 +112,167 @@ pub(super) fn render_json(
         .map(|(p, c)| serde_json::json!([p, c]))
         .collect();
 
+    // Per-handler-type and per-vhost request breakdowns.
+    let class_obj = |c: &crate::metrics::ClassSnapshot| {
+        serde_json::json!({
+            "total": c.total, "2xx": c.s2xx, "3xx": c.s3xx,
+            "4xx": c.s4xx, "5xx": c.s5xx,
+        })
+    };
+    // Each row carries its label (`handler`/`vhost`) plus the class
+    // counts, flattened into one object.
+    let labelled = |key: &str, name: &str, c: &crate::metrics::ClassSnapshot| {
+        let mut o = serde_json::Map::new();
+        o.insert(key.into(), name.into());
+        if let Some(m) = class_obj(c).as_object() {
+            o.extend(m.clone());
+        }
+        serde_json::Value::Object(o)
+    };
+    let by_handler: Vec<_> = s
+        .by_handler
+        .iter()
+        .map(|(name, c)| labelled("handler", name, c))
+        .collect();
+    let by_vhost: Vec<_> = s
+        .by_vhost
+        .iter()
+        .map(|(name, c)| labelled("vhost", name, c))
+        .collect();
+    let upstreams_json: Vec<_> = upstreams
+        .iter()
+        .map(|u| {
+            serde_json::json!({
+                "label":     u.label,
+                "url":       u.url,
+                "weight":    u.weight,
+                "in_flight": u.in_flight,
+                "healthy":   u.healthy,
+                "ejected":   u.ejected,
+            })
+        })
+        .collect();
+
+    // Build the newly-surfaced subsystem blocks as standalone values;
+    // the top-level `json!` below merely references them, which keeps
+    // any single macro expansion small enough for the recursion limit.
+    let stream_json = serde_json::json!({
+        "conns_active": s.stream.conns_active,
+        "conns_total":  s.stream.conns_total,
+        "bytes_in":     s.stream.bytes_in,
+        "bytes_out":    s.stream.bytes_out,
+    });
+    let datagram_json = serde_json::json!({
+        "flows_active":  s.datagram.flows_active,
+        "datagrams_in":  s.datagram.datagrams_in,
+        "datagrams_out": s.datagram.datagrams_out,
+        "bytes_in":      s.datagram.bytes_in,
+        "bytes_out":     s.datagram.bytes_out,
+        "flow_create":   s.datagram.flow_create,
+        "flow_evict":    s.datagram.flow_evict,
+    });
+    let compression_json = serde_json::json!({
+        "responses": s.compression.responses,
+        "skipped":   s.compression.skipped,
+        "bytes_in":  s.compression.bytes_in,
+        "bytes_out": s.compression.bytes_out,
+        "gzip":      s.compression.gzip,
+        "brotli":    s.compression.brotli,
+        "zstd":      s.compression.zstd,
+    });
+    let tls_json = serde_json::json!({
+        "handshakes": s.tls.handshakes,
+        "failures":   s.tls.failures,
+        "timeouts":   s.tls.timeouts,
+    });
+    let geoip_json = serde_json::json!({
+        "lookups": s.geoip.lookups,
+        "misses":  s.geoip.misses,
+    });
+    let shutdown_json = serde_json::json!({
+        "drained":   s.shutdown.drained,
+        "abandoned": s.shutdown.abandoned,
+    });
+    let acme_json = serde_json::json!({
+        "issuances":         s.acme.issuances,
+        "issuance_failures": s.acme.issuance_failures,
+        "renewals":          s.acme.renewals,
+        "renewal_failures":  s.acme.renewal_failures,
+    });
+    let ocsp_json = serde_json::json!({
+        "refreshes":        s.ocsp.refreshes,
+        "refresh_failures": s.ocsp.refresh_failures,
+    });
+    let proxy_lb_json = serde_json::json!({
+        "picks":             s.lb.picks,
+        "no_upstream":       s.lb.no_upstream,
+        "retries":           s.lb.retries,
+        "ejections":         s.lb.ejections,
+        "health_failures":   s.lb.health_failures,
+        "health_recoveries": s.lb.health_recoveries,
+        "health_checks":     s.lb.health_checks,
+    });
+    let proxy_upstream_json = serde_json::json!({
+        "bytes_in":       s.upstream.bytes_in,
+        "bytes_out":      s.upstream.bytes_out,
+        "connect_errors": s.upstream.connect_errors,
+        "latency_ms": {
+            "lt_1":    s.upstream.latency[0],
+            "lt_10":   s.upstream.latency[1],
+            "lt_50":   s.upstream.latency[2],
+            "lt_200":  s.upstream.latency[3],
+            "lt_1000": s.upstream.latency[4],
+            "ge_1000": s.upstream.latency[5],
+        },
+    });
+    let rate_limit_json = serde_json::json!({
+        "triggers":    s.rate_limit.triggers,
+        "active_keys": s.rate_limit.active_keys,
+    });
+    let oidc_json = serde_json::json!({
+        "refreshes":            s.oidc.refreshes,
+        "refresh_failures":     s.oidc.refresh_failures,
+        "logouts":              s.oidc.logouts,
+        "discoveries":          s.oidc.discoveries,
+        "discovery_failures":   s.oidc.discovery_failures,
+        "userinfo_failures":    s.oidc.userinfo_failures,
+        "backchannel_logouts":  s.oidc.backchannel_logouts,
+        "backchannel_failures": s.oidc.backchannel_failures,
+        "bearer_validations":   s.oidc.bearer_validations,
+        "bearer_failures":      s.oidc.bearer_failures,
+        "revocations":          s.oidc.revocations,
+        "revocation_failures":  s.oidc.revocation_failures,
+        "callback_iss_mismatches": s.oidc.callback_iss_mismatches,
+    });
+    let http_conns_json = serde_json::json!({
+        "active": s.http_conns.active,
+        "total":  s.http_conns.total,
+    });
+    let backends_json = serde_json::json!({
+        "fcgi": {
+            "requests":  s.fcgi.requests,
+            "errors":    s.fcgi.errors,
+            "in_flight": s.fcgi.in_flight,
+        },
+        "scgi": {
+            "requests":  s.scgi.requests,
+            "errors":    s.scgi.errors,
+            "in_flight": s.scgi.in_flight,
+        },
+        "cgi": {
+            "requests":       s.cgi.requests,
+            "errors":         s.cgi.errors,
+            "in_flight":      s.cgi.in_flight,
+            "spawn_failures": s.cgi.spawn_failures,
+            "timeouts":       s.cgi.timeouts,
+        },
+        "static": {
+            "bytes_served": s.static_files.bytes_served,
+            "not_modified": s.static_files.not_modified,
+            "range":        s.static_files.range,
+        },
+    });
+
     let body = serde_json::json!({
         "version":              sum.version,
         "pid":                  std::process::id(),
@@ -158,6 +320,27 @@ pub(super) fn render_json(
             "requests_total":           s.quic_requests_total,
             "outbound_handshakes_total": s.quic_outbound_handshakes_total,
         },
+        // Newly-surfaced subsystem groups, assembled separately above
+        // to keep the `json!` expansion under the macro recursion
+        // limit.  Emitted unconditionally; an unused subsystem reports
+        // zeros, exactly as `http3` does on a TCP-only deployment.
+        "stream":         stream_json,
+        "datagram":       datagram_json,
+        "compression":    compression_json,
+        "tls":            tls_json,
+        "geoip":          geoip_json,
+        "shutdown":       shutdown_json,
+        "acme":           acme_json,
+        "ocsp":           ocsp_json,
+        "proxy_lb":       proxy_lb_json,
+        "proxy_upstream": proxy_upstream_json,
+        "rate_limit":     rate_limit_json,
+        "oidc":           oidc_json,
+        "http_conns":     http_conns_json,
+        "backends":       backends_json,
+        "by_handler":     by_handler,
+        "by_vhost":       by_vhost,
+        "upstreams":      upstreams_json,
         "period": period.as_str(),
         "sparkline": {
             "step_secs":  sp.step_secs,

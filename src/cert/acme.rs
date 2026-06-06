@@ -4,6 +4,7 @@
 
 use crate::config::TlsOptions;
 use crate::cert::tls;
+use crate::metrics::Metrics;
 use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -111,6 +112,9 @@ pub struct AcmeManager {
     /// store; otherwise the resolver would lose its ALPN-01 hook
     /// after the first renewal.
     alpn_store: Option<crate::cert::acme_alpn::AlpnChallengeStore>,
+    /// Optional metrics sink for issuance/renewal event counters.
+    /// `None` in tests and until `with_metrics` is called.
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl AcmeManager {
@@ -191,6 +195,7 @@ impl AcmeManager {
             provisioner,
             cert_state: None,
             alpn_store: None,
+            metrics: None,
         }
     }
 
@@ -203,6 +208,24 @@ impl AcmeManager {
     ) -> Self {
         self.cert_state = Some(state);
         self
+    }
+
+    /// Attach the shared metrics so issuance/renewal events are
+    /// counted.  Chained alongside `with_cert_state` at construction.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Increment one ACME event counter when a metrics sink is
+    /// attached; a no-op otherwise (tests, or before `with_metrics`).
+    fn count(
+        &self,
+        sel: impl Fn(&Metrics) -> &std::sync::atomic::AtomicU64,
+    ) {
+        if let Some(m) = &self.metrics {
+            sel(m).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     // Return the directory where cert.pem and key.pem are stored.
@@ -220,9 +243,13 @@ impl AcmeManager {
                 domains = ?self.config.domains,
                 "acquiring ACME certificate"
             );
-            self.acquire_cert()
-                .await
-                .context("ACME certificate acquisition")?;
+            match self.acquire_cert().await {
+                Ok(()) => self.count(|m| &m.acme_issuances_total),
+                Err(e) => {
+                    self.count(|m| &m.acme_issuance_failures_total);
+                    return Err(e).context("ACME certificate acquisition");
+                }
+            }
             tracing::info!(
                 domains = ?self.config.domains,
                 "ACME certificate acquired"
@@ -279,6 +306,7 @@ impl AcmeManager {
                                     let _ = cert_tx.send(Arc::new(pair));
                                     self.publish_cert_state();
                                     last_failed = false;
+                                    self.count(|m| &m.acme_renewals_total);
                                     tracing::info!(
                                         cert = self.config.cert_name(),
                                         "ACME certificate acquired and \
@@ -287,6 +315,9 @@ impl AcmeManager {
                                 }
                                 Err(e) => {
                                     last_failed = true;
+                                    self.count(
+                                        |m| &m.acme_renewal_failures_total,
+                                    );
                                     tracing::error!(
                                         "failed to build acceptor from \
                                          renewed ACME cert: {e:#}"
@@ -296,6 +327,7 @@ impl AcmeManager {
                         }
                         Err(e) => {
                             last_failed = true;
+                            self.count(|m| &m.acme_renewal_failures_total);
                             tracing::error!(
                                 "failed to load ACME cert: {e:#}"
                             );
@@ -304,6 +336,7 @@ impl AcmeManager {
                 }
                 Err(e) => {
                     last_failed = true;
+                    self.count(|m| &m.acme_renewal_failures_total);
                     tracing::warn!(
                         cert = self.config.cert_name(),
                         retry_secs = self.config.retry_interval.as_secs(),

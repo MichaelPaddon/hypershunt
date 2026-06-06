@@ -18,6 +18,7 @@ use crate::metrics::{Metrics, TimePeriod};
 use async_trait::async_trait;
 use hyper::Request;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod render_html;
 mod render_json;
@@ -233,17 +234,43 @@ fn handler_type_name(h: &HandlerConfig) -> &'static str {
     }
 }
 
+// -- Reverse-proxy pool registry -----------------------------------
+
+/// One reverse-proxy pool plus a human label (vhost + location path),
+/// collected at router-construction time so the status page can render
+/// a live per-upstream health table.
+pub struct LbPoolEntry {
+    pub label: String,
+    pub pool: Arc<crate::lb::UpstreamPool>,
+}
+
+/// Shared registry of all reverse-proxy pools.  Built fresh on every
+/// router build (startup and SIGHUP), so a wholesale `AppState` swap
+/// keeps the table consistent after reload — no per-entry locking.
+pub type SharedLbRegistry = Arc<arc_swap::ArcSwap<Vec<LbPoolEntry>>>;
+
+/// Flattened, point-in-time view of one upstream for the renderers.
+pub struct UpstreamRow {
+    pub label: String,
+    pub url: String,
+    pub weight: u32,
+    pub in_flight: u32,
+    pub healthy: bool,
+    pub ejected: bool,
+}
+
 // -- Handler -------------------------------------------------------
 
 pub struct StatusHandler {
     metrics: Arc<Metrics>,
     summary: Arc<ServerSummary>,
     cert_state: Option<SharedCertState>,
+    lb_registry: Option<SharedLbRegistry>,
 }
 
 impl StatusHandler {
     pub fn new(metrics: Arc<Metrics>, summary: Arc<ServerSummary>) -> Self {
-        Self { metrics, summary, cert_state: None }
+        Self { metrics, summary, cert_state: None, lb_registry: None }
     }
 
     pub fn with_cert_state(mut self, state: SharedCertState) -> Self {
@@ -251,10 +278,40 @@ impl StatusHandler {
         self
     }
 
+    pub fn with_lb_registry(mut self, registry: SharedLbRegistry) -> Self {
+        self.lb_registry = Some(registry);
+        self
+    }
+
     fn read_cert_states(&self) -> Vec<CertState> {
         self.cert_state.as_ref().map_or_else(Vec::new, |s| {
             s.read().unwrap_or_else(|p| p.into_inner()).clone()
         })
+    }
+
+    /// Flatten the pool registry into per-upstream rows for rendering.
+    fn read_upstreams(&self) -> Vec<UpstreamRow> {
+        let Some(reg) = &self.lb_registry else {
+            return Vec::new();
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut rows = Vec::new();
+        for entry in reg.load().iter() {
+            for u in entry.pool.upstreams() {
+                rows.push(UpstreamRow {
+                    label: entry.label.clone(),
+                    url: u.url.clone(),
+                    weight: u.weight,
+                    in_flight: u.in_flight(),
+                    healthy: u.is_healthy(),
+                    ejected: u.is_ejected(now_ms),
+                });
+            }
+        }
+        rows
     }
 
     pub async fn serve(
@@ -267,15 +324,16 @@ impl StatusHandler {
         let sparkline = self.metrics.sparkline_for_period(period);
         let top_paths = self.metrics.paths_for_period(period);
         let certs = self.read_cert_states();
+        let upstreams = self.read_upstreams();
         if accept_json(req.headers()) || query_wants_json(req.uri()) {
             render_json::render_json(
                 &snap, &sparkline, &top_paths, period,
-                &self.summary, &certs,
+                &self.summary, &certs, &upstreams,
             )
         } else {
             render_html::render_html(
                 &snap, &sparkline, &top_paths, period,
-                &self.summary, &certs,
+                &self.summary, &certs, &upstreams,
             )
         }
     }
@@ -353,6 +411,7 @@ mod tests {
             quic_connections_active: 0,
             quic_requests_total: 0,
             quic_outbound_handshakes_total: 0,
+            ..Default::default()
         }
     }
 
@@ -461,6 +520,7 @@ mod tests {
             TimePeriod::Min15,
             &sample_summary(),
             &[],
+            &[],
         );
         assert_eq!(resp.status(), 200);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -485,6 +545,7 @@ mod tests {
             &paths,
             TimePeriod::Min15,
             &sample_summary(),
+            &[],
             &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -512,6 +573,7 @@ mod tests {
             TimePeriod::Min15,
             &sample_summary(),
             &[],
+            &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -535,6 +597,7 @@ mod tests {
             TimePeriod::Min15,
             &sample_summary(),
             &certs,
+            &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -551,6 +614,7 @@ mod tests {
             &paths,
             TimePeriod::Min15,
             &sample_summary(),
+            &[],
             &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -570,6 +634,7 @@ mod tests {
             &paths,
             TimePeriod::Min15,
             &sample_summary(),
+            &[],
             &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -591,6 +656,7 @@ mod tests {
             TimePeriod::Min15,
             &sample_summary(),
             &[],
+            &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -610,6 +676,7 @@ mod tests {
             &paths,
             TimePeriod::Min15,
             &sample_summary(),
+            &[],
             &[],
         );
         assert_eq!(resp.status(), 200);
@@ -634,6 +701,7 @@ mod tests {
             TimePeriod::Min15,
             &sample_summary(),
             &[],
+            &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -656,6 +724,7 @@ mod tests {
             TimePeriod::Min15,
             &sample_summary(),
             &[],
+            &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -672,6 +741,7 @@ mod tests {
             &paths,
             TimePeriod::Min15,
             &sample_summary(),
+            &[],
             &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -702,6 +772,7 @@ mod tests {
             TimePeriod::Min15,
             &sample_summary(),
             &certs,
+            &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -719,6 +790,7 @@ mod tests {
             &paths,
             TimePeriod::Min15,
             &sample_summary(),
+            &[],
             &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -739,6 +811,7 @@ mod tests {
             TimePeriod::Min15,
             &sample_summary(),
             &[],
+            &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -757,6 +830,7 @@ mod tests {
             TimePeriod::Min15,
             &sample_summary(),
             &[],
+            &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -773,6 +847,7 @@ mod tests {
             &paths,
             TimePeriod::Min15,
             &sample_summary(),
+            &[],
             &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -799,6 +874,7 @@ mod tests {
             TimePeriod::Min15,
             &sum,
             &[],
+            &[],
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -806,6 +882,164 @@ mod tests {
         assert!(html.contains("Auth Backend"));
         assert!(html.contains("spark-auth"));
         assert!(html.contains("spark-jwt"));
+    }
+
+    // -- Newly-surfaced sections -----------------------------------
+
+    fn stream_summary() -> ServerSummary {
+        let mut s = sample_summary();
+        s.listeners = vec![ListenerSummary {
+            address: "0.0.0.0:5432".into(),
+            protocol: "stream".into(),
+            acme_domains: Vec::new(),
+            max_connections: None,
+            handler_timeout_secs: None,
+        }];
+        s
+    }
+
+    #[tokio::test]
+    async fn render_json_contains_new_subsystem_keys() {
+        use http_body_util::BodyExt;
+        let paths: Vec<(String, u64)> = vec![];
+        let resp = render_json(
+            &sample_snap(),
+            &sample_sparkline(),
+            &paths,
+            TimePeriod::Min15,
+            &sample_summary(),
+            &[],
+            &[],
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        for key in [
+            "stream", "datagram", "compression", "tls", "geoip",
+            "shutdown", "acme", "ocsp", "proxy_lb", "proxy_upstream",
+            "rate_limit", "oidc", "http_conns", "backends", "by_handler",
+            "by_vhost", "upstreams",
+        ] {
+            assert!(v.get(key).is_some(), "missing JSON key {key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn render_html_proxying_hidden_when_idle() {
+        use http_body_util::BodyExt;
+        let paths: Vec<(String, u64)> = vec![];
+        let resp = render_html(
+            &sample_snap(),
+            &sample_sparkline(),
+            &paths,
+            TimePeriod::Min15,
+            &sample_summary(),
+            &[],
+            &[],
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(!html.contains("id=\"sec-proxying\""));
+    }
+
+    #[tokio::test]
+    async fn render_html_proxying_shown_with_stream_listener() {
+        use http_body_util::BodyExt;
+        let paths: Vec<(String, u64)> = vec![];
+        let resp = render_html(
+            &sample_snap(),
+            &sample_sparkline(),
+            &paths,
+            TimePeriod::Min15,
+            &stream_summary(),
+            &[],
+            &[],
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(html.contains("id=\"sec-proxying\""));
+        assert!(html.contains("TCP Stream Proxy"));
+    }
+
+    #[tokio::test]
+    async fn render_html_compression_shown_when_active() {
+        use http_body_util::BodyExt;
+        let mut snap = sample_snap();
+        snap.compression.responses = 5;
+        snap.compression.bytes_in = 1000;
+        snap.compression.bytes_out = 300;
+        let paths: Vec<(String, u64)> = vec![];
+        let resp = render_html(
+            &snap,
+            &sample_sparkline(),
+            &paths,
+            TimePeriod::Min15,
+            &sample_summary(),
+            &[],
+            &[],
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(html.contains("Response Compression"));
+        assert!(html.contains("val-cmp-resp"));
+    }
+
+    #[tokio::test]
+    async fn render_html_upstream_table_lists_rows() {
+        use http_body_util::BodyExt;
+        let ups = vec![UpstreamRow {
+            label: "h /api".into(),
+            url: "http://10.0.0.1:8080".into(),
+            weight: 2,
+            in_flight: 1,
+            healthy: true,
+            ejected: false,
+        }];
+        let paths: Vec<(String, u64)> = vec![];
+        let resp = render_html(
+            &sample_snap(),
+            &sample_sparkline(),
+            &paths,
+            TimePeriod::Min15,
+            &sample_summary(),
+            &[],
+            &ups,
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(html.contains("Upstream Health"));
+        assert!(html.contains("http://10.0.0.1:8080"));
+        assert!(html.contains("Healthy"));
+    }
+
+    #[tokio::test]
+    async fn render_json_upstreams_serialized() {
+        use http_body_util::BodyExt;
+        let ups = vec![UpstreamRow {
+            label: "h /api".into(),
+            url: "http://10.0.0.1:8080".into(),
+            weight: 1,
+            in_flight: 0,
+            healthy: false,
+            ejected: true,
+        }];
+        let paths: Vec<(String, u64)> = vec![];
+        let resp = render_json(
+            &sample_snap(),
+            &sample_sparkline(),
+            &paths,
+            TimePeriod::Min15,
+            &sample_summary(),
+            &[],
+            &ups,
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        let arr = v["upstreams"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["url"], "http://10.0.0.1:8080");
+        assert_eq!(arr[0]["ejected"], true);
     }
 
     // -- ServerSummary::from_config --------------------------------

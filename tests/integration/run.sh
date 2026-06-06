@@ -94,6 +94,7 @@ suite_redirect
 suite_ip_access
 suite_auth
 suite_status_page
+suite_status_metrics
 suite_compression
 suite_reverse_proxy
 suite_reverse_proxy_unix

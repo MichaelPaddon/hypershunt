@@ -20,6 +20,7 @@ use crate::error::{
     response_503_retry, response_redirect, response_status, response_www_auth,
 };
 use crate::geoip;
+use crate::metrics::HandlerKind;
 use crate::headers::principal_strings;
 use crate::headers::{self, RequestContext};
 use crate::oidc::routes::{
@@ -36,6 +37,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 // Wraps the per-request authenticator so it implements AuthProvider
@@ -577,16 +579,41 @@ impl HypershuntService {
                 .and_then(|j| j.inner.as_deref())
                 .unwrap_or(&*state.authenticator);
 
+            // Captured by the serve future and read at the record site
+            // below so the per-vhost / per-handler-type breakdown is
+            // attributed even for policy/rate-limit early returns.  Stays
+            // `None` for unrouted requests (404), which have no vhost.
+            let mut matched_class: Option<(Arc<str>, HandlerKind)> = None;
             let serve_fut = async {
                 match state.router.route(&mut req, &bind) {
                     Some(route) => {
+                        matched_class = Some((
+                            route.vhost_name.clone(),
+                            route.handler_kind,
+                        ));
                         // Look up country only when the policy needs it.
                         let country: Option<String> =
                             match (&state.geoip, &route.policy) {
                                 (Some(reader), Some(policy))
                                     if policy.needs_geoip =>
                                 {
-                                    geoip::lookup_country(reader, peer.ip())
+                                    state
+                                        .metrics
+                                        .geoip_lookups_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    let c = geoip::lookup_country(
+                                        reader,
+                                        peer.ip(),
+                                    );
+                                    // No country match (private IP or
+                                    // a gap in the GeoIP database).
+                                    if c.is_none() {
+                                        state
+                                            .metrics
+                                            .geoip_lookup_misses_total
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    c
                                 }
                                 _ => None,
                             };
@@ -906,7 +933,9 @@ impl HypershuntService {
 
             let encoding =
                 accept_encoding.as_deref().and_then(compress::negotiate);
-            let mut resp = compress::maybe_compress(resp, encoding).await;
+            let (mut resp, cstats) =
+                compress::maybe_compress(resp, encoding).await;
+            record_compression(&state.metrics, &cstats);
 
             // Auto-advertise HTTP/3 via Alt-Svc when a sibling UDP
             // listener exists on the same port.  Only inject when the
@@ -926,6 +955,10 @@ impl HypershuntService {
             state.metrics.dec_active();
             state.metrics.record(status, ms);
             state.metrics.record_path(&path);
+            // Per-vhost / per-handler breakdown for routed requests.
+            if let Some((vhost, kind)) = &matched_class {
+                state.metrics.record_class(*kind, vhost, status);
+            }
             log_access(
                 &state, &method, &path, &resp, ms, peer, &host, &log_user,
                 protocol, referer.as_deref(), user_agent.as_deref(),
@@ -1017,5 +1050,32 @@ fn http_version_str(v: hyper::Version) -> &'static str {
         Version::HTTP_2 => "HTTP/2.0",
         Version::HTTP_3 => "HTTP/3.0",
         _ => "HTTP/1.1",
+    }
+}
+
+/// Fold one `CompressionStats` into the shared metrics counters.
+/// Kept here (not on `Metrics`) so the compress module stays free of
+/// a metrics dependency.
+fn record_compression(
+    metrics: &crate::metrics::Metrics,
+    stats: &compress::CompressionStats,
+) {
+    use compress::Encoding;
+    if let Some(enc) = stats.applied {
+        metrics.compress_responses_total.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .compress_bytes_in_total
+            .fetch_add(stats.bytes_in, Ordering::Relaxed);
+        metrics
+            .compress_bytes_out_total
+            .fetch_add(stats.bytes_out, Ordering::Relaxed);
+        let counter = match enc {
+            Encoding::Gzip => &metrics.compress_gzip_total,
+            Encoding::Brotli => &metrics.compress_brotli_total,
+            Encoding::Zstd => &metrics.compress_zstd_total,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    } else if stats.skipped {
+        metrics.compress_skipped_total.fetch_add(1, Ordering::Relaxed);
     }
 }

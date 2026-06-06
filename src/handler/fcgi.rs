@@ -2,14 +2,17 @@
 // Unix or TCP socket using the binary FastCGI record protocol and
 // streams the response back to the HTTP client.
 
-use super::cgi_util::{build_cgi_env, parse_cgi_response};
+use super::cgi_util::{InFlightGuard, build_cgi_env, parse_cgi_response};
 use crate::error::{HttpResponse, response_502};
 use crate::error::ReqBody;
 use crate::handler::Handler;
 use crate::headers::RequestContext;
+use crate::metrics::Metrics;
 use async_trait::async_trait;
 use http_body_util::BodyExt;
 use hyper::Request;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[async_trait]
@@ -44,14 +47,21 @@ pub struct FcgiHandler {
     socket: String,
     root: String,
     index: Option<String>,
+    metrics: Arc<Metrics>,
 }
 
 impl FcgiHandler {
-    pub fn new(socket: &str, root: &str, index: Option<String>) -> Self {
+    pub fn new(
+        socket: &str,
+        root: &str,
+        index: Option<String>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             socket: socket.to_owned(),
             root: root.to_owned(),
             index,
+            metrics,
         }
     }
 
@@ -60,10 +70,18 @@ impl FcgiHandler {
         req: Request<ReqBody>,
         matched_prefix: &str,
     ) -> HttpResponse {
+        self.metrics.fcgi_requests_total.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard::new(
+            self.metrics.clone(),
+            |m| &m.fcgi_in_flight,
+        );
         let (parts, body) = req.into_parts();
         let body_bytes = match BodyExt::collect(body).await {
             Ok(c) => c.to_bytes(),
             Err(e) => {
+                self.metrics
+                    .fcgi_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     socket = %self.socket,
                     "fastcgi: failed to read request body: {e}"
@@ -86,6 +104,9 @@ impl FcgiHandler {
                 Ok(stdout) => match parse_cgi_response(&stdout) {
                     Ok(resp) => resp,
                     Err(e) => {
+                        self.metrics
+                            .fcgi_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
                         tracing::error!(
                             socket = %self.socket,
                             "fastcgi: malformed CGI response: {e}"
@@ -94,6 +115,9 @@ impl FcgiHandler {
                     }
                 },
                 Err(e) => {
+                    self.metrics
+                        .fcgi_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
                         socket = %self.socket,
                         "fastcgi: protocol error: {e}"
@@ -102,6 +126,9 @@ impl FcgiHandler {
                 }
             },
             Err(e) => {
+                self.metrics
+                    .fcgi_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     socket = %self.socket,
                     "fastcgi: connection error: {e}"

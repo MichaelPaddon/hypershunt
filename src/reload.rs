@@ -179,6 +179,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
         reload_state.spawn_deps.cert_key_mode,
         &old_registry_snapshot,
         &old_fingerprints,
+        &reload_state.spawn_deps.metrics,
     )
     .await
     {

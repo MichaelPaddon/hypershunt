@@ -2,6 +2,11 @@
 // spawn listener tasks.  Sockets are bound while still root (for ports
 // below 1024); all further work runs as the configured unprivileged user.
 
+// The status-page JSON builder assembles a large object literal via
+// `serde_json::json!`, whose macro expansion exceeds the default
+// recursion limit.
+#![recursion_limit = "256"]
+
 mod access;
 mod access_log;
 mod auth;
@@ -390,6 +395,7 @@ async fn main() -> anyhow::Result<()> {
         cert_key_mode,
         &HashMap::new(),
         &HashMap::new(),
+        &metrics,
     )
     .await
     .context("building certificate registry")?;

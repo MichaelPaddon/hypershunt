@@ -317,6 +317,13 @@ pub fn spawn_active_health_task(
             tick.tick().await;
             for (i, u) in pool.upstreams.iter().enumerate() {
                 let ok = prober.probe(&u.url, &cfg).await;
+                // Count every probe attempt, not just the state
+                // transitions tracked by the failures/recoveries
+                // counters below.
+                if let Some(m) = &metrics {
+                    m.proxy_lb_health_checks_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let state = &mut runs[i];
                 if ok {
                     state.failures = 0;

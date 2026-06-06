@@ -10,9 +10,11 @@ use crate::config::{
     VHostConfig,
 };
 use crate::handler::Handler;
-use crate::handler::status::ServerSummary;
+use crate::handler::status::{
+    LbPoolEntry, ServerSummary, SharedLbRegistry,
+};
 use crate::headers::{HeaderOp, HeaderRules, Template};
-use crate::metrics::Metrics;
+use crate::metrics::{HandlerKind, Metrics};
 use anyhow::bail;
 use hyper::Request;
 use hyper::header::HeaderName;
@@ -23,6 +25,11 @@ use std::sync::Arc;
 pub struct Route {
     pub handler: Arc<dyn Handler>,
     pub matched_prefix: String,
+    /// Config name of the matched vhost and the kind of the matched
+    /// handler, carried so the listener can record the per-vhost /
+    /// per-handler-type request breakdowns after the handler returns.
+    pub vhost_name: Arc<str>,
+    pub handler_kind: HandlerKind,
     pub policy: Option<Arc<PolicyBlock>>,
     pub basic_auth: Option<Arc<BasicAuthConfig>>,
     pub header_rules: Option<Arc<HeaderRules>>,
@@ -37,12 +44,18 @@ pub struct Route {
 
 // Runtime representation of a virtual host, with handlers pre-built.
 struct VHost {
+    // Config name, shared into each Route for per-vhost metrics.
+    name: Arc<str>,
     locations: Vec<Location>,
 }
 
 struct Location {
     path: String,
     handler: Arc<dyn Handler>,
+    // Handler kind, captured from the config variant at build time so
+    // the listener can attribute the request without downcasting the
+    // type-erased `Arc<dyn Handler>`.
+    handler_kind: HandlerKind,
     policy: Option<Arc<PolicyBlock>>,
     basic_auth: Option<Arc<BasicAuthConfig>>,
     header_rules: Option<Arc<HeaderRules>>,
@@ -105,6 +118,14 @@ impl Router {
         // resolving a `default-vhost` reference at construction time.
         let mut by_config_key: HashMap<String, Arc<VHost>> = HashMap::new();
 
+        // Shared, initially-empty reverse-proxy pool registry; filled as
+        // handlers are built and stored once the build completes.  The
+        // StatusHandler clones this same handle, so it sees every pool
+        // regardless of which vhost the status location lives in.
+        let lb_registry: SharedLbRegistry =
+            Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+        let mut lb_pools: Vec<LbPoolEntry> = Vec::new();
+
         for vcfg in &config.vhosts {
             let vhost = Arc::new(build_vhost(
                 vcfg,
@@ -112,6 +133,8 @@ impl Router {
                 summary,
                 cert_state,
                 &named_policies,
+                &lb_registry,
+                &mut lb_pools,
             )?);
 
             let all_names =
@@ -129,6 +152,9 @@ impl Router {
                 }
             }
         }
+
+        // Publish the collected pools now that every handler is built.
+        lb_registry.store(Arc::new(lb_pools));
 
         let defaults: HashMap<String, Option<Arc<VHost>>> = config
             .listeners
@@ -184,6 +210,8 @@ impl Router {
             return Some(Route {
                 handler: loc.handler.clone(),
                 matched_prefix: loc.path.clone(),
+                vhost_name: vhost.name.clone(),
+                handler_kind: loc.handler_kind,
                 policy: loc.policy.clone(),
                 basic_auth: loc.basic_auth.clone(),
                 header_rules: loc.header_rules.clone(),
@@ -469,21 +497,33 @@ fn strip_port(host: &str) -> &str {
     host.split(':').next().unwrap_or(host)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_vhost(
     vcfg: &VHostConfig,
     metrics: &Arc<Metrics>,
     summary: &Arc<ServerSummary>,
     cert_state: Option<&crate::cert::state::SharedCertState>,
     named_policies: &HashMap<String, Vec<PolicyRule>>,
+    lb_registry: &SharedLbRegistry,
+    lb_pools: &mut Vec<LbPoolEntry>,
 ) -> anyhow::Result<VHost> {
     let mut locations = Vec::with_capacity(vcfg.locations.len());
     for loc in &vcfg.locations {
-        let handler = crate::handler::build_handler(
+        let (handler, pool) = crate::handler::build_handler(
             &loc.handler,
             metrics,
             summary,
             cert_state,
+            lb_registry,
         )?;
+        // Register any reverse-proxy pool for the status page, labelled
+        // by its vhost + location for the per-upstream health table.
+        if let Some(pool) = pool {
+            lb_pools.push(LbPoolEntry {
+                label: format!("{} {}", vcfg.name.value, loc.path),
+                pool,
+            });
+        }
         let header_rules = if loc.request_headers.is_empty()
             && loc.response_headers.is_empty()
         {
@@ -527,6 +567,7 @@ fn build_vhost(
         locations.push(Location {
             path: loc.path.clone(),
             handler,
+            handler_kind: handler_kind(&loc.handler),
             policy,
             basic_auth: loc.auth.as_ref().map(|a| Arc::new(a.clone())),
             header_rules,
@@ -536,7 +577,27 @@ fn build_vhost(
             rewrite,
         });
     }
-    Ok(VHost { locations })
+    Ok(VHost {
+        name: Arc::from(vcfg.name.value.as_str()),
+        locations,
+    })
+}
+
+/// Map a handler config variant to its metrics `HandlerKind`.  Kept
+/// next to `build_vhost` so a new handler type is caught here at
+/// compile time.
+fn handler_kind(h: &crate::config::HandlerConfig) -> HandlerKind {
+    use crate::config::HandlerConfig as H;
+    match h {
+        H::Static { .. } => HandlerKind::Static,
+        H::Proxy { .. } => HandlerKind::Proxy,
+        H::Redirect { .. } => HandlerKind::Redirect,
+        H::FastCgi { .. } => HandlerKind::FastCgi,
+        H::Scgi { .. } => HandlerKind::Scgi,
+        H::Cgi { .. } => HandlerKind::Cgi,
+        H::Status => HandlerKind::Status,
+        H::AuthRequest => HandlerKind::AuthRequest,
+    }
 }
 
 /// Convert one parsed `RateLimitConfig` into a live `RateLimitRule`

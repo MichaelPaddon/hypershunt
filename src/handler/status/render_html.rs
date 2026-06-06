@@ -1,7 +1,9 @@
 // HTML status-page renderer.  Live updates are driven by the JavaScript
 // shipped in LIVE_JS, which polls the JSON endpoint every 3 seconds.
 
-use super::{AuthDesc, ListenerSummary, ServerSummary, VHostSummary};
+use super::{
+    AuthDesc, ListenerSummary, ServerSummary, UpstreamRow, VHostSummary,
+};
 use crate::cert::state::CertState;
 use crate::error::{HttpResponse, bytes_body};
 use crate::metrics::{Snapshot, SparklineData, TimePeriod};
@@ -344,6 +346,108 @@ function updatePaths(d){
   }).join('');
 }
 
+function fmtBytes(n){
+  n=+n||0;
+  if(n>=(1<<30))return (n/(1<<30)).toFixed(1)+' GiB';
+  if(n>=(1<<20))return (n/(1<<20)).toFixed(1)+' MiB';
+  if(n>=(1<<10))return (n/(1<<10)).toFixed(1)+' KiB';
+  return n+' B';
+}
+
+// Refresh the newly-surfaced metric sections.  Every id is optional:
+// setText no-ops when a section was server-side hidden, so a feature
+// that only becomes active after page load simply waits for a reload.
+function updateExtra(d){
+  if(d.stream){var s=d.stream;
+    setText('val-stream-active',s.conns_active);
+    setText('val-stream-total',fmt(s.conns_total));
+    setText('val-stream-in',fmtBytes(s.bytes_in));
+    setText('val-stream-out',fmtBytes(s.bytes_out));}
+  if(d.datagram){var g=d.datagram;
+    setText('val-dgram-flows',fmt(g.flows_active));
+    setText('val-dgram-pkts',fmt(g.datagrams_in)+' / '+fmt(g.datagrams_out));
+    setText('val-dgram-bytes',fmtBytes(g.bytes_in)+' / '+fmtBytes(g.bytes_out));
+    setText('val-dgram-create',fmt(g.flow_create));
+    setText('val-dgram-evict',fmt(g.flow_evict));}
+  if(d.proxy_lb){var l=d.proxy_lb;
+    setText('val-lb-picks',fmt(l.picks));
+    setText('val-lb-noup',fmt(l.no_upstream));
+    setText('val-lb-retries',fmt(l.retries));
+    setText('val-lb-eject',fmt(l.ejections));
+    setText('val-lb-hc',fmt(l.health_checks));
+    setText('val-lb-hfr',fmt(l.health_failures)+' / '+fmt(l.health_recoveries));}
+  if(d.proxy_upstream){var u=d.proxy_upstream;
+    setText('val-up-bytes',fmtBytes(u.bytes_in)+' / '+fmtBytes(u.bytes_out));
+    setText('val-up-cerr',fmt(u.connect_errors));}
+  if(d.http_conns){
+    setText('val-http-conns-active',d.http_conns.active);
+    setText('val-http-conns-total',fmt(d.http_conns.total));}
+  if(d.tls){
+    setText('val-tls-hs',fmt(d.tls.handshakes));
+    setText('val-tls-hs-fail',fmt(d.tls.failures));
+    setText('val-tls-hs-to',fmt(d.tls.timeouts));}
+  if(d.acme){
+    setText('val-acme-iss',fmt(d.acme.issuances));
+    setText('val-acme-iss-fail',fmt(d.acme.issuance_failures));
+    setText('val-acme-ren',fmt(d.acme.renewals));
+    setText('val-acme-ren-fail',fmt(d.acme.renewal_failures));}
+  if(d.ocsp){
+    setText('val-ocsp',fmt(d.ocsp.refreshes));
+    setText('val-ocsp-fail',fmt(d.ocsp.refresh_failures));}
+  if(d.oidc){var o=d.oidc;
+    setText('val-oidc-disc',fmt(o.discoveries));
+    setText('val-oidc-disc-fail',fmt(o.discovery_failures));
+    setText('val-oidc-ref',fmt(o.refreshes));
+    setText('val-oidc-ref-fail',fmt(o.refresh_failures));
+    setText('val-oidc-logout',fmt(o.logouts));
+    setText('val-oidc-bearer',fmt(o.bearer_validations));
+    setText('val-oidc-bearer-fail',fmt(o.bearer_failures));
+    setText('val-oidc-iss',fmt(o.callback_iss_mismatches));}
+  if(d.rate_limit){
+    setText('val-rl-triggers',fmt(d.rate_limit.triggers));
+    setText('val-rl-keys',fmt(d.rate_limit.active_keys));}
+  if(d.geoip){
+    setText('val-geoip',fmt(d.geoip.lookups));
+    setText('val-geoip-miss',fmt(d.geoip.misses));}
+  if(d.compression){var c=d.compression;
+    setText('val-cmp-resp',fmt(c.responses));
+    setText('val-cmp-skip',fmt(c.skipped));
+    setText('val-cmp-split',fmt(c.gzip)+' / '+fmt(c.brotli)+' / '+fmt(c.zstd));
+    setText('val-cmp-bytes',fmtBytes(c.bytes_in)+' → '+fmtBytes(c.bytes_out));
+    var saved=c.bytes_in>0?
+      (Math.max(0,(1-c.bytes_out/c.bytes_in))*100).toFixed(1)+'%':'—';
+    setText('val-cmp-saved',saved);}
+  if(d.backends){var b=d.backends;
+    ['fcgi','scgi'].forEach(function(k){
+      if(b[k]){setText('val-'+k+'-req',fmt(b[k].requests));
+        setText('val-'+k+'-err',fmt(b[k].errors));
+        setText('val-'+k+'-inf',b[k].in_flight);}});
+    if(b.cgi){setText('val-cgi-req',fmt(b.cgi.requests));
+      setText('val-cgi-err',fmt(b.cgi.errors));
+      setText('val-cgi-inf',b.cgi.in_flight);
+      setText('val-cgi-spawn',fmt(b.cgi.spawn_failures));
+      setText('val-cgi-to',fmt(b.cgi.timeouts));}
+    if(b.static){setText('val-static-bytes',fmtBytes(b.static.bytes_served));
+      setText('val-static-304',fmt(b.static.not_modified));
+      setText('val-static-206',fmt(b.static.range));}}
+}
+
+function updateUpstreams(ups){
+  var card=document.getElementById('upstreams-card');
+  if(!card)return;
+  if(!ups||!ups.length){card.style.display='none';return;}
+  card.style.display='';
+  var tbody=document.getElementById('upstreams-tbody');
+  if(!tbody)return;
+  tbody.innerHTML=ups.map(function(u){
+    var cls=u.ejected?'cert-crit':(u.healthy?'cert-ok':'cert-warn');
+    var st=u.ejected?'Ejected':(u.healthy?'Healthy':'Unhealthy');
+    return'<tr><td>'+escHtml(u.label)+'</td><td class="mono">'+escHtml(u.url)+
+      '</td><td>'+u.weight+'</td><td>'+u.in_flight+
+      '</td><td><span class="badge '+cls+'">'+st+'</span></td></tr>';
+  }).join('');
+}
+
 function poll(){
   fetch(location.pathname+'?format=json&period='+cur,{
     headers:{'Accept':'application/json'},cache:'no-store'
@@ -421,6 +525,8 @@ function poll(){
     }
     updateCerts(d.certs);
     updatePaths(d);
+    updateExtra(d);
+    updateUpstreams(d.upstreams);
   })
   .catch(function(){setOnline(false);});
 }
@@ -437,6 +543,7 @@ pub(super) fn render_html(
     _period: TimePeriod,
     sum: &ServerSummary,
     certs: &[CertState],
+    upstreams: &[UpstreamRow],
 ) -> HttpResponse {
     let total_lat: u64 = s.latency.iter().sum();
     let resource_sec = resource_section(s.memory_kb, s.cpu_percent);
@@ -444,18 +551,68 @@ pub(super) fn render_html(
     let listeners_sec = listeners_section(&sum.listeners);
     let vhosts_sec = vhosts_section(&sum.vhosts);
     let auth_sec = auth_section(sum.auth.as_ref());
+    // Newly-surfaced metric sections.  Each is an empty string when
+    // its subsystem is idle, so the matching nav link is suppressed too.
+    let proxying_sec = proxying_section(s, sum, upstreams);
+    let network_sec = network_section(s);
+    let security_extra_sec = security_extra_section(s);
+    let compression_sec = compression_section(s);
+    let backends_sec = backends_section(s);
+    let breakdown_sec = breakdown_section(s);
 
-    // Sidebar auth link only when auth is configured.
-    let auth_nav = if sum.auth.is_some() {
-        r##"<a class="nav-link" href="#sec-security">Security</a>"##
-    } else {
-        ""
+    // Sidebar links rendered only when their section is present.
+    let nav = |present: bool, href: &str, label: &str| -> String {
+        if present {
+            format!(r##"<a class="nav-link" href="{href}">{label}</a>"##)
+        } else {
+            String::new()
+        }
     };
-    let mem_nav = if s.memory_kb.is_some() || s.cpu_percent.is_some() {
-        r##"<a class="nav-link" href="#sec-system">System</a>"##
-    } else {
-        ""
+    let auth_nav = nav(sum.auth.is_some(), "#sec-security", "Security");
+    let mem_nav = nav(
+        s.memory_kb.is_some() || s.cpu_percent.is_some(),
+        "#sec-system",
+        "System",
+    );
+    let proxying_nav =
+        nav(!proxying_sec.is_empty(), "#sec-proxying", "Proxying");
+    let network_nav =
+        nav(!network_sec.is_empty(), "#sec-network", "Network & TLS");
+    let security_extra_nav = nav(
+        !security_extra_sec.is_empty(),
+        "#sec-security-extra",
+        "Access & Identity",
+    );
+    let compression_nav = nav(
+        !compression_sec.is_empty(),
+        "#sec-compression",
+        "Compression",
+    );
+    let backends_nav =
+        nav(!backends_sec.is_empty(), "#sec-backends", "Backends");
+    let breakdown_nav =
+        nav(!breakdown_sec.is_empty(), "#sec-breakdown", "Traffic Breakdown");
+
+    // Sidebar group labels print only above a populated group.
+    let group = |present: bool, label: &str| -> String {
+        if present {
+            format!(r#"<div class="nav-group-label">{label}</div>"#)
+        } else {
+            String::new()
+        }
     };
+    let proxying_nav_group = group(!proxying_sec.is_empty(), "Proxying");
+    let network_nav_group =
+        group(!network_sec.is_empty(), "Network &amp; TLS");
+    let security_group = group(
+        sum.auth.is_some() || !security_extra_sec.is_empty(),
+        "Security",
+    );
+    let backends_nav_group = group(!backends_sec.is_empty(), "Backends");
+    let mem_nav_group = group(
+        s.memory_kb.is_some() || s.cpu_percent.is_some(),
+        "System",
+    );
 
     let html = format!(
         r##"<!DOCTYPE html>
@@ -480,15 +637,19 @@ pub(super) fn render_html(
   <details>
     <summary>Navigation</summary>
     <nav class="sidebar-nav">
-      <div class="nav-group-label">Overview</div>
+      <div class="nav-group-label">Traffic</div>
       <a class="nav-link" href="#sec-overview">Overview</a>
       <a class="nav-link" href="#sec-rates">Request Rate</a>
       <a class="nav-link" href="#sec-status">Status Codes</a>
       <a class="nav-link" href="#sec-latency">Latency</a>
-      {mem_nav}
-      {auth_nav}
-      <div class="nav-group-label">Traffic</div>
       <a class="nav-link" href="#sec-paths">Top Paths</a>
+      {compression_nav}
+      {breakdown_nav}
+      {proxying_nav_group}{proxying_nav}
+      {network_nav_group}{network_nav}
+      {security_group}{auth_nav}{security_extra_nav}
+      {backends_nav_group}{backends_nav}
+      {mem_nav_group}{mem_nav}
       <div class="nav-group-label">Configuration</div>
       <a class="nav-link" href="#sec-certs">Certificates</a>
       <a class="nav-link" href="#sec-config">Listeners</a>
@@ -628,6 +789,18 @@ pub(super) fn render_html(
   </div>
 </section>
 
+{compression_sec}
+
+{breakdown_sec}
+
+{proxying_sec}
+
+{network_sec}
+
+{security_extra_sec}
+
+{backends_sec}
+
 {certs_sec}
 
 {listeners_sec}
@@ -658,6 +831,23 @@ pub(super) fn render_html(
         version = sum.version,
         mem_nav = mem_nav,
         auth_nav = auth_nav,
+        compression_nav = compression_nav,
+        breakdown_nav = breakdown_nav,
+        proxying_nav = proxying_nav,
+        proxying_nav_group = proxying_nav_group,
+        network_nav = network_nav,
+        network_nav_group = network_nav_group,
+        security_group = security_group,
+        security_extra_nav = security_extra_nav,
+        backends_nav = backends_nav,
+        backends_nav_group = backends_nav_group,
+        mem_nav_group = mem_nav_group,
+        compression_sec = compression_sec,
+        breakdown_sec = breakdown_sec,
+        proxying_sec = proxying_sec,
+        network_sec = network_sec,
+        security_extra_sec = security_extra_sec,
+        backends_sec = backends_sec,
         uptime = s.uptime_human(),
         active = s.requests_active,
         total = fmt_num(s.requests_total),
@@ -1024,4 +1214,432 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+// -- Newly-surfaced metric sections -------------------------------
+//
+// These render point-in-time totals/gauges as label→value tables.
+// Each value cell carries a DOM id so the poll() loop can refresh it
+// live.  A section returns an empty string when its subsystem shows no
+// activity (and, for proxying, no relevant listener), so unused
+// features don't clutter the page.
+
+/// One `label → value` row whose value cell has a live-update id.
+fn mrow(label: &str, id: &str, val: &str) -> String {
+    format!(
+        r#"<tr><td style="width:11rem;color:var(--muted)">{label}</td><td id="{id}">{val}</td></tr>"#
+    )
+}
+
+/// A `.card` wrapping a titled `info-table` of rows.
+fn mcard(title: &str, rows: &str) -> String {
+    format!(
+        r#"<div class="card"><h2>{title}</h2><table class="info-table"><tbody>{rows}</tbody></table></div>"#
+    )
+}
+
+/// Render bytes as a human-readable size (KiB/MiB/GiB).
+fn fmt_bytes(n: u64) -> String {
+    const U: &[(&str, u64)] = &[
+        ("GiB", 1 << 30),
+        ("MiB", 1 << 20),
+        ("KiB", 1 << 10),
+    ];
+    for (label, div) in U {
+        if n >= *div {
+            return format!("{:.1} {label}", n as f64 / *div as f64);
+        }
+    }
+    format!("{n} B")
+}
+
+/// True when any byte-stream or datagram proxy listener is configured.
+fn has_proxy_listener(sum: &ServerSummary) -> bool {
+    sum.listeners.iter().any(|l| {
+        l.protocol == "stream"
+            || l.protocol.starts_with("TLS-stream")
+            || l.protocol == "dgram-proxy"
+    })
+}
+
+/// Proxying section: TCP stream, UDP/datagram, and reverse-proxy
+/// load-balancer cards.  Shown when any proxy listener exists or any
+/// proxy counter is non-zero.
+fn proxying_section(
+    s: &Snapshot,
+    sum: &ServerSummary,
+    upstreams: &[UpstreamRow],
+) -> String {
+    let active = has_proxy_listener(sum)
+        || !upstreams.is_empty()
+        || s.stream.conns_total > 0
+        || s.datagram.flow_create > 0
+        || s.lb.picks > 0
+        || s.upstream.bytes_in > 0
+        || s.upstream.bytes_out > 0;
+    if !active {
+        return String::new();
+    }
+    let stream = mcard(
+        "TCP Stream Proxy",
+        &format!(
+            "{}{}{}{}",
+            mrow("Active connections", "val-stream-active",
+                &s.stream.conns_active.to_string()),
+            mrow("Total connections", "val-stream-total",
+                &fmt_num(s.stream.conns_total)),
+            mrow("Bytes client&rarr;upstream", "val-stream-in",
+                &fmt_bytes(s.stream.bytes_in)),
+            mrow("Bytes upstream&rarr;client", "val-stream-out",
+                &fmt_bytes(s.stream.bytes_out)),
+        ),
+    );
+    let dgram = mcard(
+        "UDP / Datagram Proxy",
+        &format!(
+            "{}{}{}{}{}",
+            mrow("Active flows", "val-dgram-flows",
+                &fmt_num(s.datagram.flows_active)),
+            mrow("Datagrams in / out", "val-dgram-pkts",
+                &format!("{} / {}",
+                    fmt_num(s.datagram.datagrams_in),
+                    fmt_num(s.datagram.datagrams_out))),
+            mrow("Bytes in / out", "val-dgram-bytes",
+                &format!("{} / {}",
+                    fmt_bytes(s.datagram.bytes_in),
+                    fmt_bytes(s.datagram.bytes_out))),
+            mrow("Flows created", "val-dgram-create",
+                &fmt_num(s.datagram.flow_create)),
+            mrow("Flows evicted", "val-dgram-evict",
+                &fmt_num(s.datagram.flow_evict)),
+        ),
+    );
+    let lb = mcard(
+        "Reverse-Proxy Load Balancer",
+        &format!(
+            "{}{}{}{}{}{}{}{}",
+            mrow("Upstream picks", "val-lb-picks",
+                &fmt_num(s.lb.picks)),
+            mrow("No upstream available", "val-lb-noup",
+                &fmt_num(s.lb.no_upstream)),
+            mrow("Retries", "val-lb-retries", &fmt_num(s.lb.retries)),
+            mrow("Passive ejections", "val-lb-eject",
+                &fmt_num(s.lb.ejections)),
+            mrow("Health: checks", "val-lb-hc",
+                &fmt_num(s.lb.health_checks)),
+            mrow("Health: failures / recoveries", "val-lb-hfr",
+                &format!("{} / {}",
+                    fmt_num(s.lb.health_failures),
+                    fmt_num(s.lb.health_recoveries))),
+            mrow("Upstream bytes in / out", "val-up-bytes",
+                &format!("{} / {}",
+                    fmt_bytes(s.upstream.bytes_in),
+                    fmt_bytes(s.upstream.bytes_out))),
+            mrow("Upstream connect errors", "val-up-cerr",
+                &fmt_num(s.upstream.connect_errors)),
+        ),
+    );
+    let table = upstream_health_table(upstreams);
+    format!(
+        r#"<section class="section" id="sec-proxying"><h2>Proxying</h2><div class="grid-2">{stream}{dgram}{lb}</div>{table}</section>"#
+    )
+}
+
+/// Live per-upstream health table for every reverse-proxy pool.  The
+/// `id="upstreams-tbody"` body is re-rendered by `updateUpstreams` on
+/// each poll; an empty registry hides the card.
+fn upstream_health_table(upstreams: &[UpstreamRow]) -> String {
+    let hidden = if upstreams.is_empty() {
+        " style=\"display:none\""
+    } else {
+        ""
+    };
+    let rows: String = upstreams.iter().map(upstream_row_html).collect();
+    format!(
+        r#"<div class="card" id="upstreams-card"{hidden} style="margin-top:1rem">
+  <h2>Upstream Health</h2>
+  <table class="info-table">
+    <thead><tr><th>Location</th><th>Upstream</th><th>Weight</th><th>In flight</th><th>State</th></tr></thead>
+    <tbody id="upstreams-tbody">{rows}</tbody>
+  </table>
+</div>"#
+    )
+}
+
+fn upstream_row_html(u: &UpstreamRow) -> String {
+    // Ejected takes visual priority over a stale healthy flag.
+    let (cls, state) = if u.ejected {
+        ("cert-crit", "Ejected")
+    } else if u.healthy {
+        ("cert-ok", "Healthy")
+    } else {
+        ("cert-warn", "Unhealthy")
+    };
+    format!(
+        r#"<tr><td>{label}</td><td class="mono">{url}</td><td>{weight}</td><td>{inflight}</td><td><span class="badge {cls}">{state}</span></td></tr>"#,
+        label = html_escape(&u.label),
+        url = html_escape(&u.url),
+        weight = u.weight,
+        inflight = u.in_flight,
+    )
+}
+
+/// TCP TLS handshakes, HTTP connection gauge, OCSP and ACME events.
+/// Shown when any related counter is non-zero.
+fn network_section(s: &Snapshot) -> String {
+    let active = s.tls.handshakes > 0
+        || s.http_conns.total > 0
+        || s.ocsp.refreshes > 0
+        || s.ocsp.refresh_failures > 0
+        || s.acme.issuances > 0
+        || s.acme.renewals > 0
+        || s.acme.issuance_failures > 0
+        || s.acme.renewal_failures > 0;
+    if !active {
+        return String::new();
+    }
+    let conns = mcard(
+        "Connections",
+        &format!(
+            "{}{}{}{}{}",
+            mrow("HTTP connections active", "val-http-conns-active",
+                &s.http_conns.active.to_string()),
+            mrow("HTTP connections total", "val-http-conns-total",
+                &fmt_num(s.http_conns.total)),
+            mrow("TLS handshakes", "val-tls-hs",
+                &fmt_num(s.tls.handshakes)),
+            mrow("TLS handshake failures", "val-tls-hs-fail",
+                &fmt_num(s.tls.failures)),
+            mrow("TLS handshake timeouts", "val-tls-hs-to",
+                &fmt_num(s.tls.timeouts)),
+        ),
+    );
+    let certs = mcard(
+        "Certificate Lifecycle",
+        &format!(
+            "{}{}{}{}{}{}",
+            mrow("ACME issuances", "val-acme-iss",
+                &fmt_num(s.acme.issuances)),
+            mrow("ACME issuance failures", "val-acme-iss-fail",
+                &fmt_num(s.acme.issuance_failures)),
+            mrow("ACME renewals", "val-acme-ren",
+                &fmt_num(s.acme.renewals)),
+            mrow("ACME renewal failures", "val-acme-ren-fail",
+                &fmt_num(s.acme.renewal_failures)),
+            mrow("OCSP refreshes", "val-ocsp",
+                &fmt_num(s.ocsp.refreshes)),
+            mrow("OCSP refresh failures", "val-ocsp-fail",
+                &fmt_num(s.ocsp.refresh_failures)),
+        ),
+    );
+    format!(
+        r#"<section class="section" id="sec-network"><h2>Network &amp; TLS</h2><div class="grid-2">{conns}{certs}</div></section>"#
+    )
+}
+
+/// OIDC, rate-limit, and GeoIP cards.  Each appears only when its own
+/// counters show activity, so a deployment that uses one but not the
+/// others sees just the relevant card.
+fn security_extra_section(s: &Snapshot) -> String {
+    let oidc_active = s.oidc.discoveries > 0
+        || s.oidc.refreshes > 0
+        || s.oidc.logouts > 0
+        || s.oidc.bearer_validations > 0
+        || s.oidc.discovery_failures > 0
+        || s.oidc.bearer_failures > 0;
+    let rl_active = s.rate_limit.triggers > 0 || s.rate_limit.active_keys > 0;
+    let geo_active = s.geoip.lookups > 0;
+    if !oidc_active && !rl_active && !geo_active {
+        return String::new();
+    }
+    let mut cards = String::new();
+    if oidc_active {
+        cards.push_str(&mcard(
+            "OIDC / OAuth",
+            &format!(
+                "{}{}{}{}{}{}{}{}",
+                mrow("Discoveries", "val-oidc-disc",
+                    &fmt_num(s.oidc.discoveries)),
+                mrow("Discovery failures", "val-oidc-disc-fail",
+                    &fmt_num(s.oidc.discovery_failures)),
+                mrow("Token refreshes", "val-oidc-ref",
+                    &fmt_num(s.oidc.refreshes)),
+                mrow("Refresh failures", "val-oidc-ref-fail",
+                    &fmt_num(s.oidc.refresh_failures)),
+                mrow("Logouts", "val-oidc-logout",
+                    &fmt_num(s.oidc.logouts)),
+                mrow("Bearer validations", "val-oidc-bearer",
+                    &fmt_num(s.oidc.bearer_validations)),
+                mrow("Bearer failures", "val-oidc-bearer-fail",
+                    &fmt_num(s.oidc.bearer_failures)),
+                mrow("Issuer mismatches", "val-oidc-iss",
+                    &fmt_num(s.oidc.callback_iss_mismatches)),
+            ),
+        ));
+    }
+    if rl_active {
+        cards.push_str(&mcard(
+            "Rate Limiting",
+            &format!(
+                "{}{}",
+                mrow("Requests denied (429)", "val-rl-triggers",
+                    &fmt_num(s.rate_limit.triggers)),
+                mrow("Active bucket keys", "val-rl-keys",
+                    &fmt_num(s.rate_limit.active_keys)),
+            ),
+        ));
+    }
+    if geo_active {
+        cards.push_str(&mcard(
+            "GeoIP",
+            &format!(
+                "{}{}",
+                mrow("Lookups", "val-geoip", &fmt_num(s.geoip.lookups)),
+                mrow("No-country misses", "val-geoip-miss",
+                    &fmt_num(s.geoip.misses)),
+            ),
+        ));
+    }
+    format!(
+        r#"<section class="section" id="sec-security-extra"><h2>Access &amp; Identity</h2><div class="grid-2">{cards}</div></section>"#
+    )
+}
+
+/// Compression card.  Shown once any response has been negotiated for
+/// compression (encoded or deliberately skipped).
+fn compression_section(s: &Snapshot) -> String {
+    if s.compression.responses == 0 && s.compression.skipped == 0 {
+        return String::new();
+    }
+    // Saved ratio guards against divide-by-zero before any bytes flow.
+    let saved = if s.compression.bytes_in > 0 {
+        let r = 1.0
+            - (s.compression.bytes_out as f64
+                / s.compression.bytes_in as f64);
+        format!("{:.1}%", (r * 100.0).max(0.0))
+    } else {
+        "—".into()
+    };
+    let card = mcard(
+        "Response Compression",
+        &format!(
+            "{}{}{}{}{}",
+            mrow("Responses encoded", "val-cmp-resp",
+                &fmt_num(s.compression.responses)),
+            mrow("Negotiated but skipped", "val-cmp-skip",
+                &fmt_num(s.compression.skipped)),
+            mrow("gzip / brotli / zstd", "val-cmp-split",
+                &format!("{} / {} / {}",
+                    fmt_num(s.compression.gzip),
+                    fmt_num(s.compression.brotli),
+                    fmt_num(s.compression.zstd))),
+            mrow("Bytes in &rarr; out", "val-cmp-bytes",
+                &format!("{} &rarr; {}",
+                    fmt_bytes(s.compression.bytes_in),
+                    fmt_bytes(s.compression.bytes_out))),
+            mrow("Bandwidth saved", "val-cmp-saved", &saved),
+        ),
+    );
+    format!(
+        r#"<section class="section" id="sec-compression"><h2>Compression</h2><div class="grid-2">{card}</div></section>"#
+    )
+}
+
+/// FastCGI / SCGI / CGI / static-file handler counters.  Shown when any
+/// backend handler has served a request or streamed bytes.
+fn backends_section(s: &Snapshot) -> String {
+    let active = s.fcgi.requests > 0
+        || s.scgi.requests > 0
+        || s.cgi.requests > 0
+        || s.static_files.bytes_served > 0
+        || s.static_files.not_modified > 0;
+    if !active {
+        return String::new();
+    }
+    let be = |title: &str, id: &str, b: &crate::metrics::BackendSnap| {
+        mcard(
+            title,
+            &format!(
+                "{}{}{}",
+                mrow("Requests", &format!("val-{id}-req"),
+                    &fmt_num(b.requests)),
+                mrow("Errors", &format!("val-{id}-err"),
+                    &fmt_num(b.errors)),
+                mrow("In flight", &format!("val-{id}-inf"),
+                    &b.in_flight.to_string()),
+            ),
+        )
+    };
+    let cgi = mcard(
+        "CGI",
+        &format!(
+            "{}{}{}{}{}",
+            mrow("Requests", "val-cgi-req", &fmt_num(s.cgi.requests)),
+            mrow("Errors", "val-cgi-err", &fmt_num(s.cgi.errors)),
+            mrow("In flight", "val-cgi-inf", &s.cgi.in_flight.to_string()),
+            mrow("Spawn failures", "val-cgi-spawn",
+                &fmt_num(s.cgi.spawn_failures)),
+            mrow("Timeouts", "val-cgi-to", &fmt_num(s.cgi.timeouts)),
+        ),
+    );
+    let stat = mcard(
+        "Static Files",
+        &format!(
+            "{}{}{}",
+            mrow("Bytes served", "val-static-bytes",
+                &fmt_bytes(s.static_files.bytes_served)),
+            mrow("304 Not Modified", "val-static-304",
+                &fmt_num(s.static_files.not_modified)),
+            mrow("206 Range responses", "val-static-206",
+                &fmt_num(s.static_files.range)),
+        ),
+    );
+    format!(
+        r#"<section class="section" id="sec-backends"><h2>Backends</h2><div class="grid-2">{}{}{}{}</div></section>"#,
+        be("FastCGI", "fcgi", &s.fcgi),
+        be("SCGI", "scgi", &s.scgi),
+        cgi,
+        stat,
+    )
+}
+
+/// Per-vhost and per-handler request breakdown tables.  Rendered once
+/// at least one routed request has been attributed.
+fn breakdown_section(s: &Snapshot) -> String {
+    let handler_rows: String = s
+        .by_handler
+        .iter()
+        .filter(|(_, c)| c.total > 0)
+        .map(|(name, c)| class_row(name, c))
+        .collect();
+    let vhost_rows: String = s
+        .by_vhost
+        .iter()
+        .map(|(name, c)| class_row(name, c))
+        .collect();
+    if handler_rows.is_empty() && vhost_rows.is_empty() {
+        return String::new();
+    }
+    let table = |title: &str, head: &str, rows: &str| {
+        format!(
+            r#"<div class="card"><h2>{title}</h2><table class="info-table"><thead><tr><th>{head}</th><th>Total</th><th>2xx</th><th>3xx</th><th>4xx</th><th>5xx</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+        )
+    };
+    format!(
+        r#"<section class="section" id="sec-breakdown"><h2>Traffic Breakdown</h2><div class="grid-2">{}{}</div></section>"#,
+        table("By Handler", "Handler", &handler_rows),
+        table("By Vhost", "Vhost", &vhost_rows),
+    )
+}
+
+fn class_row(name: &str, c: &crate::metrics::ClassSnapshot) -> String {
+    format!(
+        r#"<tr><td class="mono">{name}</td><td>{total}</td><td>{s2}</td><td>{s3}</td><td>{s4}</td><td>{s5}</td></tr>"#,
+        name = html_escape(name),
+        total = fmt_num(c.total),
+        s2 = fmt_num(c.s2xx),
+        s3 = fmt_num(c.s3xx),
+        s4 = fmt_num(c.s4xx),
+        s5 = fmt_num(c.s5xx),
+    )
 }

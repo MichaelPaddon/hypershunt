@@ -61,12 +61,20 @@ impl Handler for RedirectHandler {
 /// Build the handler tree for a parsed `HandlerConfig`.  Returns an
 /// `Arc<dyn Handler>` so the router can clone references cheaply and
 /// dispatch through a single trait object.
+/// Result of building one handler: the handler trait object plus, for
+/// reverse-proxy locations, the `UpstreamPool` so the caller can
+/// register it for the status page's per-upstream health table.
+pub type BuiltHandler =
+    (Arc<dyn Handler>, Option<Arc<crate::lb::UpstreamPool>>);
+
+/// Build one handler from its config.
 pub fn build_handler(
     cfg: &HandlerConfig,
     metrics: &Arc<Metrics>,
     summary: &Arc<status::ServerSummary>,
     cert_state: Option<&crate::cert::state::SharedCertState>,
-) -> anyhow::Result<Arc<dyn Handler>> {
+    lb_registry: &status::SharedLbRegistry,
+) -> anyhow::Result<BuiltHandler> {
     match cfg {
         HandlerConfig::Static {
             root,
@@ -78,7 +86,7 @@ pub fn build_handler(
             userdir,
             userdir_allowlist,
             userdir_min_uid,
-        } => Ok(Arc::new(static_files::StaticHandler::new(
+        } => Ok((Arc::new(static_files::StaticHandler::new(
             static_files::StaticConfig {
                 root: root.clone(),
                 index_files: index_files.clone(),
@@ -90,7 +98,8 @@ pub fn build_handler(
                 userdir_allowlist: userdir_allowlist.clone(),
                 userdir_min_uid: *userdir_min_uid,
             },
-        ))),
+            metrics.clone(),
+        )) as Arc<dyn Handler>, None)),
         HandlerConfig::Proxy {
             upstreams,
             lb_policy,
@@ -138,17 +147,35 @@ pub fn build_handler(
                     Some(metrics.clone()),
                 );
             }
-            Ok(Arc::new(h))
+            // Hand the pool back so the caller can register it for the
+            // status page's per-upstream health table.
+            let pool = h.pool().clone();
+            Ok((Arc::new(h) as Arc<dyn Handler>, Some(pool)))
         }
-        HandlerConfig::Redirect { to, code } => Ok(Arc::new(RedirectHandler {
-            to: Template::parse(to),
-            code: *code,
-        })),
-        HandlerConfig::FastCgi { socket, root, index } => Ok(Arc::new(
-            fcgi::FcgiHandler::new(socket, root, index.clone()),
+        HandlerConfig::Redirect { to, code } => Ok((
+            Arc::new(RedirectHandler {
+                to: Template::parse(to),
+                code: *code,
+            }) as Arc<dyn Handler>,
+            None,
         )),
-        HandlerConfig::Scgi { socket, root, index } => Ok(Arc::new(
-            scgi::ScgiHandler::new(socket, root, index.clone()),
+        HandlerConfig::FastCgi { socket, root, index } => Ok((
+            Arc::new(fcgi::FcgiHandler::new(
+                socket,
+                root,
+                index.clone(),
+                metrics.clone(),
+            )) as Arc<dyn Handler>,
+            None,
+        )),
+        HandlerConfig::Scgi { socket, root, index } => Ok((
+            Arc::new(scgi::ScgiHandler::new(
+                socket,
+                root,
+                index.clone(),
+                metrics.clone(),
+            )) as Arc<dyn Handler>,
+            None,
         )),
         HandlerConfig::Status => {
             let mut h =
@@ -156,15 +183,22 @@ pub fn build_handler(
             if let Some(cs) = cert_state {
                 h = h.with_cert_state(cs.clone());
             }
-            Ok(Arc::new(h))
+            h = h.with_lb_registry(lb_registry.clone());
+            Ok((Arc::new(h) as Arc<dyn Handler>, None))
         }
-        HandlerConfig::AuthRequest => {
-            Ok(Arc::new(auth_request::AuthRequestHandler::new()))
-        }
+        HandlerConfig::AuthRequest => Ok((
+            Arc::new(auth_request::AuthRequestHandler::new())
+                as Arc<dyn Handler>,
+            None,
+        )),
         HandlerConfig::Cgi { root } => {
             #[cfg(unix)]
             {
-                Ok(Arc::new(cgi::CgiHandler::new(root)))
+                Ok((
+                    Arc::new(cgi::CgiHandler::new(root, metrics.clone()))
+                        as Arc<dyn Handler>,
+                    None,
+                ))
             }
             #[cfg(not(unix))]
             {

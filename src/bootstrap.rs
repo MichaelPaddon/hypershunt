@@ -13,6 +13,7 @@ use crate::config::{
     self, CertificateDef, ProxyConfig, TlsConfig, TlsListenerConfig,
 };
 use crate::auth;
+use crate::metrics::Metrics;
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
@@ -95,6 +96,7 @@ pub(crate) async fn build_cert_source(
     registry: &CertRegistry,
     cert_key_mode: u32,
     alpn: Option<&[String]>,
+    metrics: &Arc<Metrics>,
 ) -> anyhow::Result<(cert::tls::CertSource, Option<tokio::task::JoinHandle<()>>)> {
     if let TlsConfig::Ref(name) = &tls_cfg.cert {
         // Ref: lookup-only.  The cert source's renewal task (if any)
@@ -116,6 +118,7 @@ pub(crate) async fn build_cert_source(
         cert_state,
         cert_key_mode,
         alpn,
+        metrics,
     )
     .await
 }
@@ -133,6 +136,7 @@ async fn build_cert_source_from_source(
     cert_state: &cert::state::SharedCertState,
     cert_key_mode: u32,
     alpn: Option<&[String]>,
+    metrics: &Arc<Metrics>,
 ) -> anyhow::Result<(cert::tls::CertSource, Option<tokio::task::JoinHandle<()>>)> {
     match cert {
         TlsConfig::Acme {
@@ -186,7 +190,8 @@ async fn build_cert_source_from_source(
                         resolved,
                     ),
                 }
-                .with_cert_state(cert_state.clone()),
+                .with_cert_state(cert_state.clone())
+                .with_metrics(metrics.clone()),
             );
             // Try to get an initial cert.  If ACME fails, fall back to
             // self-signed and keep retrying in the background -- crashing
@@ -318,6 +323,7 @@ pub(crate) async fn build_cert_registry(
     // an empty map at startup.
     existing: &CertRegistry,
     existing_sources: &std::collections::HashMap<String, String>,
+    metrics: &Arc<Metrics>,
 ) -> anyhow::Result<(
     CertRegistry,
     // Per-cert ACME renewal handles, keyed by cert name.  The
@@ -355,6 +361,7 @@ pub(crate) async fn build_cert_registry(
             cert_state,
             cert_key_mode,
             None,
+            metrics,
         )
         .await
         .with_context(|| {

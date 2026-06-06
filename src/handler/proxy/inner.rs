@@ -84,6 +84,9 @@ pub(crate) struct InnerProxyClient {
     /// (TLS+h2 ALPN auto-negotiation on the upgrade path is a
     /// follow-up).
     pub(super) upgrade_scheme: crate::config::ProxyUpstreamScheme,
+    /// Shared metrics for per-request upstream counters (connect
+    /// errors).  `None` until `set_metrics` runs at router build.
+    metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 /// Captured `H3Client` builder parameters for lazy construction on
@@ -208,6 +211,7 @@ impl InnerProxyClient {
                 },
                 auto_h3_enabled: false,
                 upgrade_scheme: scheme,
+                metrics: None,
             });
         }
         #[cfg(not(unix))]
@@ -253,6 +257,7 @@ impl InnerProxyClient {
                 },
                 auto_h3_enabled: false,
                 upgrade_scheme: scheme,
+                metrics: None,
             });
         }
 
@@ -314,6 +319,7 @@ impl InnerProxyClient {
             },
             auto_h3_enabled,
             upgrade_scheme: scheme,
+            metrics: None,
         })
     }
 
@@ -323,7 +329,18 @@ impl InnerProxyClient {
     /// pipeline elsewhere.
     pub(crate) fn set_metrics(&mut self, metrics: Arc<crate::metrics::Metrics>) {
         if let ProxyClient::H3(h) = &mut self.client {
-            h.metrics = Some(metrics);
+            h.metrics = Some(metrics.clone());
+        }
+        self.metrics = Some(metrics);
+    }
+
+    /// Bump the upstream connect-error counter when a metrics sink is
+    /// attached.  Used by the explicit dial sites on the
+    /// PROXY-protocol path (the pooled path uses `Error::is_connect`).
+    fn count_connect_error(&self) {
+        if let Some(m) = &self.metrics {
+            m.proxy_upstream_connect_errors_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -643,6 +660,15 @@ impl InnerProxyClient {
                 convert_response(resp)
             }
             Err(e) => {
+                // Distinguish a failure to *reach* the upstream (dial /
+                // TLS / connect timeout) from an upstream that answered
+                // with an error: only the former bumps connect_errors.
+                if e.is_connect()
+                    && let Some(m) = &self.metrics
+                {
+                    m.proxy_upstream_connect_errors_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 tracing::error!("proxy: backend request failed: {e}");
                 response_502()
             }
@@ -837,6 +863,7 @@ impl InnerProxyClient {
             let mut stream = match tokio::net::UnixStream::connect(path).await {
                 Ok(s) => s,
                 Err(e) => {
+                    self.count_connect_error();
                     tracing::error!("proxy: unix upstream connect failed: {e}");
                     return response_502();
                 }
@@ -864,6 +891,7 @@ impl InnerProxyClient {
         let mut stream = match tokio::net::TcpStream::connect(authority).await {
             Ok(s) => s,
             Err(e) => {
+                self.count_connect_error();
                 tracing::error!("proxy: upstream connect failed: {e}");
                 return response_502();
             }

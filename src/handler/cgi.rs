@@ -2,16 +2,19 @@
 // scripts under the configured document root.  Unix only; uses execve(2)
 // via std::process::Command with a CGI-standard environment.
 
-use super::cgi_util::{build_cgi_env, parse_cgi_response};
+use super::cgi_util::{InFlightGuard, build_cgi_env, parse_cgi_response};
 use crate::error::{HttpResponse, response_404, response_502};
 use crate::error::ReqBody;
 use crate::handler::Handler;
 use crate::headers::RequestContext;
+use crate::metrics::Metrics;
 use async_trait::async_trait;
 use http_body_util::BodyExt;
 use hyper::Request;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -29,12 +32,14 @@ impl Handler for CgiHandler {
 
 pub struct CgiHandler {
     root: PathBuf,
+    metrics: Arc<Metrics>,
 }
 
 impl CgiHandler {
-    pub fn new(root: &str) -> Self {
+    pub fn new(root: &str, metrics: Arc<Metrics>) -> Self {
         Self {
             root: PathBuf::from(root),
+            metrics,
         }
     }
 
@@ -43,6 +48,11 @@ impl CgiHandler {
         req: Request<ReqBody>,
         matched_prefix: &str,
     ) -> HttpResponse {
+        self.metrics.cgi_requests_total.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard::new(
+            self.metrics.clone(),
+            |m| &m.cgi_in_flight,
+        );
         let (parts, body) = req.into_parts();
         let uri_path = parts.uri.path().to_owned();
 
@@ -65,6 +75,9 @@ impl CgiHandler {
         let body_bytes = match BodyExt::collect(body).await {
             Ok(c) => c.to_bytes(),
             Err(e) => {
+                self.metrics
+                    .cgi_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!("cgi: failed to read request body: {e}");
                 return response_502();
             }
@@ -89,6 +102,12 @@ impl CgiHandler {
         {
             Ok(c) => c,
             Err(e) => {
+                self.metrics
+                    .cgi_spawn_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .cgi_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     script = %script_path.display(),
                     "cgi: failed to spawn script: {e}"
@@ -102,6 +121,7 @@ impl CgiHandler {
         if let Some(mut stdin) = child.stdin.take()
             && let Err(e) = stdin.write_all(&body_bytes).await
         {
+            self.metrics.cgi_errors_total.fetch_add(1, Ordering::Relaxed);
             tracing::error!("cgi: failed to write stdin: {e}");
             let _ = child.kill().await;
             return response_502();
@@ -110,6 +130,9 @@ impl CgiHandler {
         let output = match child.wait_with_output().await {
             Ok(o) => o,
             Err(e) => {
+                self.metrics
+                    .cgi_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     script = %script_path.display(),
                     "cgi: script execution failed: {e}"
@@ -129,6 +152,9 @@ impl CgiHandler {
         match parse_cgi_response(&output.stdout) {
             Ok(resp) => resp,
             Err(e) => {
+                self.metrics
+                    .cgi_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     script = %script_path.display(),
                     "cgi: malformed response: {e}"

@@ -2,14 +2,17 @@
 // headers as a netstring block, forwards to a Unix or TCP socket, and
 // streams the response through parse_cgi_response().
 
-use super::cgi_util::{build_cgi_env, parse_cgi_response};
+use super::cgi_util::{InFlightGuard, build_cgi_env, parse_cgi_response};
 use crate::error::{HttpResponse, response_502};
 use crate::error::ReqBody;
 use crate::handler::Handler;
 use crate::headers::RequestContext;
+use crate::metrics::Metrics;
 use async_trait::async_trait;
 use http_body_util::BodyExt;
 use hyper::Request;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[async_trait]
@@ -28,14 +31,21 @@ pub struct ScgiHandler {
     socket: String,
     root: String,
     index: Option<String>,
+    metrics: Arc<Metrics>,
 }
 
 impl ScgiHandler {
-    pub fn new(socket: &str, root: &str, index: Option<String>) -> Self {
+    pub fn new(
+        socket: &str,
+        root: &str,
+        index: Option<String>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             socket: socket.to_owned(),
             root: root.to_owned(),
             index,
+            metrics,
         }
     }
 
@@ -44,10 +54,18 @@ impl ScgiHandler {
         req: Request<ReqBody>,
         matched_prefix: &str,
     ) -> HttpResponse {
+        self.metrics.scgi_requests_total.fetch_add(1, Ordering::Relaxed);
+        let _guard = InFlightGuard::new(
+            self.metrics.clone(),
+            |m| &m.scgi_in_flight,
+        );
         let (parts, body) = req.into_parts();
         let body_bytes = match BodyExt::collect(body).await {
             Ok(c) => c.to_bytes(),
             Err(e) => {
+                self.metrics
+                    .scgi_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     socket = %self.socket,
                     "scgi: failed to read request body: {e}"
@@ -69,6 +87,9 @@ impl ScgiHandler {
             Ok(raw) => match parse_cgi_response(&raw) {
                 Ok(resp) => resp,
                 Err(e) => {
+                    self.metrics
+                        .scgi_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
                         socket = %self.socket,
                         "scgi: malformed CGI response: {e}"
@@ -77,6 +98,9 @@ impl ScgiHandler {
                 }
             },
             Err(e) => {
+                self.metrics
+                    .scgi_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     socket = %self.socket,
                     "scgi: connection error: {e}"

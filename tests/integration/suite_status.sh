@@ -24,6 +24,79 @@ EOF
     stop_server
 }
 
+suite_status_metrics() {
+    echo "=== Status page: extended metrics ==="
+    # One live backend and one dead port so the per-upstream health
+    # table shows both, and the dead upstream drives connect-errors.
+    _status_spawn_backend 9301 "alpha"
+
+    cat >"$TMPDIR/status-metrics.kdl" <<'EOF'
+listener "tcp://127.0.0.1:8086"
+vhost localhost {
+    location "/status" { status }
+    location "/files" { static root="/tmp/www" strip-prefix=#true }
+    location "/api" {
+        proxy {
+            upstream "http://127.0.0.1:9301"
+            upstream "http://127.0.0.1:9399"
+        }
+    }
+}
+EOF
+    start_server "$TMPDIR/status-metrics.kdl" 8086 \
+        || { fail "status_metrics/server_start" "hypershunt failed"; return; }
+
+    local url="http://127.0.0.1:8086"
+    # Warm up the per-vhost / per-handler / proxy counters before
+    # asserting the snapshot reflects them.
+    curl -s "$url/files/hello.txt"  >/dev/null
+    curl -s "$url/api/" >/dev/null
+    curl -s "$url/api/" >/dev/null
+    curl -s "$url/missing" >/dev/null
+
+    local js="$url/status?format=json"
+    # The newly-surfaced subsystem blocks must all be present.
+    assert_body "status_metrics/has_stream"     '"stream"'         "$js"
+    assert_body "status_metrics/has_datagram"   '"datagram"'       "$js"
+    assert_body "status_metrics/has_proxy_lb"   '"proxy_lb"'       "$js"
+    assert_body "status_metrics/has_upstream"   '"proxy_upstream"' "$js"
+    assert_body "status_metrics/has_oidc"       '"oidc"'           "$js"
+    assert_body "status_metrics/has_http_conns" '"http_conns"'     "$js"
+    assert_body "status_metrics/has_by_handler" '"by_handler"'     "$js"
+    assert_body "status_metrics/has_by_vhost"   '"by_vhost"'       "$js"
+    assert_body "status_metrics/has_upstreams"  '"upstreams"'      "$js"
+
+    # The per-upstream health table lists both configured backends.
+    assert_body "status_metrics/upstream_live" "127.0.0.1:9301" "$js"
+    assert_body "status_metrics/upstream_dead" "127.0.0.1:9399" "$js"
+
+    # Per-handler / per-vhost breakdown reflects the warm-up traffic.
+    assert_body "status_metrics/handler_proxy"  '"handler":"proxy"'  "$js"
+    assert_body "status_metrics/handler_static" '"handler":"static"' "$js"
+    assert_body "status_metrics/vhost_localhost" '"vhost":"localhost"' "$js"
+
+    stop_server
+}
+
+# Minimal HTTP backend returning a fixed body; PID reaped by cleanup().
+_status_spawn_backend() {
+    local port="$1" name="$2"
+    python3 - "$port" "$name" <<'PYEOF' >/dev/null 2>&1 &
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+port = int(sys.argv[1]); name = sys.argv[2].encode()
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", len(name))
+        self.end_headers(); self.wfile.write(name)
+    def log_message(self, *a): pass
+HTTPServer(("127.0.0.1", port), H).serve_forever()
+PYEOF
+    BACKEND_PIDS+=("$!")
+    sleep 0.3
+}
+
 suite_compression() {
     echo "=== Compression ==="
     cat >"$TMPDIR/compress.kdl" <<'EOF'

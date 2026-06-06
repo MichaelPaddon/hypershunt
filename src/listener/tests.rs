@@ -432,6 +432,7 @@
     // Verify run_stream_proxy forwards raw bytes to the upstream.
     #[tokio::test]
     async fn stream_proxy_forwards_bytes_to_upstream() {
+        use std::sync::atomic::Ordering;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener as TokioTcpListener;
 
@@ -460,6 +461,7 @@
         .unwrap();
         let (tx, rx) = watch::channel(false);
         let (_stop_tx, stop_rx) = watch::channel(false);
+        let metrics = Arc::new(crate::metrics::Metrics::new());
         tokio::spawn(run_stream_proxy(
             cfg,
             BoundSocket::Tcp(proxy_l),
@@ -469,6 +471,7 @@
             stop_rx,
             None,
             None,
+            metrics.clone(),
         ));
 
         // Connect through the proxy and echo.
@@ -478,6 +481,32 @@
         let mut buf = vec![0u8; 4];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
+
+        // Close the client so copy_bidirectional completes cleanly and
+        // flushes its byte counts into the stream metrics.
+        drop(client);
+        // Poll briefly for the connection task to record byte totals.
+        for _ in 0..50 {
+            if metrics.stream_bytes_in_total.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            metrics.stream_conns_total.load(Ordering::Relaxed),
+            1,
+            "one connection should be counted"
+        );
+        assert_eq!(
+            metrics.stream_bytes_in_total.load(Ordering::Relaxed),
+            4,
+            "4 bytes client->upstream"
+        );
+        assert_eq!(
+            metrics.stream_bytes_out_total.load(Ordering::Relaxed),
+            4,
+            "4 bytes upstream->client"
+        );
         drop(tx); // signal shutdown
     }
 

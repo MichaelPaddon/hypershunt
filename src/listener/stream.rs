@@ -12,10 +12,12 @@ use crate::access::{
 };
 use crate::config::ListenerConfig;
 use crate::geoip;
+use crate::metrics::Metrics;
 use crate::proxy_proto;
 use arc_swap::ArcSwap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
@@ -123,6 +125,18 @@ impl tokio::io::AsyncWrite for BackendStream {
 
 /// `acceptor` is Some when the listener should terminate TLS from clients.
 /// `upstream_tls` is Some when the upstream connection should use TLS.
+/// Decrements the live stream-connection gauge when a connection task
+/// ends, however it ends (proxy-proto/TLS failure, access deny, upstream
+/// connect failure, or clean close).  Created once per accepted
+/// connection so the gauge can never leak.
+struct StreamConnGuard(Arc<Metrics>);
+
+impl Drop for StreamConnGuard {
+    fn drop(&mut self) {
+        self.0.stream_conns_active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_stream_proxy(
     cfg: ListenerConfig,
@@ -133,6 +147,7 @@ pub async fn run_stream_proxy(
     mut stop_accept: watch::Receiver<bool>,
     access: Option<Arc<PolicyBlock>>,
     geoip: Option<Arc<geoip::CountryReader>>,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let name = cfg.local_name();
     let proxy_cfg = cfg.proxy.as_ref().expect("proxy config required");
@@ -168,10 +183,20 @@ pub async fn run_stream_proxy(
                         let conn_geoip = geoip.clone();
                         let proxy_ver = accept_proxy_protocol;
                         let trusted_p = trusted_proxies.clone();
+                        let conn_metrics = metrics.clone();
                         // load_full() cheaply bumps the Arc refcount,
                         // picking up any hot-swapped cert since last accept.
                         let acc = acceptor.as_ref().map(|a| a.load_full());
                         connections.spawn(async move {
+                            conn_metrics
+                                .stream_conns_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            conn_metrics
+                                .stream_conns_active
+                                .fetch_add(1, Ordering::Relaxed);
+                            // Drops at task end on every path below.
+                            let _guard =
+                                StreamConnGuard(conn_metrics.clone());
                             // PROXY protocol header (if any) is always
                             // plaintext, even when TLS follows.
                             let peer_addr = match proxy_ver {
@@ -188,20 +213,32 @@ pub async fn run_stream_proxy(
                                     TLS_HANDSHAKE_TIMEOUT,
                                     acc.accept(stream),
                                 ).await {
-                                    Ok(Ok(tls)) => stream_proxy_connection(
-                                        tls,
-                                        peer_addr,
-                                        &target,
-                                        conn_shutdown,
-                                        conn_access,
-                                        conn_geoip,
-                                    ).await,
+                                    Ok(Ok(tls)) => {
+                                        conn_metrics
+                                            .tls_handshakes_total
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        stream_proxy_connection(
+                                            tls,
+                                            peer_addr,
+                                            &target,
+                                            conn_shutdown,
+                                            conn_access,
+                                            conn_geoip,
+                                            &conn_metrics,
+                                        ).await
+                                    }
                                     Ok(Err(e)) => {
+                                        conn_metrics
+                                            .tls_handshake_failures_total
+                                            .fetch_add(1, Ordering::Relaxed);
                                         debug!(%peer_addr,
                                             "TLS handshake failed: {e}");
                                         Ok(())
                                     }
                                     Err(_) => {
+                                        conn_metrics
+                                            .tls_handshake_timeouts_total
+                                            .fetch_add(1, Ordering::Relaxed);
                                         debug!(%peer_addr,
                                             "TLS handshake timed out");
                                         Ok(())
@@ -215,6 +252,7 @@ pub async fn run_stream_proxy(
                                     conn_shutdown,
                                     conn_access,
                                     conn_geoip,
+                                    &conn_metrics,
                                 ).await
                             };
                             if let Err(e) = result {
@@ -244,7 +282,7 @@ pub async fn run_stream_proxy(
         }
     }
 
-    drain_connections(&name, connections).await;
+    drain_connections(&name, connections, &metrics).await;
     Ok(())
 }
 
@@ -261,6 +299,7 @@ struct StreamProxyTarget {
     local_unix: Option<std::path::PathBuf>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_proxy_connection<C>(
     mut client: C,
     peer_addr: PeerAddr,
@@ -268,6 +307,7 @@ async fn stream_proxy_connection<C>(
     mut shutdown: watch::Receiver<bool>,
     access: Option<Arc<PolicyBlock>>,
     geoip: Option<Arc<geoip::CountryReader>>,
+    metrics: &Metrics,
 ) -> anyhow::Result<()>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -393,7 +433,14 @@ where
 
     tokio::select! {
         result = tokio::io::copy_bidirectional(&mut client, &mut backend) => {
-            result?;
+            // copy_bidirectional yields (client->backend, backend->client)
+            // byte counts only on clean completion; an IO error discards
+            // the partial counts, so error transfers go uncounted.
+            let (c2b, b2c) = result?;
+            metrics.stream_bytes_in_total.fetch_add(c2b, Ordering::Relaxed);
+            metrics
+                .stream_bytes_out_total
+                .fetch_add(b2c, Ordering::Relaxed);
         }
         _ = shutdown.changed() => {
             // Shutdown signalled; let OS close the sockets.

@@ -93,19 +93,32 @@ pub struct AppState {
 pub(super) async fn drain_connections(
     name: &str,
     mut connections: JoinSet<()>,
+    metrics: &Metrics,
 ) {
+    use std::sync::atomic::Ordering::Relaxed;
     let n = connections.len();
     if n > 0 {
         tracing::info!(bind = %name, connections = n, "draining");
     }
     let drain = async { while connections.join_next().await.is_some() {} };
     if tokio::time::timeout(DRAIN_TIMEOUT, drain).await.is_err() {
+        // Whatever is still in the set when the deadline fires is
+        // abandoned; the rest drained cleanly.
+        let abandoned = connections.len();
+        metrics
+            .shutdown_abandoned_total
+            .fetch_add(abandoned as u64, Relaxed);
+        metrics
+            .shutdown_drained_total
+            .fetch_add((n - abandoned) as u64, Relaxed);
         tracing::warn!(
             bind = %name,
             "drain timeout after {}s; {} connection(s) abandoned",
             DRAIN_TIMEOUT.as_secs(),
-            connections.len(),
+            abandoned,
         );
+    } else {
+        metrics.shutdown_drained_total.fetch_add(n as u64, Relaxed);
     }
 }
 

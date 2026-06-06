@@ -13,11 +13,13 @@ use super::{
     TLS_HANDSHAKE_TIMEOUT, drain_connections,
 };
 use crate::config::{ListenerConfig, Timeouts};
+use crate::metrics::Metrics;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
@@ -173,7 +175,7 @@ pub async fn run_plain(
         }
     }
 
-    drain_connections(&name, connections).await;
+    drain_connections(&name, connections, &state.load().metrics).await;
     Ok(())
 }
 
@@ -261,13 +263,23 @@ pub async fn run_tls(
                                     start.into_stream(cfg).await
                                 },
                             ).await {
-                                Ok(Ok(s)) => s,
+                                Ok(Ok(s)) => {
+                                    state.metrics.tls_handshakes_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    s
+                                }
                                 Ok(Err(e)) => {
+                                    state.metrics
+                                        .tls_handshake_failures_total
+                                        .fetch_add(1, Ordering::Relaxed);
                                     debug!(%peer_addr,
                                         "TLS handshake failed: {e}");
                                     return;
                                 }
                                 Err(_) => {
+                                    state.metrics
+                                        .tls_handshake_timeouts_total
+                                        .fetch_add(1, Ordering::Relaxed);
                                     debug!(%peer_addr,
                                         "TLS handshake timed out");
                                     return;
@@ -326,8 +338,18 @@ pub async fn run_tls(
         }
     }
 
-    drain_connections(&name, connections).await;
+    drain_connections(&name, connections, &state.load().metrics).await;
     Ok(())
+}
+
+/// Decrements the live HTTP-connection gauge when a connection task
+/// ends, whatever path it takes out of `serve_connection`.
+struct HttpConnGuard(Arc<Metrics>);
+
+impl Drop for HttpConnGuard {
+    fn drop(&mut self) {
+        self.0.http_conns_active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 // Serve a single connection, initiating graceful shutdown on signal.
@@ -347,6 +369,13 @@ async fn serve_connection<I>(
     if *shutdown.borrow() {
         return;
     }
+    // Count this as a live HTTP connection.  For TLS listeners this
+    // runs only after a successful handshake, so the gauge reflects
+    // connections actually serving requests, not raw accepts.  The
+    // guard decrements on every exit path.
+    svc.state.metrics.http_conns_total.fetch_add(1, Ordering::Relaxed);
+    svc.state.metrics.http_conns_active.fetch_add(1, Ordering::Relaxed);
+    let _conn_guard = HttpConnGuard(svc.state.metrics.clone());
     debug!(%peer_addr, "accepted connection");
     let builder = make_builder(&svc.timeouts);
     // `serve_connection_with_upgrades` is the variant that keeps

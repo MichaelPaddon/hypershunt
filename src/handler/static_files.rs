@@ -9,7 +9,10 @@ use crate::error::{
 use crate::error::ReqBody;
 use crate::handler::Handler;
 use crate::headers::RequestContext;
+use crate::metrics::Metrics;
 use async_trait::async_trait;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 #[async_trait]
 impl Handler for StaticHandler {
@@ -58,6 +61,7 @@ pub struct StaticHandler {
     userdir: Option<String>,
     userdir_allowlist: Vec<String>,
     userdir_min_uid: u32,
+    metrics: Arc<Metrics>,
 }
 
 /// Constructor parameter bag for `StaticHandler::new`.  Keeps the
@@ -76,7 +80,7 @@ pub struct StaticConfig {
 }
 
 impl StaticHandler {
-    pub fn new(cfg: StaticConfig) -> Self {
+    pub fn new(cfg: StaticConfig, metrics: Arc<Metrics>) -> Self {
         Self {
             root: cfg.root.map(PathBuf::from),
             index_files: cfg.index_files,
@@ -87,6 +91,7 @@ impl StaticHandler {
             userdir: cfg.userdir,
             userdir_allowlist: cfg.userdir_allowlist,
             userdir_min_uid: cfg.userdir_min_uid,
+            metrics,
         }
     }
 
@@ -230,6 +235,9 @@ impl StaticHandler {
 
         let etag = compute_etag(&metadata);
         if is_not_modified(&req, &etag) {
+            self.metrics
+                .static_not_modified_total
+                .fetch_add(1, Ordering::Relaxed);
             return Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
                 .header("ETag", &etag)
@@ -254,6 +262,12 @@ impl StaticHandler {
                     return response_500();
                 }
                 let length = end - start + 1;
+                self.metrics
+                    .static_range_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .static_bytes_served_total
+                    .fetch_add(length, Ordering::Relaxed);
                 Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header("Content-Type", content_type)
@@ -282,6 +296,9 @@ impl StaticHandler {
                     Ok(f) => f,
                     Err(_) => return response_500(),
                 };
+                self.metrics
+                    .static_bytes_served_total
+                    .fetch_add(file_len, Ordering::Relaxed);
                 Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", content_type)
@@ -871,6 +888,11 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// Fresh metrics sink for handler constructors in tests.
+    fn test_metrics() -> Arc<Metrics> {
+        Arc::new(Metrics::new())
+    }
+
     #[test]
     fn safe_join_normal() {
         let root = Path::new("/var/www");
@@ -1122,6 +1144,7 @@ mod tests {
             userdir: None,
             userdir_allowlist: vec![],
             userdir_min_uid: 1000,
+            metrics: test_metrics(),
         };
         // Request for /missing -> first two miss, third (literal
         // /index.html) hits the SPA fallback.
@@ -1148,6 +1171,7 @@ mod tests {
             userdir: None,
             userdir_allowlist: vec![],
             userdir_min_uid: 1000,
+            metrics: test_metrics(),
         };
         // The first template matches the existing file, so the
         // fallback is never visited.
@@ -1175,6 +1199,7 @@ mod tests {
             userdir: None,
             userdir_allowlist: vec![],
             userdir_min_uid: 1000,
+            metrics: test_metrics(),
         };
         // `/sub` exists as a directory -- try-files must skip
         // it and fall through to /index.html so the SPA route
@@ -1203,6 +1228,7 @@ mod tests {
             userdir: None,
             userdir_allowlist: vec![],
             userdir_min_uid: 1000,
+            metrics: test_metrics(),
         };
         // The resolver gets the already-stripped relative,
         // which mirrors the runtime contract from serve().
@@ -1231,7 +1257,7 @@ mod tests {
             userdir: None,
             userdir_allowlist: vec![],
             userdir_min_uid: 1000,
-        })
+        }, test_metrics())
     }
 
     fn fallback_handler(root: &Path, target: &str) -> StaticHandler {
@@ -1245,7 +1271,7 @@ mod tests {
             userdir: None,
             userdir_allowlist: vec![],
             userdir_min_uid: 1000,
-        })
+        }, test_metrics())
     }
 
     #[tokio::test]
@@ -1334,7 +1360,7 @@ mod tests {
             userdir: None,
             userdir_allowlist: vec![],
             userdir_min_uid: 1000,
-        });
+        }, test_metrics());
         let req = Request::builder()
             .uri("/")
             .body(empty_req_body())
@@ -1445,7 +1471,7 @@ mod tests {
             userdir: Some("public_html".into()),
             userdir_allowlist: allowlist,
             userdir_min_uid: min_uid,
-        })
+        }, test_metrics())
     }
 
     #[cfg(unix)]
@@ -1513,6 +1539,7 @@ mod tests {
             userdir: None,
             userdir_allowlist: vec![],
             userdir_min_uid: 1000,
+            metrics: test_metrics(),
         };
         let got = handler.try_files_resolve(handler.root.as_deref().unwrap(), "/nope").await;
         assert!(got.is_none());

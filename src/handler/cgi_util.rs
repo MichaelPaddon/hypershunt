@@ -3,7 +3,38 @@
 // parse_cgi_response() converts script output into an HTTP response.
 
 use crate::error::{HttpResponse, bytes_body};
+use crate::metrics::Metrics;
 use hyper::{Response, StatusCode};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+// -- In-flight gauge guard -----------------------------------------
+
+/// RAII guard for a backend handler's in-flight gauge.  `new`
+/// increments the selected `AtomicI64`; `drop` decrements it on every
+/// return path so a panicking or early-returning request can't leak
+/// the gauge.  The selector is a plain fn pointer (always `'static`),
+/// so the same guard serves the FastCGI/SCGI/CGI gauges.
+pub struct InFlightGuard {
+    metrics: Arc<Metrics>,
+    sel: fn(&Metrics) -> &AtomicI64,
+}
+
+impl InFlightGuard {
+    pub fn new(
+        metrics: Arc<Metrics>,
+        sel: fn(&Metrics) -> &AtomicI64,
+    ) -> Self {
+        sel(&metrics).fetch_add(1, Ordering::Relaxed);
+        Self { metrics, sel }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        (self.sel)(&self.metrics).fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 // -- CGI environment -----------------------------------------------
 

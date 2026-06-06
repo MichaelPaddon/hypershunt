@@ -18,6 +18,21 @@ pub enum Encoding {
     Zstd,
 }
 
+/// Outcome of `maybe_compress`, reported back to the caller so the
+/// request pipeline can record compression metrics without this module
+/// depending on the metrics layer.  `bytes_in`/`bytes_out` are only
+/// meaningful when `applied` is `Some`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompressionStats {
+    /// Encoding actually written to the wire (None = left unencoded).
+    pub applied: Option<Encoding>,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    /// True when an encoding was negotiated but not applied (body too
+    /// small, incompressible type, already encoded, or encode failure).
+    pub skipped: bool,
+}
+
 // Parse Accept-Encoding and return the best encoding we support.
 // Preference order is zstd > brotli > gzip: zstd typically beats
 // gzip on size at similar CPU, and beats brotli on throughput at
@@ -80,13 +95,16 @@ fn is_compressible(content_type: &str) -> bool {
 pub async fn maybe_compress(
     resp: HttpResponse,
     encoding: Option<Encoding>,
-) -> HttpResponse {
+) -> (HttpResponse, CompressionStats) {
+    // No encoding negotiated: not a skip, the client never asked.
     let Some(enc) = encoding else {
-        return resp;
+        return (resp, CompressionStats::default());
     };
+    // From here on, every non-applied path is a `skipped` outcome.
+    let skipped = CompressionStats { skipped: true, ..Default::default() };
 
     if resp.headers().contains_key(header::CONTENT_ENCODING) {
-        return resp;
+        return (resp, skipped);
     }
 
     let compressible = resp
@@ -96,18 +114,22 @@ pub async fn maybe_compress(
         .map(is_compressible)
         .unwrap_or(false);
     if !compressible {
-        return resp;
+        return (resp, skipped);
     }
 
     let (mut parts, body) = resp.into_parts();
 
     let data = match body.collect().await {
         Ok(c) => c.to_bytes(),
-        Err(_) => return Response::from_parts(parts, bytes_body(Bytes::new())),
+        Err(_) => {
+            let r = Response::from_parts(parts, bytes_body(Bytes::new()));
+            return (r, skipped);
+        }
     };
 
     if data.len() < MIN_SIZE {
-        return Response::from_parts(parts, bytes_body(data));
+        let r = Response::from_parts(parts, bytes_body(data));
+        return (r, skipped);
     }
 
     let compressed = match enc {
@@ -118,13 +140,21 @@ pub async fn maybe_compress(
 
     let Ok(compressed) = compressed else {
         // Compression failed; send the original body unencoded.
-        return Response::from_parts(parts, bytes_body(data));
+        let r = Response::from_parts(parts, bytes_body(data));
+        return (r, skipped);
     };
 
     let enc_name = match enc {
         Encoding::Gzip => "gzip",
         Encoding::Brotli => "br",
         Encoding::Zstd => "zstd",
+    };
+
+    let stats = CompressionStats {
+        applied: Some(enc),
+        bytes_in: data.len() as u64,
+        bytes_out: compressed.len() as u64,
+        skipped: false,
     };
 
     // Content-Length no longer matches; remove it so hyper recomputes
@@ -139,7 +169,8 @@ pub async fn maybe_compress(
         .headers
         .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
 
-    Response::from_parts(parts, bytes_body(Bytes::from(compressed)))
+    let r = Response::from_parts(parts, bytes_body(Bytes::from(compressed)));
+    (r, stats)
 }
 
 fn gzip_encode(data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -324,7 +355,7 @@ mod tests {
     async fn compresses_large_text_response_with_gzip() {
         let body = "hello world ".repeat(200); // well above MIN_SIZE
         let resp = text_response(&body);
-        let out = maybe_compress(resp, Some(Encoding::Gzip)).await;
+        let (out, _stats) = maybe_compress(resp, Some(Encoding::Gzip)).await;
 
         assert_eq!(
             out.headers()
@@ -345,7 +376,7 @@ mod tests {
     async fn compresses_large_text_response_with_brotli() {
         let body = "hello world ".repeat(200);
         let resp = text_response(&body);
-        let out = maybe_compress(resp, Some(Encoding::Brotli)).await;
+        let (out, _stats) = maybe_compress(resp, Some(Encoding::Brotli)).await;
 
         assert_eq!(
             out.headers()
@@ -360,14 +391,14 @@ mod tests {
     #[tokio::test]
     async fn skips_compression_below_min_size() {
         let resp = text_response("small");
-        let out = maybe_compress(resp, Some(Encoding::Gzip)).await;
+        let (out, _stats) = maybe_compress(resp, Some(Encoding::Gzip)).await;
         assert!(out.headers().get("Content-Encoding").is_none());
     }
 
     #[tokio::test]
     async fn skips_compression_for_binary_content() {
         let resp = binary_response(b"PNG\x89\x50\x4e\x47");
-        let out = maybe_compress(resp, Some(Encoding::Gzip)).await;
+        let (out, _stats) = maybe_compress(resp, Some(Encoding::Gzip)).await;
         assert!(out.headers().get("Content-Encoding").is_none());
     }
 
@@ -380,7 +411,7 @@ mod tests {
             .header("Content-Encoding", "gzip")
             .body(bytes_body(Bytes::from(body)))
             .unwrap();
-        let out = maybe_compress(resp, Some(Encoding::Brotli)).await;
+        let (out, _stats) = maybe_compress(resp, Some(Encoding::Brotli)).await;
         assert_eq!(
             out.headers()
                 .get("Content-Encoding")
@@ -395,7 +426,7 @@ mod tests {
     async fn skips_compression_when_encoding_is_none() {
         let body = "hello world ".repeat(200);
         let resp = text_response(&body);
-        let out = maybe_compress(resp, None).await;
+        let (out, _stats) = maybe_compress(resp, None).await;
         assert!(out.headers().get("Content-Encoding").is_none());
     }
 
@@ -406,7 +437,7 @@ mod tests {
 
         let body = "the quick brown fox ".repeat(100);
         let resp = text_response(&body);
-        let out = maybe_compress(resp, Some(Encoding::Gzip)).await;
+        let (out, _stats) = maybe_compress(resp, Some(Encoding::Gzip)).await;
 
         let compressed = out.into_body().collect().await.unwrap().to_bytes();
         let mut dec = GzDecoder::new(compressed.as_ref());
@@ -419,7 +450,7 @@ mod tests {
     async fn compresses_large_text_response_with_zstd() {
         let body = "hello world ".repeat(200);
         let resp = text_response(&body);
-        let out = maybe_compress(resp, Some(Encoding::Zstd)).await;
+        let (out, _stats) = maybe_compress(resp, Some(Encoding::Zstd)).await;
 
         assert_eq!(
             out.headers()
@@ -444,7 +475,7 @@ mod tests {
         // blob back through zstd::decode_all.
         let body = "the quick brown fox ".repeat(100);
         let resp = text_response(&body);
-        let out = maybe_compress(resp, Some(Encoding::Zstd)).await;
+        let (out, _stats) = maybe_compress(resp, Some(Encoding::Zstd)).await;
         let compressed =
             out.into_body().collect().await.unwrap().to_bytes();
         let decompressed =
@@ -458,22 +489,54 @@ mod tests {
     #[tokio::test]
     async fn zstd_skips_compression_for_binary_content() {
         let resp = binary_response(b"PNG\x89\x50\x4e\x47");
-        let out = maybe_compress(resp, Some(Encoding::Zstd)).await;
+        let (out, _stats) = maybe_compress(resp, Some(Encoding::Zstd)).await;
         assert!(out.headers().get("Content-Encoding").is_none());
     }
 
     #[tokio::test]
     async fn zstd_skips_compression_below_min_size() {
         let resp = text_response("tiny");
-        let out = maybe_compress(resp, Some(Encoding::Zstd)).await;
+        let (out, _stats) = maybe_compress(resp, Some(Encoding::Zstd)).await;
         assert!(out.headers().get("Content-Encoding").is_none());
+    }
+
+    // -- CompressionStats ----------------------------------------
+
+    #[tokio::test]
+    async fn stats_report_applied_encoding_and_sizes() {
+        let body = "hello world ".repeat(200);
+        let in_len = body.len() as u64;
+        let resp = text_response(&body);
+        let (_out, stats) =
+            maybe_compress(resp, Some(Encoding::Gzip)).await;
+        assert_eq!(stats.applied, Some(Encoding::Gzip));
+        assert!(!stats.skipped);
+        assert_eq!(stats.bytes_in, in_len);
+        assert!(stats.bytes_out > 0 && stats.bytes_out < in_len);
+    }
+
+    #[tokio::test]
+    async fn stats_mark_skip_for_small_body() {
+        let (_out, stats) =
+            maybe_compress(text_response("tiny"), Some(Encoding::Gzip))
+                .await;
+        assert!(stats.applied.is_none());
+        assert!(stats.skipped);
+    }
+
+    #[tokio::test]
+    async fn stats_not_skipped_when_no_encoding_negotiated() {
+        let body = "hello world ".repeat(200);
+        let (_out, stats) = maybe_compress(text_response(&body), None).await;
+        assert!(stats.applied.is_none());
+        assert!(!stats.skipped, "no negotiation is not a skip");
     }
 
     #[tokio::test]
     async fn brotli_output_is_decompressible() {
         let body = "the quick brown fox ".repeat(100);
         let resp = text_response(&body);
-        let out = maybe_compress(resp, Some(Encoding::Brotli)).await;
+        let (out, _stats) = maybe_compress(resp, Some(Encoding::Brotli)).await;
 
         let compressed = out.into_body().collect().await.unwrap().to_bytes();
         let mut dec = brotli::Decompressor::new(compressed.as_ref(), 4096);

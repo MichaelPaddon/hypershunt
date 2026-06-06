@@ -12,7 +12,7 @@
 // in tick_loop (runs every WINDOW_SECS = 5 seconds).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::interval;
@@ -154,8 +154,152 @@ pub struct SparklineData {
     pub active: Vec<u32>,
 }
 
+// -- Snapshot sub-groups ------------------------------------------
+//
+// New subsystems surface as point-in-time totals/gauges grouped into
+// small Copy structs.  This keeps `Snapshot` readable and lets the
+// renderers map one group to one JSON object / page section.
+
+#[derive(Clone, Copy, Default)]
+pub struct StreamSnap {
+    pub conns_active: i64,
+    pub conns_total: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct CompressionSnap {
+    pub responses: u64,
+    pub skipped: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub gzip: u64,
+    pub brotli: u64,
+    pub zstd: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct TlsSnap {
+    pub handshakes: u64,
+    pub failures: u64,
+    pub timeouts: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct GeoipSnap {
+    pub lookups: u64,
+    pub misses: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ShutdownSnap {
+    pub drained: u64,
+    pub abandoned: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct AcmeSnap {
+    pub issuances: u64,
+    pub issuance_failures: u64,
+    pub renewals: u64,
+    pub renewal_failures: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct OcspSnap {
+    pub refreshes: u64,
+    pub refresh_failures: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct LbSnap {
+    pub picks: u64,
+    pub no_upstream: u64,
+    pub retries: u64,
+    pub ejections: u64,
+    pub health_failures: u64,
+    pub health_recoveries: u64,
+    pub health_checks: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct UpstreamSnap {
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub connect_errors: u64,
+    pub latency: [u64; 6],
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct RateLimitSnap {
+    pub triggers: u64,
+    pub active_keys: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct DatagramSnap {
+    pub flows_active: u64,
+    pub datagrams_in: u64,
+    pub datagrams_out: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub flow_create: u64,
+    pub flow_evict: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct HttpConnSnap {
+    pub active: i64,
+    pub total: u64,
+}
+
+/// One CGI-family backend handler's counters (FastCGI/SCGI).
+#[derive(Clone, Copy, Default)]
+pub struct BackendSnap {
+    pub requests: u64,
+    pub errors: u64,
+    pub in_flight: i64,
+}
+
+/// CGI adds spawn-failure and timeout splits over `BackendSnap`.
+#[derive(Clone, Copy, Default)]
+pub struct CgiSnap {
+    pub requests: u64,
+    pub errors: u64,
+    pub in_flight: i64,
+    pub spawn_failures: u64,
+    pub timeouts: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct StaticSnap {
+    pub bytes_served: u64,
+    pub not_modified: u64,
+    pub range: u64,
+}
+
+/// The full ~13-counter OIDC group.
+#[derive(Clone, Copy, Default)]
+pub struct OidcSnap {
+    pub refreshes: u64,
+    pub refresh_failures: u64,
+    pub logouts: u64,
+    pub discoveries: u64,
+    pub discovery_failures: u64,
+    pub userinfo_failures: u64,
+    pub backchannel_logouts: u64,
+    pub backchannel_failures: u64,
+    pub bearer_validations: u64,
+    pub bearer_failures: u64,
+    pub revocations: u64,
+    pub revocation_failures: u64,
+    pub callback_iss_mismatches: u64,
+}
+
 // -- Snapshot (current state, not period-specific) ----------------
 
+#[derive(Default)]
 pub struct Snapshot {
     pub uptime: Duration,
     pub requests_total: u64,
@@ -194,6 +338,28 @@ pub struct Snapshot {
     pub quic_requests_total: u64,
     /// Outbound h3 (proxy upstream) handshake count.
     pub quic_outbound_handshakes_total: u64,
+    // Newly-surfaced subsystem groups (totals + gauges).
+    pub stream: StreamSnap,
+    pub datagram: DatagramSnap,
+    pub compression: CompressionSnap,
+    pub tls: TlsSnap,
+    pub geoip: GeoipSnap,
+    pub shutdown: ShutdownSnap,
+    pub acme: AcmeSnap,
+    pub ocsp: OcspSnap,
+    pub lb: LbSnap,
+    pub upstream: UpstreamSnap,
+    pub rate_limit: RateLimitSnap,
+    pub oidc: OidcSnap,
+    pub http_conns: HttpConnSnap,
+    pub fcgi: BackendSnap,
+    pub scgi: BackendSnap,
+    pub cgi: CgiSnap,
+    pub static_files: StaticSnap,
+    /// Per-handler-type request breakdown (config order) and per-vhost
+    /// breakdown (map order); rendered as tables.
+    pub by_handler: Vec<(&'static str, ClassSnapshot)>,
+    pub by_vhost: Vec<(String, ClassSnapshot)>,
 }
 
 impl Snapshot {
@@ -334,6 +500,108 @@ impl CoarseArchive {
     }
 }
 
+// -- Per-class request tallies (vhost / handler breakdowns) -------
+
+/// Request classes the status page breaks traffic down by.  The enum
+/// discriminant is the array index into `Metrics::per_kind`, so the
+/// declaration order must stay in lock-step with `HANDLER_KIND_ALL`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandlerKind {
+    Static,
+    Proxy,
+    Redirect,
+    FastCgi,
+    Scgi,
+    Cgi,
+    Status,
+    AuthRequest,
+}
+
+/// Number of `HandlerKind` variants; sizes the `per_kind` array.
+pub const HANDLER_KINDS: usize = 8;
+
+/// All kinds in discriminant order — used to label the per-handler
+/// snapshot without reflection.
+pub const HANDLER_KIND_ALL: [HandlerKind; HANDLER_KINDS] = [
+    HandlerKind::Static,
+    HandlerKind::Proxy,
+    HandlerKind::Redirect,
+    HandlerKind::FastCgi,
+    HandlerKind::Scgi,
+    HandlerKind::Cgi,
+    HandlerKind::Status,
+    HandlerKind::AuthRequest,
+];
+
+impl HandlerKind {
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Stable lower-case label used as the JSON key / table row.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Proxy => "proxy",
+            Self::Redirect => "redirect",
+            Self::FastCgi => "fastcgi",
+            Self::Scgi => "scgi",
+            Self::Cgi => "cgi",
+            Self::Status => "status",
+            Self::AuthRequest => "auth-request",
+        }
+    }
+}
+
+/// One request tally broken down by status class.  Used per-vhost and
+/// per-handler-type.  All atomics so the hot path never locks.
+#[derive(Default)]
+pub struct ClassCounters {
+    pub total: AtomicU64,
+    pub s2xx: AtomicU64,
+    pub s3xx: AtomicU64,
+    pub s4xx: AtomicU64,
+    pub s5xx: AtomicU64,
+}
+
+impl ClassCounters {
+    fn record(&self, status: u16) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        match status / 100 {
+            2 => self.s2xx.fetch_add(1, Ordering::Relaxed),
+            3 => self.s3xx.fetch_add(1, Ordering::Relaxed),
+            4 => self.s4xx.fetch_add(1, Ordering::Relaxed),
+            5 => self.s5xx.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+    }
+
+    fn snapshot(&self) -> ClassSnapshot {
+        ClassSnapshot {
+            total: self.total.load(Ordering::Relaxed),
+            s2xx: self.s2xx.load(Ordering::Relaxed),
+            s3xx: self.s3xx.load(Ordering::Relaxed),
+            s4xx: self.s4xx.load(Ordering::Relaxed),
+            s5xx: self.s5xx.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Per-handler-type (config order) and per-vhost (map order) request
+/// breakdowns, as returned by `Metrics::class_snapshots`.
+pub type ClassSnapshots =
+    (Vec<(&'static str, ClassSnapshot)>, Vec<(String, ClassSnapshot)>);
+
+/// Plain-data copy of a `ClassCounters` for the renderers.
+#[derive(Clone, Copy, Default)]
+pub struct ClassSnapshot {
+    pub total: u64,
+    pub s2xx: u64,
+    pub s3xx: u64,
+    pub s4xx: u64,
+    pub s5xx: u64,
+}
+
 // -- Public Metrics struct ----------------------------------------
 
 pub struct Metrics {
@@ -443,6 +711,88 @@ pub struct Metrics {
     pub datagrams_dropped_oversize_total: AtomicU64,
     pub datagram_flow_create_total: AtomicU64,
     pub datagram_flow_evict_total: AtomicU64,
+    // -- TCP stream-proxy counters.  Zero unless a byte-stream
+    // listener with a `proxy` block is active.  `active` is a live
+    // gauge; bytes split client->upstream (in) and upstream->client
+    // (out), matching the datagram-proxy convention.
+    pub stream_conns_active: AtomicI64,
+    pub stream_conns_total: AtomicU64,
+    pub stream_bytes_in_total: AtomicU64,
+    pub stream_bytes_out_total: AtomicU64,
+    // -- Response-compression counters.  `responses` counts encoded
+    // bodies; `skipped` counts negotiated-but-not-encoded responses
+    // (too small, incompressible type, already encoded).  bytes_in is
+    // the pre-compression size, bytes_out post; their ratio is the
+    // realised savings.  gzip/brotli split the chosen encoding.
+    pub compress_responses_total: AtomicU64,
+    pub compress_skipped_total: AtomicU64,
+    pub compress_bytes_in_total: AtomicU64,
+    pub compress_bytes_out_total: AtomicU64,
+    pub compress_gzip_total: AtomicU64,
+    pub compress_brotli_total: AtomicU64,
+    pub compress_zstd_total: AtomicU64,
+    // -- Inbound TLS handshakes on TCP listeners (the QUIC path has
+    // its own counters).  Lets operators see the TLS success/failure
+    // split that the global request counters hide.
+    pub tls_handshakes_total: AtomicU64,
+    pub tls_handshake_failures_total: AtomicU64,
+    pub tls_handshake_timeouts_total: AtomicU64,
+    // -- GeoIP lookups performed during policy evaluation; `misses`
+    // are lookups with no country match (private IP, gap in the DB).
+    pub geoip_lookups_total: AtomicU64,
+    pub geoip_lookup_misses_total: AtomicU64,
+    // -- Graceful-shutdown accounting: connections that drained
+    // cleanly vs. those abandoned when the drain deadline fired.
+    pub shutdown_drained_total: AtomicU64,
+    pub shutdown_abandoned_total: AtomicU64,
+    // -- ACME certificate lifecycle events.  Issuances are first-time
+    // acquisitions; renewals are scheduled re-acquisitions.  Failures
+    // are counted separately so a flapping ACME backend is visible.
+    pub acme_issuances_total: AtomicU64,
+    pub acme_issuance_failures_total: AtomicU64,
+    pub acme_renewals_total: AtomicU64,
+    pub acme_renewal_failures_total: AtomicU64,
+    // -- Active health-check probe attempts (every probe, not just the
+    // state transitions counted by proxy_lb_health_failures/recoveries).
+    pub proxy_lb_health_checks_total: AtomicU64,
+    // -- Per-upstream request-path counters for the reverse proxy.
+    // Bytes are body sizes relayed to/from upstreams; connect_errors
+    // count failures to dial an upstream.  The latency histogram uses
+    // the same bucket boundaries as the global request histogram.
+    pub proxy_upstream_bytes_in_total: AtomicU64,
+    pub proxy_upstream_bytes_out_total: AtomicU64,
+    pub proxy_upstream_connect_errors_total: AtomicU64,
+    pub proxy_upstream_latency: [AtomicU64; 6],
+    // -- HTTP connection-level gauge/counter (distinct from
+    // requests_active, which counts in-flight requests, not sockets).
+    pub http_conns_active: AtomicI64,
+    pub http_conns_total: AtomicU64,
+    // -- FastCGI / SCGI / CGI backend handlers.  Each tracks total
+    // requests, errors (connect/protocol/spawn), and a live in-flight
+    // gauge.  CGI additionally splits spawn failures and timeouts.
+    pub fcgi_requests_total: AtomicU64,
+    pub fcgi_errors_total: AtomicU64,
+    pub fcgi_in_flight: AtomicI64,
+    pub scgi_requests_total: AtomicU64,
+    pub scgi_errors_total: AtomicU64,
+    pub scgi_in_flight: AtomicI64,
+    pub cgi_requests_total: AtomicU64,
+    pub cgi_errors_total: AtomicU64,
+    pub cgi_in_flight: AtomicI64,
+    pub cgi_spawn_failures_total: AtomicU64,
+    pub cgi_timeouts_total: AtomicU64,
+    // -- Static-file handler: bytes served, 304 Not Modified hits,
+    // and 206 Partial Content (range) responses.
+    pub static_bytes_served_total: AtomicU64,
+    pub static_not_modified_total: AtomicU64,
+    pub static_range_total: AtomicU64,
+    // -- Per-handler-type request breakdown (fixed array, no lock).
+    pub per_kind: [ClassCounters; HANDLER_KINDS],
+    // -- Per-vhost request breakdown.  Keyed by the matched vhost's
+    // config name (bounded cardinality), not the raw Host header.  The
+    // hot path takes a read lock and bumps atomics; only the first
+    // sighting of a vhost takes the write lock.
+    pub per_vhost: RwLock<HashMap<String, Arc<ClassCounters>>>,
     // Ring-buffer archives (all written by tick_loop only).
     fine: Mutex<FineHistory>,
     paths: Mutex<PathData>,
@@ -452,6 +802,20 @@ pub struct Metrics {
 }
 
 // -- Metrics implementation ----------------------------------------
+
+/// Bucket index for a latency in milliseconds, shared by the global
+/// request histogram and the reverse-proxy upstream histogram:
+/// <1ms <10ms <50ms <200ms <1s >=1s.
+fn latency_bucket(latency_ms: u128) -> usize {
+    match latency_ms {
+        ms if ms < 1 => 0,
+        ms if ms < 10 => 1,
+        ms if ms < 50 => 2,
+        ms if ms < 200 => 3,
+        ms if ms < 1000 => 4,
+        _ => 5,
+    }
+}
 
 impl Metrics {
     pub fn new() -> Self {
@@ -504,6 +868,53 @@ impl Metrics {
             datagrams_dropped_oversize_total: AtomicU64::new(0),
             datagram_flow_create_total: AtomicU64::new(0),
             datagram_flow_evict_total: AtomicU64::new(0),
+            stream_conns_active: AtomicI64::new(0),
+            stream_conns_total: AtomicU64::new(0),
+            stream_bytes_in_total: AtomicU64::new(0),
+            stream_bytes_out_total: AtomicU64::new(0),
+            compress_responses_total: AtomicU64::new(0),
+            compress_skipped_total: AtomicU64::new(0),
+            compress_bytes_in_total: AtomicU64::new(0),
+            compress_bytes_out_total: AtomicU64::new(0),
+            compress_gzip_total: AtomicU64::new(0),
+            compress_brotli_total: AtomicU64::new(0),
+            compress_zstd_total: AtomicU64::new(0),
+            tls_handshakes_total: AtomicU64::new(0),
+            tls_handshake_failures_total: AtomicU64::new(0),
+            tls_handshake_timeouts_total: AtomicU64::new(0),
+            geoip_lookups_total: AtomicU64::new(0),
+            geoip_lookup_misses_total: AtomicU64::new(0),
+            shutdown_drained_total: AtomicU64::new(0),
+            shutdown_abandoned_total: AtomicU64::new(0),
+            acme_issuances_total: AtomicU64::new(0),
+            acme_issuance_failures_total: AtomicU64::new(0),
+            acme_renewals_total: AtomicU64::new(0),
+            acme_renewal_failures_total: AtomicU64::new(0),
+            proxy_lb_health_checks_total: AtomicU64::new(0),
+            proxy_upstream_bytes_in_total: AtomicU64::new(0),
+            proxy_upstream_bytes_out_total: AtomicU64::new(0),
+            proxy_upstream_connect_errors_total: AtomicU64::new(0),
+            proxy_upstream_latency: std::array::from_fn(|_| {
+                AtomicU64::new(0)
+            }),
+            http_conns_active: AtomicI64::new(0),
+            http_conns_total: AtomicU64::new(0),
+            fcgi_requests_total: AtomicU64::new(0),
+            fcgi_errors_total: AtomicU64::new(0),
+            fcgi_in_flight: AtomicI64::new(0),
+            scgi_requests_total: AtomicU64::new(0),
+            scgi_errors_total: AtomicU64::new(0),
+            scgi_in_flight: AtomicI64::new(0),
+            cgi_requests_total: AtomicU64::new(0),
+            cgi_errors_total: AtomicU64::new(0),
+            cgi_in_flight: AtomicI64::new(0),
+            cgi_spawn_failures_total: AtomicU64::new(0),
+            cgi_timeouts_total: AtomicU64::new(0),
+            static_bytes_served_total: AtomicU64::new(0),
+            static_not_modified_total: AtomicU64::new(0),
+            static_range_total: AtomicU64::new(0),
+            per_kind: std::array::from_fn(|_| ClassCounters::default()),
+            per_vhost: RwLock::new(HashMap::new()),
             fine: Mutex::new(FineHistory::new()),
             paths: Mutex::new(PathData {
                 slots: (0..FINE_SLOTS).map(|_| HashMap::new()).collect(),
@@ -551,15 +962,63 @@ impl Metrics {
             }
             _ => {}
         }
-        let bucket = match latency_ms {
-            ms if ms < 1 => 0,
-            ms if ms < 10 => 1,
-            ms if ms < 50 => 2,
-            ms if ms < 200 => 3,
-            ms if ms < 1000 => 4,
-            _ => 5,
+        self.latency[latency_bucket(latency_ms)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a completed request against the per-handler-type and
+    /// per-vhost breakdowns.  `vhost` is the matched vhost's config
+    /// name (bounded cardinality), so the per-vhost map cannot grow
+    /// without bound from hostile Host headers.
+    pub fn record_class(
+        &self,
+        kind: HandlerKind,
+        vhost: &str,
+        status: u16,
+    ) {
+        self.per_kind[kind.index()].record(status);
+
+        // Fast path: vhost already seen — read lock only.
+        {
+            let map =
+                self.per_vhost.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(c) = map.get(vhost) {
+                c.record(status);
+                return;
+            }
+        }
+        // First sighting: insert under the write lock, then record.
+        let entry = {
+            let mut map = self
+                .per_vhost
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            map.entry(vhost.to_owned())
+                .or_insert_with(|| Arc::new(ClassCounters::default()))
+                .clone()
         };
-        self.latency[bucket].fetch_add(1, Ordering::Relaxed);
+        entry.record(status);
+    }
+
+    /// Record one upstream-response latency into the reverse-proxy
+    /// histogram (same bucket boundaries as the request histogram).
+    pub fn record_proxy_upstream_latency(&self, latency_ms: u128) {
+        self.proxy_upstream_latency[latency_bucket(latency_ms)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot the per-handler-type and per-vhost breakdowns for the
+    /// renderers.  Returned oldest-config-order for handlers; vhosts in
+    /// map iteration order (renderer sorts as needed).
+    pub fn class_snapshots(&self) -> ClassSnapshots {
+        let by_kind = HANDLER_KIND_ALL
+            .iter()
+            .map(|k| (k.label(), self.per_kind[k.index()].snapshot()))
+            .collect();
+        let map = self.per_vhost.read().unwrap_or_else(|p| p.into_inner());
+        let by_vhost =
+            map.iter().map(|(n, c)| (n.clone(), c.snapshot())).collect();
+        (by_kind, by_vhost)
     }
 
     pub fn inc_active(&self) {
@@ -627,6 +1086,8 @@ impl Metrics {
             (auth, jwt, jwt_exp, jwt_iss)
         };
 
+        let (by_handler, by_vhost) = self.class_snapshots();
+
         Snapshot {
             uptime: self.start_time.elapsed(),
             requests_total: total,
@@ -666,6 +1127,218 @@ impl Metrics {
                 .load(Ordering::Relaxed),
             quic_outbound_handshakes_total: self
                 .quic_outbound_handshakes_total
+                .load(Ordering::Relaxed),
+            stream: self.stream_snap(),
+            datagram: self.datagram_snap(),
+            compression: self.compression_snap(),
+            tls: self.tls_snap(),
+            geoip: self.geoip_snap(),
+            shutdown: self.shutdown_snap(),
+            acme: self.acme_snap(),
+            ocsp: self.ocsp_snap(),
+            lb: self.lb_snap(),
+            upstream: self.upstream_snap(),
+            rate_limit: self.rate_limit_snap(),
+            oidc: self.oidc_snap(),
+            http_conns: HttpConnSnap {
+                active: self.http_conns_active.load(Ordering::Relaxed),
+                total: self.http_conns_total.load(Ordering::Relaxed),
+            },
+            fcgi: BackendSnap {
+                requests: self.fcgi_requests_total.load(Ordering::Relaxed),
+                errors: self.fcgi_errors_total.load(Ordering::Relaxed),
+                in_flight: self.fcgi_in_flight.load(Ordering::Relaxed),
+            },
+            scgi: BackendSnap {
+                requests: self.scgi_requests_total.load(Ordering::Relaxed),
+                errors: self.scgi_errors_total.load(Ordering::Relaxed),
+                in_flight: self.scgi_in_flight.load(Ordering::Relaxed),
+            },
+            cgi: CgiSnap {
+                requests: self.cgi_requests_total.load(Ordering::Relaxed),
+                errors: self.cgi_errors_total.load(Ordering::Relaxed),
+                in_flight: self.cgi_in_flight.load(Ordering::Relaxed),
+                spawn_failures: self
+                    .cgi_spawn_failures_total
+                    .load(Ordering::Relaxed),
+                timeouts: self.cgi_timeouts_total.load(Ordering::Relaxed),
+            },
+            static_files: StaticSnap {
+                bytes_served: self
+                    .static_bytes_served_total
+                    .load(Ordering::Relaxed),
+                not_modified: self
+                    .static_not_modified_total
+                    .load(Ordering::Relaxed),
+                range: self.static_range_total.load(Ordering::Relaxed),
+            },
+            by_handler,
+            by_vhost,
+        }
+    }
+
+    // -- Per-group snapshot loaders --------------------------------
+    // Each reads a subsystem's atomics into its plain-data struct.
+
+    fn stream_snap(&self) -> StreamSnap {
+        StreamSnap {
+            conns_active: self.stream_conns_active.load(Ordering::Relaxed),
+            conns_total: self.stream_conns_total.load(Ordering::Relaxed),
+            bytes_in: self.stream_bytes_in_total.load(Ordering::Relaxed),
+            bytes_out: self.stream_bytes_out_total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn datagram_snap(&self) -> DatagramSnap {
+        DatagramSnap {
+            flows_active: self.datagram_flows_active.load(Ordering::Relaxed),
+            datagrams_in: self.datagrams_in_total.load(Ordering::Relaxed),
+            datagrams_out: self.datagrams_out_total.load(Ordering::Relaxed),
+            bytes_in: self.bytes_in_total.load(Ordering::Relaxed),
+            bytes_out: self.bytes_out_total.load(Ordering::Relaxed),
+            flow_create: self
+                .datagram_flow_create_total
+                .load(Ordering::Relaxed),
+            flow_evict: self
+                .datagram_flow_evict_total
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn compression_snap(&self) -> CompressionSnap {
+        CompressionSnap {
+            responses: self.compress_responses_total.load(Ordering::Relaxed),
+            skipped: self.compress_skipped_total.load(Ordering::Relaxed),
+            bytes_in: self.compress_bytes_in_total.load(Ordering::Relaxed),
+            bytes_out: self.compress_bytes_out_total.load(Ordering::Relaxed),
+            gzip: self.compress_gzip_total.load(Ordering::Relaxed),
+            brotli: self.compress_brotli_total.load(Ordering::Relaxed),
+            zstd: self.compress_zstd_total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn tls_snap(&self) -> TlsSnap {
+        TlsSnap {
+            handshakes: self.tls_handshakes_total.load(Ordering::Relaxed),
+            failures: self
+                .tls_handshake_failures_total
+                .load(Ordering::Relaxed),
+            timeouts: self
+                .tls_handshake_timeouts_total
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn geoip_snap(&self) -> GeoipSnap {
+        GeoipSnap {
+            lookups: self.geoip_lookups_total.load(Ordering::Relaxed),
+            misses: self.geoip_lookup_misses_total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn shutdown_snap(&self) -> ShutdownSnap {
+        ShutdownSnap {
+            drained: self.shutdown_drained_total.load(Ordering::Relaxed),
+            abandoned: self.shutdown_abandoned_total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn acme_snap(&self) -> AcmeSnap {
+        AcmeSnap {
+            issuances: self.acme_issuances_total.load(Ordering::Relaxed),
+            issuance_failures: self
+                .acme_issuance_failures_total
+                .load(Ordering::Relaxed),
+            renewals: self.acme_renewals_total.load(Ordering::Relaxed),
+            renewal_failures: self
+                .acme_renewal_failures_total
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn ocsp_snap(&self) -> OcspSnap {
+        OcspSnap {
+            refreshes: self.ocsp_refreshes.load(Ordering::Relaxed),
+            refresh_failures: self
+                .ocsp_refresh_failures
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn lb_snap(&self) -> LbSnap {
+        LbSnap {
+            picks: self.proxy_lb_picks.load(Ordering::Relaxed),
+            no_upstream: self.proxy_lb_no_upstream.load(Ordering::Relaxed),
+            retries: self.proxy_lb_retries.load(Ordering::Relaxed),
+            ejections: self.proxy_lb_ejections.load(Ordering::Relaxed),
+            health_failures: self
+                .proxy_lb_health_failures
+                .load(Ordering::Relaxed),
+            health_recoveries: self
+                .proxy_lb_health_recoveries
+                .load(Ordering::Relaxed),
+            health_checks: self
+                .proxy_lb_health_checks_total
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn upstream_snap(&self) -> UpstreamSnap {
+        UpstreamSnap {
+            bytes_in: self
+                .proxy_upstream_bytes_in_total
+                .load(Ordering::Relaxed),
+            bytes_out: self
+                .proxy_upstream_bytes_out_total
+                .load(Ordering::Relaxed),
+            connect_errors: self
+                .proxy_upstream_connect_errors_total
+                .load(Ordering::Relaxed),
+            latency: std::array::from_fn(|i| {
+                self.proxy_upstream_latency[i].load(Ordering::Relaxed)
+            }),
+        }
+    }
+
+    fn rate_limit_snap(&self) -> RateLimitSnap {
+        RateLimitSnap {
+            triggers: self.rate_limit_triggers.load(Ordering::Relaxed),
+            active_keys: self.rate_limit_active_keys.load(Ordering::Relaxed),
+        }
+    }
+
+    fn oidc_snap(&self) -> OidcSnap {
+        OidcSnap {
+            refreshes: self.oidc_refreshes.load(Ordering::Relaxed),
+            refresh_failures: self
+                .oidc_refresh_failures
+                .load(Ordering::Relaxed),
+            logouts: self.oidc_logouts.load(Ordering::Relaxed),
+            discoveries: self.oidc_discoveries.load(Ordering::Relaxed),
+            discovery_failures: self
+                .oidc_discovery_failures
+                .load(Ordering::Relaxed),
+            userinfo_failures: self
+                .oidc_userinfo_failures
+                .load(Ordering::Relaxed),
+            backchannel_logouts: self
+                .oidc_backchannel_logouts
+                .load(Ordering::Relaxed),
+            backchannel_failures: self
+                .oidc_backchannel_failures
+                .load(Ordering::Relaxed),
+            bearer_validations: self
+                .oidc_bearer_validations
+                .load(Ordering::Relaxed),
+            bearer_failures: self
+                .oidc_bearer_failures
+                .load(Ordering::Relaxed),
+            revocations: self.oidc_revocations.load(Ordering::Relaxed),
+            revocation_failures: self
+                .oidc_revocation_failures
+                .load(Ordering::Relaxed),
+            callback_iss_mismatches: self
+                .oidc_callback_iss_mismatches
                 .load(Ordering::Relaxed),
         }
     }
@@ -1410,6 +2083,7 @@ mod tests {
                 quic_connections_active: 0,
                 quic_requests_total: 0,
                 quic_outbound_handshakes_total: 0,
+                ..Default::default()
             }
             .uptime_human()
         };
@@ -1549,5 +2223,104 @@ mod tests {
             minute.paths[idx].iter().any(|(p, c)| p == "/test" && *c == 78),
             "consolidated path count"
         );
+    }
+
+    // -- Newly-surfaced subsystem snapshots ------------------------
+
+    #[test]
+    fn snapshot_surfaces_stream_counters() {
+        let m = Metrics::new();
+        m.stream_conns_total.fetch_add(3, Ordering::Relaxed);
+        m.stream_conns_active.fetch_add(2, Ordering::Relaxed);
+        m.stream_bytes_in_total.fetch_add(100, Ordering::Relaxed);
+        m.stream_bytes_out_total.fetch_add(200, Ordering::Relaxed);
+        let s = m.snapshot();
+        assert_eq!(s.stream.conns_total, 3);
+        assert_eq!(s.stream.conns_active, 2);
+        assert_eq!(s.stream.bytes_in, 100);
+        assert_eq!(s.stream.bytes_out, 200);
+    }
+
+    #[test]
+    fn snapshot_surfaces_datagram_counters() {
+        let m = Metrics::new();
+        m.datagram_flows_active.fetch_add(5, Ordering::Relaxed);
+        m.bytes_in_total.fetch_add(42, Ordering::Relaxed);
+        let s = m.snapshot();
+        assert_eq!(s.datagram.flows_active, 5);
+        assert_eq!(s.datagram.bytes_in, 42);
+    }
+
+    #[test]
+    fn snapshot_surfaces_lb_and_upstream_counters() {
+        let m = Metrics::new();
+        m.proxy_lb_picks.fetch_add(7, Ordering::Relaxed);
+        m.proxy_lb_health_checks_total.fetch_add(4, Ordering::Relaxed);
+        m.proxy_upstream_connect_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        m.record_proxy_upstream_latency(5); // bucket 1 (<10ms)
+        let s = m.snapshot();
+        assert_eq!(s.lb.picks, 7);
+        assert_eq!(s.lb.health_checks, 4);
+        assert_eq!(s.upstream.connect_errors, 1);
+        assert_eq!(s.upstream.latency[1], 1);
+    }
+
+    #[test]
+    fn snapshot_surfaces_compression_tls_geoip() {
+        let m = Metrics::new();
+        m.compress_responses_total.fetch_add(2, Ordering::Relaxed);
+        m.compress_zstd_total.fetch_add(2, Ordering::Relaxed);
+        m.tls_handshakes_total.fetch_add(9, Ordering::Relaxed);
+        m.geoip_lookups_total.fetch_add(3, Ordering::Relaxed);
+        m.geoip_lookup_misses_total.fetch_add(1, Ordering::Relaxed);
+        let s = m.snapshot();
+        assert_eq!(s.compression.responses, 2);
+        assert_eq!(s.compression.zstd, 2);
+        assert_eq!(s.tls.handshakes, 9);
+        assert_eq!(s.geoip.lookups, 3);
+        assert_eq!(s.geoip.misses, 1);
+    }
+
+    #[test]
+    fn snapshot_surfaces_oidc_and_backends() {
+        let m = Metrics::new();
+        m.oidc_bearer_validations.fetch_add(6, Ordering::Relaxed);
+        m.fcgi_requests_total.fetch_add(2, Ordering::Relaxed);
+        m.cgi_spawn_failures_total.fetch_add(1, Ordering::Relaxed);
+        m.static_bytes_served_total.fetch_add(4096, Ordering::Relaxed);
+        let s = m.snapshot();
+        assert_eq!(s.oidc.bearer_validations, 6);
+        assert_eq!(s.fcgi.requests, 2);
+        assert_eq!(s.cgi.spawn_failures, 1);
+        assert_eq!(s.static_files.bytes_served, 4096);
+    }
+
+    #[test]
+    fn record_class_aggregates_by_handler_and_vhost() {
+        let m = Metrics::new();
+        m.record_class(HandlerKind::Proxy, "example.com", 200);
+        m.record_class(HandlerKind::Proxy, "example.com", 502);
+        m.record_class(HandlerKind::Static, "other.com", 404);
+        let s = m.snapshot();
+        // Per-handler: proxy has 2 (one 2xx, one 5xx), static has 1 4xx.
+        let proxy = s
+            .by_handler
+            .iter()
+            .find(|(n, _)| *n == "proxy")
+            .map(|(_, c)| *c)
+            .unwrap();
+        assert_eq!(proxy.total, 2);
+        assert_eq!(proxy.s2xx, 1);
+        assert_eq!(proxy.s5xx, 1);
+        // Per-vhost: example.com has 2, other.com has 1.
+        let ex = s
+            .by_vhost
+            .iter()
+            .find(|(n, _)| n == "example.com")
+            .map(|(_, c)| *c)
+            .unwrap();
+        assert_eq!(ex.total, 2);
+        assert_eq!(ex.s4xx, 0);
     }
 }

@@ -80,6 +80,7 @@ pub async fn build_tls_listener_future(
         &deps.cert_registry.load(),
         deps.cert_key_mode,
         cfg.alpn.as_deref(),
+        &deps.metrics,
     )
     .await?;
     let opts = tls_cfg.options.resolve(&deps.tls_defaults);
@@ -276,6 +277,7 @@ pub async fn build_quic_listener_future(
         &deps.cert_registry.load(),
         deps.cert_key_mode,
         cfg.alpn.as_deref(),
+        &deps.metrics,
     )
     .await?;
     let opts = tls_cfg.options.resolve(&deps.tls_defaults);
@@ -361,6 +363,7 @@ pub async fn build_stream_listener_future(
                 &deps.cert_registry.load(),
                 deps.cert_key_mode,
                 cfg.alpn.as_deref(),
+                &deps.metrics,
             )
             .await?;
             (Some(cert_source.tls), acme_handle)
@@ -395,6 +398,7 @@ pub async fn build_stream_listener_future(
         .insert(cfg.local_name(), stop_tx);
     let shutdown_rx = deps.shutdown_rx.clone();
     let geoip = deps.tcp_geoip.clone();
+    let metrics = deps.metrics.clone();
     let bind = cfg.bind.to_url();
     Ok(Box::pin(async move {
         if let Err(e) = crate::listener::run_stream_proxy(
@@ -406,6 +410,7 @@ pub async fn build_stream_listener_future(
             stop_rx,
             access,
             geoip,
+            metrics,
         )
         .await
         {
