@@ -18,13 +18,13 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// return path so a panicking or early-returning request can't leak
 /// the gauge.  The selector is a plain fn pointer (always `'static`),
 /// so the same guard serves the FastCGI/SCGI/CGI gauges.
-pub struct InFlightGuard {
+pub(crate) struct InFlightGuard {
     metrics: Arc<Metrics>,
     sel: fn(&Metrics) -> &AtomicI64,
 }
 
 impl InFlightGuard {
-    pub fn new(
+    pub(crate) fn new(
         metrics: Arc<Metrics>,
         sel: fn(&Metrics) -> &AtomicI64,
     ) -> Self {
@@ -39,13 +39,48 @@ impl Drop for InFlightGuard {
     }
 }
 
+// -- Socket round-trip ---------------------------------------------
+
+/// Open a `unix:` or `tcp:` socket, send `request`, read the full
+/// response.  Used by the FastCGI and SCGI handlers; both protocols
+/// use the same half-duplex framing at the transport level.
+pub(crate) async fn socket_roundtrip(
+    socket: &str,
+    request: &[u8],
+    protocol: &str,
+) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if let Some(path) = socket.strip_prefix("unix:") {
+        let stream = tokio::net::UnixStream::connect(path).await?;
+        let (mut reader, mut writer) = stream.into_split();
+        writer.write_all(request).await?;
+        writer.shutdown().await?;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+        Ok(buf)
+    } else if let Some(addr) = socket.strip_prefix("tcp:") {
+        let stream = tokio::net::TcpStream::connect(addr).await?;
+        let (mut reader, mut writer) = stream.into_split();
+        writer.write_all(request).await?;
+        writer.shutdown().await?;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+        Ok(buf)
+    } else {
+        anyhow::bail!(
+            "unsupported {protocol} socket {socket:?}; \
+             use unix:/path or tcp:host:port"
+        )
+    }
+}
+
 // -- Body collection -----------------------------------------------
 
 /// Collect a streaming request body into bytes.  Increments `errors`
 /// and returns an `Err(502)` response if the body stream fails.
 /// Used by the CGI-family handlers (CGI, FastCGI, SCGI) so the error
 /// path is not repeated three times.
-pub async fn collect_body(
+pub(crate) async fn collect_body(
     body: ReqBody,
     errors: &AtomicU64,
 ) -> Result<Bytes, HttpResponse> {
@@ -58,7 +93,7 @@ pub async fn collect_body(
 
 // -- CGI environment -----------------------------------------------
 
-pub fn build_cgi_env(
+pub(crate) fn build_cgi_env(
     parts: &hyper::http::request::Parts,
     root: &str,
     _matched_prefix: &str,
@@ -150,7 +185,7 @@ pub fn build_cgi_env(
 }
 
 // Split "host[:port]" -> ("host", "port").  Handles IPv6 brackets.
-pub fn split_host_port(host: &str) -> (&str, &str) {
+pub(crate) fn split_host_port(host: &str) -> (&str, &str) {
     if host.starts_with('[')
         && let Some(end) = host.find(']')
     {
@@ -168,7 +203,7 @@ pub fn split_host_port(host: &str) -> (&str, &str) {
 // Parse a CGI-format response (headers + blank line + body) into a
 // hyper Response.  The Status header sets the code (default 200).
 // All other headers are forwarded verbatim.
-pub fn parse_cgi_response(stdout: &[u8]) -> anyhow::Result<HttpResponse> {
+pub(crate) fn parse_cgi_response(stdout: &[u8]) -> anyhow::Result<HttpResponse> {
     let (header_bytes, body) =
         find_header_boundary(stdout).ok_or_else(|| {
             anyhow::anyhow!("CGI response has no header/body separator")
@@ -213,7 +248,7 @@ pub fn parse_cgi_response(stdout: &[u8]) -> anyhow::Result<HttpResponse> {
         .expect("known-valid response builder"))
 }
 
-pub fn find_header_boundary(data: &[u8]) -> Option<(&[u8], &[u8])> {
+pub(crate) fn find_header_boundary(data: &[u8]) -> Option<(&[u8], &[u8])> {
     if let Some(i) = find_subsequence(data, b"\r\n\r\n") {
         return Some((&data[..i], &data[i + 4..]));
     }
@@ -223,7 +258,7 @@ pub fn find_header_boundary(data: &[u8]) -> Option<(&[u8], &[u8])> {
     None
 }
 
-pub fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 

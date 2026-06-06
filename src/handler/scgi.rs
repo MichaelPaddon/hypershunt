@@ -2,7 +2,10 @@
 // headers as a netstring block, forwards to a Unix or TCP socket, and
 // streams the response through parse_cgi_response().
 
-use super::cgi_util::{InFlightGuard, build_cgi_env, collect_body, parse_cgi_response};
+use super::cgi_util::{
+    InFlightGuard, build_cgi_env, collect_body, parse_cgi_response,
+    socket_roundtrip,
+};
 use crate::error::{HttpResponse, response_502};
 use crate::error::ReqBody;
 use crate::handler::Handler;
@@ -12,9 +15,8 @@ use async_trait::async_trait;
 use hyper::Request;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub struct ScgiHandler {
+pub(crate) struct ScgiHandler {
     socket: String,
     root: String,
     index: Option<String>,
@@ -56,7 +58,11 @@ impl Handler for ScgiHandler {
         );
         let request_bytes = build_scgi_request(&env, &body_bytes);
 
-        match self.execute(&request_bytes).await {
+        match socket_roundtrip(
+            &self.socket, &request_bytes, "scgi",
+        )
+        .await
+        {
             Ok(raw) => match parse_cgi_response(&raw) {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -85,7 +91,7 @@ impl Handler for ScgiHandler {
 }
 
 impl ScgiHandler {
-    pub fn new(
+    pub(crate) fn new(
         socket: &str,
         root: &str,
         index: Option<String>,
@@ -100,31 +106,6 @@ impl ScgiHandler {
     }
 
 
-    async fn execute(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if let Some(path) = self.socket.strip_prefix("unix:") {
-            let stream = tokio::net::UnixStream::connect(path).await?;
-            let (mut reader, mut writer) = stream.into_split();
-            writer.write_all(request).await?;
-            writer.shutdown().await?;
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await?;
-            Ok(buf)
-        } else if let Some(addr) = self.socket.strip_prefix("tcp:") {
-            let stream = tokio::net::TcpStream::connect(addr).await?;
-            let (mut reader, mut writer) = stream.into_split();
-            writer.write_all(request).await?;
-            writer.shutdown().await?;
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await?;
-            Ok(buf)
-        } else {
-            anyhow::bail!(
-                "unsupported scgi socket '{}'; \
-                 use unix:/path or tcp:host:port",
-                self.socket
-            )
-        }
-    }
 }
 
 // -- SCGI request encoding -----------------------------------------
@@ -134,7 +115,7 @@ impl ScgiHandler {
 //
 // Netstring format: "${len}:${data}," where data is the concatenation
 // of null-terminated key-value pairs.  CONTENT_LENGTH must be first.
-pub fn build_scgi_request(env: &[(String, String)], body: &[u8]) -> Vec<u8> {
+pub(crate) fn build_scgi_request(env: &[(String, String)], body: &[u8]) -> Vec<u8> {
     // Build the header block.  CONTENT_LENGTH must come first per spec.
     let content_length = body.len().to_string();
     let mut header_block = Vec::new();

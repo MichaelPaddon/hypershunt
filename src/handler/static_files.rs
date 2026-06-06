@@ -27,7 +27,7 @@ use std::time::UNIX_EPOCH;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncRead, AsyncSeekExt, ReadBuf};
 
-pub struct StaticHandler {
+pub(crate) struct StaticHandler {
     // None when the handler runs in `userdir` mode; the root is
     // derived per-request from the requested user's HOME.
     root: Option<PathBuf>,
@@ -69,7 +69,7 @@ pub struct StaticConfig {
 }
 
 impl StaticHandler {
-    pub fn new(cfg: StaticConfig, metrics: Arc<Metrics>) -> Self {
+    pub(crate) fn new(cfg: StaticConfig, metrics: Arc<Metrics>) -> Self {
         Self {
             root: cfg.root.map(PathBuf::from),
             index_files: cfg.index_files,

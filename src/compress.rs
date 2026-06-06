@@ -41,7 +41,7 @@ pub struct CompressionStats {
 // q=0 ("not acceptable") is intentionally not handled -- clients that
 // explicitly opt out of a specific encoding are rare enough not to
 // complicate the hot path.
-pub fn negotiate(accept_encoding: &str) -> Option<Encoding> {
+pub(crate) fn negotiate(accept_encoding: &str) -> Option<Encoding> {
     let mut zstd = false;
     let mut brotli = false;
     let mut gzip = false;
@@ -92,7 +92,7 @@ fn is_compressible(content_type: &str) -> bool {
 // The body is fully buffered before compression; large binary responses
 // are excluded by the content-type filter above so peak memory is
 // bounded to the size of compressible responses.
-pub async fn maybe_compress(
+pub(crate) async fn maybe_compress(
     resp: HttpResponse,
     encoding: Option<Encoding>,
 ) -> (HttpResponse, CompressionStats) {

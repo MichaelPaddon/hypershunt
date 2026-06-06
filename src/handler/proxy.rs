@@ -107,7 +107,7 @@ static HOP_BY_HOP: &[&str] = &[
 /// ([`InnerProxyClient`]) plus an [`UpstreamPool`] that picks one per
 /// request.  A single-upstream configuration produces a 1-element pool
 /// and behaves identically to the pre-LB code path.
-pub struct ProxyHandler {
+pub(crate) struct ProxyHandler {
     /// One inner per upstream; index-aligned with `pool.upstreams()`.
     inners: Vec<InnerProxyClient>,
     /// Picker + per-upstream health state.
@@ -128,7 +128,7 @@ impl ProxyHandler {
     /// pools are built via [`ProxyHandler::new_pool`].
     #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         upstream_str: &str,
         strip_prefix: bool,
         proxy_protocol: Option<ProxyProtocolVersion>,
@@ -174,7 +174,7 @@ impl ProxyHandler {
     /// pool, scheme, and proxy-protocol settings (those knobs live on
     /// the outer `proxy` block, not on individual `upstream` children).
     #[allow(clippy::too_many_arguments)]
-    pub fn new_pool(
+    pub(crate) fn new_pool(
         upstreams_cfg: &[crate::config::UpstreamConfig],
         lb_policy: crate::config::LbPolicy,
         lb_hash_header: Option<String>,
@@ -539,7 +539,7 @@ fn build_probe_uri(upstream: &str, path: &str) -> Option<Uri> {
 
 // -- URI rewriting -------------------------------------------------
 
-pub fn build_backend_uri(
+pub(crate) fn build_backend_uri(
     upstream: &Uri,
     req_uri: &Uri,
     matched_prefix: &str,
@@ -584,7 +584,7 @@ pub fn build_backend_uri(
 
 // -- Header handling -----------------------------------------------
 
-pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
+pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
     // Collect extra headers named in Connection before removing it.
     let connection_listed: Vec<HeaderName> = headers
         .get("connection")

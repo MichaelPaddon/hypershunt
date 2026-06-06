@@ -250,7 +250,7 @@ pub struct UpstreamRow {
 
 // -- Handler -------------------------------------------------------
 
-pub struct StatusHandler {
+pub(crate) struct StatusHandler {
     metrics: Arc<Metrics>,
     summary: Arc<ServerSummary>,
     cert_state: Option<SharedCertState>,
@@ -258,16 +258,16 @@ pub struct StatusHandler {
 }
 
 impl StatusHandler {
-    pub fn new(metrics: Arc<Metrics>, summary: Arc<ServerSummary>) -> Self {
+    pub(crate) fn new(metrics: Arc<Metrics>, summary: Arc<ServerSummary>) -> Self {
         Self { metrics, summary, cert_state: None, lb_registry: None }
     }
 
-    pub fn with_cert_state(mut self, state: SharedCertState) -> Self {
+    pub(crate) fn with_cert_state(mut self, state: SharedCertState) -> Self {
         self.cert_state = Some(state);
         self
     }
 
-    pub fn with_lb_registry(mut self, registry: SharedLbRegistry) -> Self {
+    pub(crate) fn with_lb_registry(mut self, registry: SharedLbRegistry) -> Self {
         self.lb_registry = Some(registry);
         self
     }

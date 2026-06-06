@@ -2,7 +2,10 @@
 // Unix or TCP socket using the binary FastCGI record protocol and
 // streams the response back to the HTTP client.
 
-use super::cgi_util::{InFlightGuard, build_cgi_env, collect_body, parse_cgi_response};
+use super::cgi_util::{
+    InFlightGuard, build_cgi_env, collect_body, parse_cgi_response,
+    socket_roundtrip,
+};
 use crate::error::{HttpResponse, response_502};
 use crate::error::ReqBody;
 use crate::handler::Handler;
@@ -12,7 +15,6 @@ use async_trait::async_trait;
 use hyper::Request;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // -- FastCGI constants ---------------------------------------------
 
@@ -63,28 +65,33 @@ impl Handler for FcgiHandler {
         );
         let request_bytes = build_fcgi_request(&env, &body_bytes);
 
-        match self.execute(&request_bytes).await {
-            Ok(raw) => match parse_fcgi_stdout(&raw) {
-                Ok(stdout) => match parse_cgi_response(&stdout) {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        self.metrics
-                            .fcgi_errors_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(
-                            socket = %self.socket,
-                            "fastcgi: malformed CGI response: {e}"
-                        );
-                        response_502()
-                    }
-                },
+        let raw = match socket_roundtrip(
+            &self.socket, &request_bytes, "fastcgi",
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.metrics
+                    .fcgi_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    socket = %self.socket,
+                    "fastcgi: connection error: {e}"
+                );
+                return response_502();
+            }
+        };
+        match parse_fcgi_stdout(&raw) {
+            Ok(stdout) => match parse_cgi_response(&stdout) {
+                Ok(resp) => resp,
                 Err(e) => {
                     self.metrics
                         .fcgi_errors_total
                         .fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
                         socket = %self.socket,
-                        "fastcgi: protocol error: {e}"
+                        "fastcgi: malformed CGI response: {e}"
                     );
                     response_502()
                 }
@@ -95,7 +102,7 @@ impl Handler for FcgiHandler {
                     .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     socket = %self.socket,
-                    "fastcgi: connection error: {e}"
+                    "fastcgi: protocol error: {e}"
                 );
                 response_502()
             }
@@ -103,7 +110,7 @@ impl Handler for FcgiHandler {
     }
 }
 
-pub struct FcgiHandler {
+pub(crate) struct FcgiHandler {
     socket: String,
     root: String,
     index: Option<String>,
@@ -111,7 +118,7 @@ pub struct FcgiHandler {
 }
 
 impl FcgiHandler {
-    pub fn new(
+    pub(crate) fn new(
         socket: &str,
         root: &str,
         index: Option<String>,
@@ -126,31 +133,6 @@ impl FcgiHandler {
     }
 
 
-    async fn execute(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if let Some(path) = self.socket.strip_prefix("unix:") {
-            let stream = tokio::net::UnixStream::connect(path).await?;
-            let (mut reader, mut writer) = stream.into_split();
-            writer.write_all(request).await?;
-            writer.shutdown().await?;
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await?;
-            Ok(buf)
-        } else if let Some(addr) = self.socket.strip_prefix("tcp:") {
-            let stream = tokio::net::TcpStream::connect(addr).await?;
-            let (mut reader, mut writer) = stream.into_split();
-            writer.write_all(request).await?;
-            writer.shutdown().await?;
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await?;
-            Ok(buf)
-        } else {
-            anyhow::bail!(
-                "unsupported fastcgi socket '{}'; \
-                 use unix:/path or tcp:host:port",
-                self.socket
-            )
-        }
-    }
 }
 
 // -- Record encoding -----------------------------------------------
@@ -187,7 +169,7 @@ fn encode_length(out: &mut Vec<u8>, n: usize) {
     }
 }
 
-pub fn encode_params<K: AsRef<str>, V: AsRef<str>>(vars: &[(K, V)]) -> Vec<u8> {
+pub(crate) fn encode_params<K: AsRef<str>, V: AsRef<str>>(vars: &[(K, V)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (name, value) in vars {
         let n = name.as_ref().as_bytes();
@@ -223,7 +205,7 @@ fn build_fcgi_request(env: &[(String, String)], body: &[u8]) -> Vec<u8> {
 
 // Concatenate FCGI_STDOUT record content from the raw response stream.
 // Stops at FCGI_END_REQUEST.  FCGI_STDERR is logged and discarded.
-pub fn parse_fcgi_stdout(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn parse_fcgi_stdout(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut stdout = Vec::new();
     let mut pos = 0;
     while pos + 8 <= data.len() {
