@@ -24,7 +24,7 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
@@ -52,7 +52,7 @@ jobs:
       # Cache the installed tools keyed on Cargo.lock + arch so a
       # repeated release tag push doesn't reinstall from scratch.
       - name: Cache cargo tools
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin
           key: cargo-tools-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.toml') }}
@@ -93,7 +93,7 @@ jobs:
           cp target/generate-rpm/*.rpm dist/
 
       - name: Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.arch }}
           path: dist/
@@ -106,13 +106,13 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
 
       - name: Download packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: packages-*
           merge-multiple: true
