@@ -11,8 +11,39 @@ use bytes::Bytes;
 use hyper::{Response, StatusCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// Hypershunt logo SVG, inlined for the sidebar brand.
-const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="40 55 600 250" role="img" aria-label="Hypershunt"><line x1="60" y1="180" x2="225" y2="180" stroke="#1e3a5f" stroke-width="2.5" stroke-linecap="round"/><line x1="455" y1="180" x2="620" y2="180" stroke="#1e3a5f" stroke-width="2.5" stroke-linecap="round"/><circle cx="340" cy="180" r="110" fill="#1e3a5f"/><line x1="230" y1="180" x2="238" y2="180" stroke="#FAECE7" stroke-width="2.5" stroke-linecap="round"/><line x1="442" y1="180" x2="450" y2="180" stroke="#FAECE7" stroke-width="2.5" stroke-linecap="round"/><text x="340" y="202" text-anchor="middle" font-family="Futura,'Century Gothic','Avenir Next',sans-serif" font-size="72" font-weight="700" fill="#FAECE7">hypershunt</text></svg>"##;
+// PNG logo embedded at compile time and served from a sub-path so the
+// browser caches it after the first load rather than bloating the HTML.
+pub(super) const LOGO_PNG: &[u8] =
+    include_bytes!("../../../docs/hypershunt-logo.png");
+pub(super) const LOGO_FILE: &str = "hypershunt-logo.png";
+
+/// Serve the PNG logo with a 24-hour cache and ETag support.
+/// Returns 304 Not Modified when the client's ETag matches.
+pub(super) fn serve_logo(
+    headers: &hyper::HeaderMap,
+) -> HttpResponse {
+    let etag = format!("\"{}\"", LOGO_PNG.len());
+    let already_cached = headers
+        .get("if-none-match")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == etag)
+        .unwrap_or(false);
+    if already_cached {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", &etag)
+            .body(bytes_body(Bytes::new()))
+            .expect("known-valid response");
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "image/png")
+        .header("Cache-Control", "public, max-age=86400")
+        .header("Content-Length", LOGO_PNG.len().to_string())
+        .header("ETag", &etag)
+        .body(bytes_body(Bytes::from_static(LOGO_PNG)))
+        .expect("known-valid response")
+}
 
 // All CSS for the status page, kept as a const so format! doesn't
 // need to escape the braces inside it.
@@ -42,7 +73,7 @@ a{color:var(--accent)}
   border-right:1px solid var(--border);position:sticky;top:0;
   height:100vh;overflow-y:auto;display:flex;flex-direction:column}
 .sidebar-brand{padding:.9rem 1rem .75rem;border-bottom:1px solid var(--border)}
-.sidebar-brand svg{width:140px;display:block}
+.sidebar-brand img{width:140px;display:block}
 .sidebar-live{display:flex;align-items:center;gap:.4rem;
   padding:.45rem 1rem;font-size:.78rem;color:var(--muted);
   border-bottom:1px solid var(--border)}
@@ -544,8 +575,16 @@ pub(super) fn render_html(
     sum: &ServerSummary,
     certs: &[CertState],
     upstreams: &[UpstreamRow],
+    matched_prefix: &str,
 ) -> HttpResponse {
     let total_lat: u64 = s.latency.iter().sum();
+    // Logo served from a sub-path relative to wherever the status
+    // location is mounted (/, /status, /.hypershunt/status, …).
+    let logo_src = format!(
+        "{}/{}",
+        matched_prefix.trim_end_matches('/'),
+        LOGO_FILE
+    );
     let resource_sec = resource_section(s.memory_kb, s.cpu_percent);
     let certs_sec = certs_section(certs);
     let listeners_sec = listeners_section(&sum.listeners);
@@ -620,7 +659,6 @@ pub(super) fn render_html(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjIzMCA3MCAyMjAgMjIwIj48Y2lyY2xlIGN4PSIzNDAiIGN5PSIxODAiIHI9IjExMCIgZmlsbD0iIzFlM2E1ZiIvPjx0ZXh0IHg9IjM0MCIgeT0iMTcyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LWZhbWlseT0iRnV0dXJhLCdDZW50dXJ5IEdvdGhpYycsJ0F2ZW5pciBOZXh0JyxzYW5zLXNlcmlmIiBmb250LXNpemU9IjEyMCIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iI0ZBRUNFNyIgZG9taW5hbnQtYmFzZWxpbmU9ImNlbnRyYWwiPmE8L3RleHQ+PC9zdmc+">
 <title>hypershunt — Status</title>
 <style>{css}</style>
 </head>
@@ -628,7 +666,7 @@ pub(super) fn render_html(
 
 <aside class="sidebar">
   <div class="sidebar-brand">
-    <a id="logo-link" href="/" style="display:block">{logo}</a>
+    <a id="logo-link" href="/" style="display:block"><img class="brand-logo" src="{logo_src}" alt="hypershunt" width="140"></a>
   </div>
   <div class="sidebar-live">
     <span class="live-dot" id="live-dot"></span>
@@ -827,7 +865,7 @@ pub(super) fn render_html(
 </body>
 </html>"##,
         css = CSS,
-        logo = LOGO_SVG,
+        logo_src = logo_src,
         version = sum.version,
         mem_nav = mem_nav,
         auth_nav = auth_nav,

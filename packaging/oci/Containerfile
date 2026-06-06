@@ -32,6 +32,9 @@ RUN mkdir src \
 
 # ── Real build ────────────────────────────────────────────────────────────────
 COPY src ./src
+# The status page embeds this PNG via include_bytes! at compile time.
+# Copy only this file so unrelated docs edits don't bust the build cache.
+COPY docs/hypershunt-logo.png ./docs/hypershunt-logo.png
 RUN cargo build --release
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────

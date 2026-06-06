@@ -317,8 +317,19 @@ impl StatusHandler {
     pub async fn serve(
         &self,
         req: Request<ReqBody>,
-        _matched_prefix: &str,
+        matched_prefix: &str,
     ) -> HttpResponse {
+        // Logo requests are intercepted before content-negotiation so
+        // the browser can cache the PNG asset independently of the page.
+        if req
+            .uri()
+            .path()
+            .rsplit('/')
+            .next()
+            == Some(render_html::LOGO_FILE)
+        {
+            return render_html::serve_logo(req.headers());
+        }
         let period = query_period(req.uri());
         let snap = self.metrics.snapshot();
         let sparkline = self.metrics.sparkline_for_period(period);
@@ -334,6 +345,7 @@ impl StatusHandler {
             render_html::render_html(
                 &snap, &sparkline, &top_paths, period,
                 &self.summary, &certs, &upstreams,
+                matched_prefix,
             )
         }
     }
@@ -636,6 +648,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -657,6 +670,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -678,6 +692,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         assert_eq!(resp.status(), 200);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -702,6 +717,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -725,6 +741,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -743,6 +760,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -773,6 +791,7 @@ mod tests {
             &sample_summary(),
             &certs,
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -792,6 +811,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -812,6 +832,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -831,6 +852,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -849,6 +871,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -875,6 +898,7 @@ mod tests {
             &sum,
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -936,6 +960,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -954,6 +979,7 @@ mod tests {
             &stream_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -977,6 +1003,7 @@ mod tests {
             &sample_summary(),
             &[],
             &[],
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -1004,6 +1031,7 @@ mod tests {
             &sample_summary(),
             &[],
             &ups,
+            "",
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
@@ -1257,5 +1285,78 @@ mod tests {
         "#,
         );
         assert_eq!(s.listeners[0].handler_timeout_secs, Some(30));
+    }
+
+    // -- PNG logo endpoint -----------------------------------------
+
+    #[tokio::test]
+    async fn serve_logo_returns_png() {
+        use http_body_util::BodyExt;
+        use hyper::HeaderMap;
+        let resp =
+            render_html::serve_logo(&HeaderMap::new());
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png"),
+        );
+        let bytes =
+            resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(!bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_logo_304_on_matching_etag() {
+        use http_body_util::BodyExt;
+        use hyper::header::HeaderValue;
+        use hyper::HeaderMap;
+        // First request to learn the ETag.
+        let resp =
+            render_html::serve_logo(&HeaderMap::new());
+        let etag = resp
+            .headers()
+            .get("etag")
+            .unwrap()
+            .clone();
+        // Second request with matching If-None-Match.
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("if-none-match", etag);
+        let resp2 = render_html::serve_logo(&hdrs);
+        assert_eq!(resp2.status(), 304);
+        let bytes =
+            resp2.into_body().collect().await.unwrap().to_bytes();
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn render_html_logo_img_src_reflects_prefix() {
+        use http_body_util::BodyExt;
+        let paths: Vec<(String, u64)> = vec![];
+        let resp = render_html(
+            &sample_snap(),
+            &sample_sparkline(),
+            &paths,
+            TimePeriod::Min15,
+            &sample_summary(),
+            &[],
+            &[],
+            "/status",
+        );
+        let bytes =
+            resp.into_body().collect().await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            html.contains(
+                "src=\"/status/hypershunt-logo.png\""
+            ),
+            "img src must use the matched prefix",
+        );
+        // Favicon must not be present.
+        assert!(
+            !html.contains("rel=\"icon\""),
+            "favicon must be absent",
+        );
     }
 }

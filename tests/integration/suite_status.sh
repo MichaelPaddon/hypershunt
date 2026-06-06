@@ -21,6 +21,12 @@ EOF
     assert_body   "status/json_fields" "requests" \
         "http://127.0.0.1:8084/" -H "Accept: application/json"
 
+    # PNG logo served from the sub-path endpoint.
+    assert_status "status/logo_200"    200 \
+        "http://127.0.0.1:8084/hypershunt-logo.png"
+    assert_header "status/logo_type"   "Content-Type" "image/png" \
+        "http://127.0.0.1:8084/hypershunt-logo.png"
+
     stop_server
 }
 
