@@ -1,0 +1,30 @@
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        python3 \
+        libpam0g \
+        libpam-runtime \
+        passwd \
+        slapd \
+        ldap-utils \
+        openssl \
+        zstd \
+        python3-websockets \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/release/hypershunt /usr/bin/hypershunt
+# h3get is built as `cargo build --release --example h3get`.  It is
+# required for the HTTP/3 integration suites because the packaged
+# `curl` doesn't include --http3 support on Debian.
+COPY target/release/examples/h3get /usr/bin/h3get
+# Test-only h2 prior-knowledge CONNECT-extended echo server.  Used
+# by suite_websocket_h2c.sh to drive hypershunt's h1<->h2c upgrade
+# bridge.  Built with `cargo build --release --example
+# h2c_connect_echo`.
+COPY target/release/examples/h2c_connect_echo /usr/bin/h2c_connect_echo
+COPY tests/integration/ /opt/tests/
+RUN chmod +x /opt/tests/run.sh /usr/bin/hypershunt /usr/bin/h3get \
+    /usr/bin/h2c_connect_echo
+
+CMD ["/opt/tests/run.sh"]

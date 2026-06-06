@@ -1,0 +1,283 @@
+[package]
+name = "hypershunt"
+version = "1.0.0-rc7"
+edition = "2024"
+description = "HTTP/reverse-proxy server with TLS, virtual hosts, and static file serving"
+authors = ["Michael Paddon <michael@paddon.org>"]
+license = "BSD-2-Clause"
+
+[[bin]]
+name = "hypershunt"
+path = "src/main.rs"
+
+# Test-only h3 client used by the shell integration suite to round-
+# trip HTTP/3 requests.  Built with `cargo build --example h3get`
+# and copied into the container alongside hypershunt.  Lives as a
+# [[example]] rather than a [[bin]] so it doesn't appear in the
+# packaged binaries.
+[[example]]
+name = "h3get"
+path = "examples/h3get.rs"
+
+# Test-only h2 prior-knowledge CONNECT-extended echo server.  Used
+# by the shell integration suite to exercise hypershunt's h1<->h2c
+# upgrade bridge against a real h2 backend.  Same shipping pattern
+# as `h3get`.
+[[example]]
+name = "h2c_connect_echo"
+path = "examples/h2c_connect_echo.rs"
+
+[dependencies]
+hyper              = { version = "1",    features = ["http1", "http2", "server"] }
+hyper-util         = { version = "0.1",  features = ["tokio", "server", "server-auto", "client", "client-legacy"] }
+http-body-util     = "0.1"
+bytes              = "1"
+rustls             = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+# HTTP/3 stack -- unconditional so the packaged binary always serves
+# both TCP (h1/h2) and UDP (h3) listeners; an operator only needs to
+# declare a `udp:` listener in hypershunt.kdl to enable h3.
+quinn              = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+h3                 = "0.0.8"
+h3-quinn           = "0.0.10"
+rustls-pemfile     = "2"
+tokio-rustls       = "0.26"
+rcgen              = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+instant-acme       = { version = "0.8", default-features = false, features = ["aws-lc-rs", "hyper-rustls"] }
+async-trait        = "0.1"
+arc-swap           = "1"
+x509-parser        = "0.18"
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+tokio              = { version = "1",    features = ["full"] }
+# Adapter for turning tokio mpsc receivers into http_body_util StreamBody.
+# Used by the HTTP/3 outbound proxy to stream upstream response bodies
+# back to the downstream client without buffering them in memory.
+tokio-stream       = "0.1"
+kdl                = "6"
+miette             = { version = "7", default-features = false }
+regex              = "1"
+anyhow             = "1"
+mime_guess         = "2"
+flate2             = "1"
+brotli             = "8"
+# zstd response compression.  Modern browsers negotiate `zstd` on
+# Accept-Encoding (Chrome 123+, Firefox 126+, Safari 17.4+) and it
+# typically beats gzip on size at similar CPU.
+zstd               = "0.13"
+ipnet              = "2"
+hyper-rustls       = { version = "0.27", default-features = false, features = ["aws-lc-rs", "webpki-tokio", "http1", "tls12"] }
+webpki-roots       = "1"
+tower-service      = "0.3"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.6.1", features = ["derive"] }
+base64             = "0.22"
+ldap3      = { version = "0.12.1", default-features = false, features = ["sync", "tls-rustls-aws-lc-rs"] }
+maxminddb  = "0.28"
+zeroize    = "1"
+p256       = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+sha2       = "0.10"
+rand_core  = { version = "0.6", features = ["getrandom"] }
+lru        = "0.16"
+# OAuth/OIDC client used by `auth jwt { wrap oidc { ... } }`.
+# Provides discovery, JWKS fetch, authorization-code + PKCE flow,
+# and ID-token validation.
+openidconnect = "3"
+url           = "2"
+# ASN.1 codec + PKIX/OCSP types for OCSP-stapling support.  Used by
+# src/ocsp.rs to build OCSPRequest blobs to POST to a responder and
+# to parse OCSPResponse / BasicOCSPResponse bytes back out.
+rasn          = "0.28"
+rasn-pkix     = "0.28"
+rasn-ocsp     = "0.28"
+sha1          = "0.10"
+# Hash verifiers for the file-backed Basic-auth back-end
+# (`auth file { path "/etc/hypershunt/htpasswd" }`).  Each crate is
+# narrowly scoped: bcrypt for `$2y$/$2b$`, pwhash for SHA-512 crypt
+# (`$6$`), argon2 for `$argon2id$`.  Other schemes (DES, MD5-crypt,
+# plain) are rejected at parse time -- see src/auth.rs.
+bcrypt        = "0.17"
+pwhash        = "1"
+argon2        = "0.5"
+# chrono is already a transitive dep of `rasn` (its GeneralizedTime
+# is a chrono::DateTime alias).  Name it directly here so src/ocsp.rs
+# can translate the GeneralizedTime into a std::time::SystemTime.
+chrono        = { version = "0.4", default-features = false, features = ["alloc"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["user", "fs", "socket", "process", "signal"] }
+libc = "0.2"
+pam = "0.7"
+
+[features]
+# Route53 DNS-01 provider pulls in the AWS SDK (~30 transitive
+# crates).  Operators who want it opt in via `cargo build --features
+# dns-route53` so the default `cargo build` stays slim.  acme-dns,
+# Cloudflare, and exec providers don't need extra deps and are always
+# compiled in.
+default = []
+dns-route53 = ["aws-config", "aws-sdk-route53"]
+
+[dependencies.aws-config]
+version = "1"
+optional = true
+default-features = false
+features = ["behavior-version-latest", "rustls", "rt-tokio"]
+
+[dependencies.aws-sdk-route53]
+version = "1"
+optional = true
+default-features = false
+features = ["behavior-version-latest", "rustls", "rt-tokio"]
+
+[dev-dependencies]
+tempfile          = "3"
+time              = "0.3"
+# WebSocket client + server for the proxy upgrade-bridge tests.
+# We only need the protocol + handshake helpers; no TLS features
+# (the test backend is plaintext loopback).
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["handshake", "connect"] }
+futures-util      = "0.3"
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
+strip     = "symbols"
+
+[package.metadata.scripts]
+
+# Build with:  cargo run-script smoke
+# Requires:    cargo install cargo-run-script
+smoke = '''
+set -e
+cd "$CARGO_MANIFEST_DIR"
+cargo build --release
+# h3get is the HTTP/3 client used by the integration suite (Debian
+# curl can't do --http3).  Built as a release example so the
+# container picks up an optimised binary.
+cargo build --release --example h3get
+podman build -f tests/integration/Containerfile -t hypershunt-test .
+podman run hypershunt-test
+'''
+
+# Build with:  cargo run-script oci
+# Requires:    cargo install cargo-run-script
+oci = '''
+set -e
+cd "$CARGO_MANIFEST_DIR"
+VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+podman build -f packaging/oci/Containerfile -t "hypershunt:$VERSION" -t hypershunt:latest .
+'''
+
+# -- Debian package ------------------------------------------------
+# Build with:  cargo deb
+# Output:      target/debian/hypershunt_<version>_<arch>.deb
+
+[package.metadata.deb]
+maintainer = "Michael Paddon <michael@paddon.org>"
+copyright  = "2026, Michael Paddon"
+license-file = "LICENSE"
+extended-description-file = "packaging/description.txt"
+depends  = "$auto"
+section  = "net"
+priority = "optional"
+
+# Maintainer scripts (postinst/prerm) live in debian/.
+# Administrator enables the service with:
+#   systemctl enable --now hypershunt
+maintainer-scripts = "packaging/debian"
+
+[[package.metadata.deb.assets]]
+source = "target/release/hypershunt"
+dest   = "usr/bin/hypershunt"
+mode   = "755"
+
+[[package.metadata.deb.assets]]
+source = "packaging/systemd/hypershunt.service"
+dest   = "usr/lib/systemd/system/hypershunt.service"
+mode   = "644"
+
+[[package.metadata.deb.assets]]
+source = "hypershunt.kdl"
+dest   = "etc/hypershunt.kdl"
+mode   = "644"
+
+# Bundled documentation site, installed verbatim from the repo's
+# `docs/` directory.  cargo-deb 3.x walks the `**` glob so adding
+# files under `docs/` requires no Cargo.toml edit.
+[[package.metadata.deb.assets]]
+source = "docs/**/*"
+dest   = "usr/share/doc/hypershunt/site/"
+mode   = "644"
+
+[[package.metadata.deb.assets]]
+source = "docs/hypershunt.1"
+dest   = "usr/share/man/man1/hypershunt.1"
+mode   = "644"
+
+[[package.metadata.deb.assets]]
+source = "packaging/fail2ban/filter.d/hypershunt.conf"
+dest   = "etc/fail2ban/filter.d/hypershunt.conf"
+mode   = "644"
+
+[[package.metadata.deb.assets]]
+source = "packaging/fail2ban/jail.d/hypershunt.conf"
+dest   = "etc/fail2ban/jail.d/hypershunt.conf"
+mode   = "644"
+
+# dpkg preserves these files across upgrades, prompting the user if
+# they have local changes.
+conf-files = ["/etc/hypershunt.kdl",
+              "/etc/fail2ban/filter.d/hypershunt.conf",
+              "/etc/fail2ban/jail.d/hypershunt.conf"]
+
+# -- RPM package ---------------------------------------------------
+# Build with:  cargo generate-rpm   (after cargo build --release)
+# Output:      target/generate-rpm/hypershunt-<version>-1.<arch>.rpm
+# Or simply:   make rpm
+
+[package.metadata.generate-rpm]
+post_install_script  = "packaging/rpm/postinst.sh"
+pre_uninstall_script = "packaging/rpm/prerm.sh"
+
+
+[[package.metadata.generate-rpm.assets]]
+source = "target/release/hypershunt"
+dest   = "/usr/bin/hypershunt"
+mode   = "755"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/systemd/hypershunt.service"
+dest   = "/usr/lib/systemd/system/hypershunt.service"
+mode   = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "hypershunt.kdl"
+dest   = "/etc/hypershunt.kdl"
+mode   = "644"
+config = true
+
+# Bundled documentation site, installed verbatim from the repo's
+# `docs/` directory.  cargo-generate-rpm 0.x supports glob source
+# paths with `**` for recursive matching.
+[[package.metadata.generate-rpm.assets]]
+source = "docs/**/*"
+dest   = "/usr/share/doc/hypershunt/site/"
+mode   = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "docs/hypershunt.1"
+dest   = "/usr/share/man/man1/hypershunt.1"
+mode   = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/fail2ban/filter.d/hypershunt.conf"
+dest   = "/etc/fail2ban/filter.d/hypershunt.conf"
+mode   = "644"
+config = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/fail2ban/jail.d/hypershunt.conf"
+dest   = "/etc/fail2ban/jail.d/hypershunt.conf"
+mode   = "644"
+config = true

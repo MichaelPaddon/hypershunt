@@ -1,0 +1,33 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure|abort-upgrade|abort-deconfigure|abort-remove)
+        # Create system group if not present.
+        if ! getent group hypershunt >/dev/null; then
+            addgroup --system hypershunt
+        fi
+
+        # Create system user if not present.
+        # No login shell, no home directory — service account only.
+        if ! getent passwd hypershunt >/dev/null; then
+            adduser --system --ingroup hypershunt \
+                    --no-create-home --home /nonexistent \
+                    --shell /usr/sbin/nologin \
+                    --gecos "hypershunt HTTP server" hypershunt
+        fi
+
+        # Reload systemd so it sees the new unit files.
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload >/dev/null || true
+        fi
+
+        echo ""
+        echo "hypershunt installed.  To start and enable on boot:"
+        echo "  sudo systemctl enable --now hypershunt"
+        echo ""
+        echo "Edit /etc/hypershunt.kdl before starting."
+        ;;
+esac
+
+#DEBHELPER#

@@ -1,0 +1,587 @@
+// OCSP stapling for TLS listeners.
+//
+// Responsibility split:
+//   - `extract_ocsp_url`  parses the leaf cert's Authority Information
+//     Access extension and returns the first OCSP responder URL.
+//   - `build_request`     hashes the issuer name and SPKI under SHA-1
+//     and serialises an OCSPRequest (no nonce, no signature) DER blob
+//     ready to POST.
+//   - `parse_response`    decodes the responder's reply into a staple
+//     and the validity window so the refresh task knows when to come
+//     back.
+//   - `fetch_staple`      runs the full flow (parse, build, HTTP POST,
+//     parse) and returns the staple bytes + nextUpdate.
+//   - `spawn_refresh_task` runs as a tokio task per CertSource and
+//     republishes the latest staple through the CertPair watch channel
+//     so the existing `VhostAlpnMap` rebuild path picks it up.
+//
+// Failure semantics throughout: best-effort.  A cert with no AIA, an
+// unreachable responder, or a malformed response logs WARN, increments
+// `ocsp_refresh_failures`, and leaves the listener serving without a
+// staple.  Stapling is an optimisation; it must never break TLS.
+
+use anyhow::{Context, Result, anyhow};
+use arc_swap::ArcSwap;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
+use rasn::types::{Integer, OctetString};
+use rasn_ocsp::{
+    BasicOcspResponse, CertId, OcspRequest, OcspResponse, OcspResponseStatus,
+    Request, TbsRequest,
+};
+use rasn_pkix::{
+    AuthorityInfoAccessSyntax, Certificate, Extension, GeneralName,
+};
+use sha1::{Digest, Sha1};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::config::OcspConfig;
+use crate::metrics::Metrics;
+use crate::cert::tls::{CertPair, clone_key};
+
+/// OID 1.3.6.1.5.5.7.1.1 -- id-pe-authorityInfoAccess.
+const OID_AIA: &[u32] = &[1, 3, 6, 1, 5, 5, 7, 1, 1];
+/// OID 1.3.6.1.5.5.7.48.1 -- id-ad-ocsp (the AIA accessMethod that
+/// identifies an OCSP responder URL).
+const OID_AD_OCSP: &[u32] = &[1, 3, 6, 1, 5, 5, 7, 48, 1];
+/// OID 1.3.6.1.5.5.7.48.1.1 -- id-pkix-ocsp-basic; the only response
+/// type rustls actually staples.  Other responses are valid OCSP but
+/// not stapleable, so we reject them as if the fetch had failed.
+const OID_OCSP_BASIC: &[u32] = &[1, 3, 6, 1, 5, 5, 7, 48, 1, 1];
+/// OID 1.3.14.3.2.26 -- SHA-1 hash, the only algorithm every public
+/// responder is required to accept for CertID hashing.  RFC 5019.
+const OID_SHA1: &[u32] = &[1, 3, 14, 3, 2, 26];
+
+/// Parsed result of a successful staple fetch.
+#[derive(Debug)]
+pub struct Staple {
+    /// Raw DER OCSPResponse bytes, passed to rustls verbatim.
+    pub der: Vec<u8>,
+    /// When the responder says this staple becomes invalid; the
+    /// refresh task uses this to schedule the next fetch.  `None`
+    /// when the responder omits `nextUpdate` (rare but legal).
+    pub next_update: Option<SystemTime>,
+}
+
+/// Extract the first OCSP responder URL from a leaf certificate's
+/// AIA extension.  Returns `None` when the cert has no AIA extension,
+/// when AIA has no OCSP entry, or when the URL is not a URI form.
+pub fn extract_ocsp_url(leaf_der: &[u8]) -> Result<Option<String>> {
+    let cert: Certificate = rasn::der::decode(leaf_der)
+        .map_err(|e| anyhow!("decoding leaf cert: {e}"))?;
+    let exts = match cert.tbs_certificate.extensions {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let aia_ext = exts.iter().find(|e: &&Extension| {
+        e.extn_id.as_ref() == OID_AIA
+    });
+    let aia_ext = match aia_ext {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let aia: AuthorityInfoAccessSyntax =
+        rasn::der::decode(aia_ext.extn_value.as_ref())
+            .map_err(|e| anyhow!("decoding AIA extension: {e}"))?;
+    for ad in &aia {
+        if ad.access_method.as_ref() != OID_AD_OCSP {
+            continue;
+        }
+        if let GeneralName::Uri(uri) = &ad.access_location {
+            return Ok(Some(uri.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Build the OCSPRequest body to POST for a leaf cert signed by
+/// `issuer`.  Uses SHA-1 for the issuer name/key hashes; per RFC 5019
+/// this is the lowest-common-denominator that every public responder
+/// is required to support.
+pub fn build_request(
+    leaf_der: &[u8],
+    issuer_der: &[u8],
+) -> Result<Vec<u8>> {
+    let leaf: Certificate = rasn::der::decode(leaf_der)
+        .map_err(|e| anyhow!("decoding leaf cert: {e}"))?;
+    let issuer: Certificate = rasn::der::decode(issuer_der)
+        .map_err(|e| anyhow!("decoding issuer cert: {e}"))?;
+
+    // Issuer Name hash: SHA-1 over the DER encoding of the *leaf's*
+    // issuer name.  This must equal the DER of the issuer's subject;
+    // we use the leaf's view because that is the bytes the responder
+    // expects.
+    let issuer_name_der =
+        rasn::der::encode(&leaf.tbs_certificate.issuer)
+            .map_err(|e| anyhow!("re-encoding issuer name: {e}"))?;
+    let issuer_name_hash = sha1(&issuer_name_der);
+
+    // Issuer Key hash: SHA-1 over the raw bytes of the SPKI's BIT
+    // STRING value (the public key itself, no tag/length prefix).
+    let spki_bits =
+        &issuer.tbs_certificate.subject_public_key_info.subject_public_key;
+    let mut spki_bytes = Vec::with_capacity(spki_bits.len() / 8 + 1);
+    for chunk in spki_bits.as_raw_slice() {
+        spki_bytes.push(*chunk);
+    }
+    let issuer_key_hash = sha1(&spki_bytes);
+
+    let cert_id = CertId {
+        hash_algorithm: rasn_pkix::AlgorithmIdentifier {
+            algorithm: oid(OID_SHA1),
+            parameters: Some(rasn::types::Any::new(vec![0x05, 0x00])),
+        },
+        issuer_name_hash: OctetString::from(issuer_name_hash.to_vec()),
+        issuer_key_hash: OctetString::from(issuer_key_hash.to_vec()),
+        serial_number: leaf.tbs_certificate.serial_number.clone(),
+    };
+
+    let req = OcspRequest {
+        tbs_request: TbsRequest {
+            version: Integer::from(0u8),
+            requestor_name: None,
+            request_list: vec![Request {
+                req_cert: cert_id,
+                single_request_extensions: None,
+            }],
+            request_extensions: None,
+        },
+        optional_signature: None,
+    };
+    rasn::der::encode(&req)
+        .map_err(|e| anyhow!("encoding OCSPRequest: {e}"))
+}
+
+/// Parse an OCSPResponse DER blob into a `Staple` + a sanity check
+/// that the response is `successful` and carries a `BasicOcspResponse`.
+/// Returns an error if the responder said `tryLater` / `unauthorized`
+/// or wrapped a non-basic response type that rustls cannot staple.
+pub fn parse_response(der: &[u8]) -> Result<Staple> {
+    let resp: OcspResponse = rasn::der::decode(der)
+        .map_err(|e| anyhow!("decoding OCSPResponse: {e}"))?;
+    if resp.status != OcspResponseStatus::Successful {
+        return Err(anyhow!(
+            "OCSP responder returned non-success status {:?}",
+            resp.status
+        ));
+    }
+    let body = resp.bytes.ok_or_else(|| {
+        anyhow!("OCSP successful response carried no responseBytes")
+    })?;
+    if body.r#type.as_ref() != OID_OCSP_BASIC {
+        return Err(anyhow!(
+            "OCSP response is not id-pkix-ocsp-basic; cannot staple"
+        ));
+    }
+    let basic: BasicOcspResponse = rasn::der::decode(body.response.as_ref())
+        .map_err(|e| anyhow!("decoding BasicOCSPResponse: {e}"))?;
+    let single = basic
+        .tbs_response_data
+        .responses
+        .first()
+        .ok_or_else(|| anyhow!("OCSP BasicResponse had no SingleResponse"))?;
+    let next_update = single
+        .next_update
+        .as_ref()
+        .map(chrono_to_systemtime);
+    Ok(Staple { der: der.to_vec(), next_update })
+}
+
+/// One-shot OCSP fetch: parse the AIA URL, build the request, POST it
+/// to the responder over hyper, and parse the result.  Honors
+/// `fetch_timeout_secs`.
+pub async fn fetch_staple(
+    leaf_der: &[u8],
+    issuer_der: &[u8],
+    cfg: &OcspConfig,
+) -> Result<Staple> {
+    let url = extract_ocsp_url(leaf_der)?
+        .ok_or_else(|| anyhow!("cert has no AIA OCSP responder URL"))?;
+    let body = build_request(leaf_der, issuer_der)?;
+    let uri: hyper::Uri = url
+        .parse()
+        .with_context(|| format!("parsing OCSP URL '{url}'"))?;
+
+    // Use the same TLS-capable hyper-util client shape as the rest of
+    // the codebase.  Responders typically live on plain HTTP but some
+    // CAs (notably Let's Encrypt's "OCSP responder") front them with
+    // HTTPS, so the connector advertises both.
+    let connector = HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .build();
+    let client: Client<_, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+
+    let req = hyper::Request::builder()
+        .method(hyper::Method::POST)
+        .uri(uri.clone())
+        .header(hyper::header::CONTENT_TYPE, "application/ocsp-request")
+        .header(hyper::header::ACCEPT, "application/ocsp-response")
+        .body(Full::new(Bytes::from(body)))
+        .context("building OCSP HTTP request")?;
+    let timeout = Duration::from_secs(cfg.fetch_timeout_secs);
+    let resp = tokio::time::timeout(timeout, client.request(req))
+        .await
+        .map_err(|_| anyhow!("OCSP HTTP request timed out"))?
+        .with_context(|| format!("POST {uri}"))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "OCSP responder returned HTTP {}",
+            resp.status()
+        ));
+    }
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .context("reading OCSP response body")?
+        .to_bytes();
+    parse_response(&bytes)
+}
+
+/// SHA-1 helper.
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h = Sha1::new();
+    h.update(data);
+    let out = h.finalize();
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&out);
+    a
+}
+
+/// Construct an rasn ObjectIdentifier from a slice of arcs.
+fn oid(arcs: &[u32]) -> rasn::types::ObjectIdentifier {
+    rasn::types::ObjectIdentifier::new(arcs.to_vec()).unwrap()
+}
+
+/// Convert a chrono DateTime<Utc> (rasn's GeneralizedTime alias) into a
+/// std::time::SystemTime.  Times before the unix epoch are clamped to
+/// UNIX_EPOCH so the caller never observes a negative duration.
+fn chrono_to_systemtime(
+    gt: &chrono::DateTime<chrono::FixedOffset>,
+) -> SystemTime {
+    let secs = gt.timestamp();
+    if secs <= 0 {
+        UNIX_EPOCH
+    } else {
+        UNIX_EPOCH + Duration::from_secs(secs as u64)
+    }
+}
+
+/// Cache path for a leaf cert's most-recent staple.  Keyed by the
+/// SHA-256 of the leaf DER so file-cert and ACME-cert flows share a
+/// single namespace under `<state_dir>/ocsp/`.
+fn staple_cache_path(
+    state_dir: &std::path::Path,
+    leaf_der: &[u8],
+) -> PathBuf {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    h.update(leaf_der);
+    let digest = h.finalize();
+    let mut name = String::with_capacity(64 + 4);
+    for b in digest.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut name, "{b:02x}");
+    }
+    name.push_str(".der");
+    state_dir.join("ocsp").join(name)
+}
+
+/// Long-running task that fetches an OCSP staple, publishes it via
+/// `cert_tx`, persists it to disk if a `state_dir` is configured, and
+/// then refreshes shortly before the staple's `nextUpdate`.  The task
+/// terminates only when the channel sender is closed.
+pub fn spawn_refresh_task(
+    label: String,
+    cfg: OcspConfig,
+    state_dir: Option<PathBuf>,
+    cert_rx: tokio::sync::watch::Receiver<Arc<CertPair>>,
+    cert_tx: Arc<ArcSwap<tokio::sync::watch::Sender<Arc<CertPair>>>>,
+    metrics: Arc<Metrics>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !cfg.enabled {
+        return None;
+    }
+    Some(crate::task::spawn_supervised("ocsp.refresh", async move {
+        let mut prior_leaf: Option<Vec<u8>> = None;
+        loop {
+            let pair = cert_rx.borrow().clone();
+            // The cert that we'll be stapling for.  Recapture every
+            // iteration so an ACME renewal swaps in seamlessly.
+            let leaf_der = match pair.chain.first() {
+                Some(c) => c.as_ref().to_vec(),
+                None => {
+                    tracing::warn!(
+                        listener = %label,
+                        "OCSP: empty cert chain; nothing to staple"
+                    );
+                    tokio::time::sleep(Duration::from_secs(
+                        cfg.failure_backoff_secs,
+                    ))
+                    .await;
+                    continue;
+                }
+            };
+            let issuer_der = match pair.chain.get(1) {
+                Some(c) => c.as_ref().to_vec(),
+                None => {
+                    tracing::warn!(
+                        listener = %label,
+                        "OCSP: cert chain has no issuer; cannot staple \
+                         (chain length < 2)"
+                    );
+                    // Wait for a renewal that might bring an issuer.
+                    let mut rx = cert_rx.clone();
+                    let _ = rx.changed().await;
+                    continue;
+                }
+            };
+            // If the cert just rotated, drop the on-disk cache for the
+            // previous leaf so we don't serve a stale staple if a
+            // restart races against a fresh fetch.
+            if let Some(prev) = &prior_leaf
+                && prev != &leaf_der
+                && let Some(sd) = &state_dir
+            {
+                let _ = std::fs::remove_file(staple_cache_path(sd, prev));
+            }
+            prior_leaf = Some(leaf_der.clone());
+
+            let next_delay = match fetch_staple(
+                &leaf_der, &issuer_der, &cfg,
+            )
+            .await
+            {
+                Ok(staple) => {
+                    metrics
+                        .ocsp_refreshes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(sd) = &state_dir {
+                        let path = staple_cache_path(sd, &leaf_der);
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if let Err(e) = std::fs::write(&path, &staple.der) {
+                            tracing::warn!(
+                                listener = %label,
+                                "OCSP: writing staple cache {}: {e:#}",
+                                path.display()
+                            );
+                        }
+                    }
+                    // Publish the staple by sending a fresh CertPair
+                    // through the watch channel.  This triggers the
+                    // existing renewal-watcher path that rebuilds
+                    // VhostAlpnMap and (for QUIC) the ServerConfig.
+                    let delay = schedule_next(&staple, &cfg);
+                    let new_pair = Arc::new(CertPair {
+                        chain: pair.chain.clone(),
+                        key: clone_key(&pair.key),
+                        // Preserve any TLS-ALPN-01 challenge store
+                        // attached to the cert source; only the
+                        // staple bytes are refreshed here.
+                        alpn_store: pair.alpn_store.clone(),
+                        ocsp: staple.der,
+                    });
+                    let tx = cert_tx.load();
+                    if tx.send(new_pair).is_err() {
+                        // No subscribers; nothing to do but log and
+                        // exit gracefully.
+                        tracing::debug!(
+                            listener = %label,
+                            "OCSP: no CertSource subscribers; refresh \
+                             task exiting"
+                        );
+                        return;
+                    }
+                    delay
+                }
+                Err(e) => {
+                    metrics.ocsp_refresh_failures.fetch_add(
+                        1,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    tracing::warn!(
+                        listener = %label,
+                        "OCSP: fetch failed: {e:#}"
+                    );
+                    Duration::from_secs(cfg.failure_backoff_secs)
+                }
+            };
+            tokio::time::sleep(next_delay).await;
+        }
+    }))
+}
+
+/// Pick a refresh delay halfway between now and the staple's
+/// `nextUpdate`, but never less than `min_refresh_secs` (so a
+/// long-lived staple still gets re-checked at the configured floor)
+/// and never more than `nextUpdate - 5 minutes` so we always refresh
+/// before the staple expires.
+fn schedule_next(staple: &Staple, cfg: &OcspConfig) -> Duration {
+    let min = Duration::from_secs(cfg.min_refresh_secs);
+    let now = SystemTime::now();
+    let next = match staple.next_update {
+        Some(t) => t,
+        None => return min,
+    };
+    let total = match next.duration_since(now) {
+        Ok(d) => d,
+        Err(_) => return Duration::from_secs(cfg.failure_backoff_secs),
+    };
+    // Aim for the midpoint; never let the staple expire by leaving
+    // ourselves at least 5 minutes of headroom.
+    let margin = Duration::from_secs(300);
+    let half = total / 2;
+    let cap = total.saturating_sub(margin);
+    let chosen = half.min(cap);
+    if chosen < min { min } else { chosen }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a CA + leaf cert pair with an AIA OCSP URL, using rcgen.
+    /// Returns (leaf DER, issuer DER) so tests can drive the codec
+    /// helpers without a real responder.
+    fn make_chain(ocsp_url: Option<&str>) -> (Vec<u8>, Vec<u8>) {
+        use rcgen::{
+            CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
+        };
+        // CA
+        let mut ca_params =
+            CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca =
+            IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "hypershunt-ocsp-test-CA");
+        ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        let ca_kp = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca_params, ca_kp);
+
+        // Leaf
+        let mut leaf_params =
+            CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "leaf.example.com");
+        if let Some(url) = ocsp_url {
+            // rcgen exposes a custom-extension hook for AIA via
+            // CustomExtension.  Emit a minimal AIA SEQUENCE containing
+            // one AccessDescription { accessMethod=ocsp,
+            // accessLocation=uri }.
+            let aia = encode_aia_ocsp(url);
+            let mut ext = rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 5, 5, 7, 1, 1],
+                aia,
+            );
+            ext.set_criticality(false);
+            leaf_params.custom_extensions.push(ext);
+        }
+        let leaf_kp = KeyPair::generate().unwrap();
+        let leaf = leaf_params.signed_by(&leaf_kp, &issuer).unwrap();
+        (leaf.der().to_vec(), ca_cert.der().to_vec())
+    }
+
+    /// Hand-roll the DER for an AIA SEQUENCE OF (single entry, OCSP +
+    /// URI form).  rcgen's CustomExtension only takes the raw extn
+    /// bytes; we feed it the encoded value of AuthorityInfoAccessSyntax.
+    fn encode_aia_ocsp(url: &str) -> Vec<u8> {
+        use rasn::types::Ia5String;
+        let aia: AuthorityInfoAccessSyntax =
+            vec![rasn_pkix::AccessDescription {
+                access_method: oid(OID_AD_OCSP),
+                access_location: GeneralName::Uri(
+                    Ia5String::try_from(url.as_bytes().to_vec()).unwrap(),
+                ),
+            }];
+        rasn::der::encode(&aia).unwrap()
+    }
+
+    #[test]
+    fn extract_ocsp_url_finds_aia_uri() {
+        let (leaf, _) = make_chain(Some("http://ocsp.example.com/"));
+        let url = extract_ocsp_url(&leaf).unwrap();
+        assert_eq!(url.as_deref(), Some("http://ocsp.example.com/"));
+    }
+
+    #[test]
+    fn extract_ocsp_url_returns_none_when_no_aia() {
+        let (leaf, _) = make_chain(None);
+        let url = extract_ocsp_url(&leaf).unwrap();
+        assert!(url.is_none(), "expected no AIA, got {url:?}");
+    }
+
+    #[test]
+    fn build_request_roundtrips_serial_and_url() {
+        let (leaf, issuer) = make_chain(Some("http://r.example/"));
+        let body = build_request(&leaf, &issuer).unwrap();
+        // It at least round-trips: decoding succeeds and the request
+        // list carries exactly one entry that names the SHA-1 algorithm.
+        let req: OcspRequest = rasn::der::decode(&body).unwrap();
+        assert_eq!(req.tbs_request.request_list.len(), 1);
+        let cert_id = &req.tbs_request.request_list[0].req_cert;
+        assert_eq!(cert_id.hash_algorithm.algorithm.as_ref(), OID_SHA1);
+        assert_eq!(cert_id.issuer_name_hash.len(), 20);
+        assert_eq!(cert_id.issuer_key_hash.len(), 20);
+    }
+
+    #[test]
+    fn parse_response_rejects_non_basic() {
+        // Build an OCSPResponse with status=successful but a fake
+        // response OID that isn't id-pkix-ocsp-basic.  parse_response
+        // must reject it -- rustls only knows how to staple basic
+        // responses.
+        let resp = OcspResponse {
+            status: OcspResponseStatus::Successful,
+            bytes: Some(rasn_ocsp::ResponseBytes {
+                r#type: oid(&[1, 2, 3, 4]),
+                response: OctetString::from(vec![0u8; 4]),
+            }),
+        };
+        let der = rasn::der::encode(&resp).unwrap();
+        let err = parse_response(&der).unwrap_err().to_string();
+        assert!(
+            err.contains("id-pkix-ocsp-basic"),
+            "expected basic-response rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_response_rejects_try_later() {
+        let resp = OcspResponse {
+            status: OcspResponseStatus::TryLater,
+            bytes: None,
+        };
+        let der = rasn::der::encode(&resp).unwrap();
+        let err = parse_response(&der).unwrap_err().to_string();
+        assert!(err.contains("non-success"), "got: {err}");
+    }
+
+    #[test]
+    fn staple_cache_path_is_stable_and_hashed() {
+        let tmp = std::env::temp_dir();
+        let p1 = staple_cache_path(&tmp, b"hello world");
+        let p2 = staple_cache_path(&tmp, b"hello world");
+        let p3 = staple_cache_path(&tmp, b"different");
+        assert_eq!(p1, p2, "same input must hash to same path");
+        assert_ne!(p1, p3, "different input must differ");
+        assert!(
+            p1.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".der")
+        );
+    }
+}

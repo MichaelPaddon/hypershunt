@@ -1,0 +1,968 @@
+use super::kdl::*;
+use super::{
+    BasicAuthConfig, BoundAddr, DtlsListenerConfig, ErrorPageDef,
+    GeoIpConfig, HeaderOpConfig, HealthConfig, ListenerConfig,
+    LocationConfig, ProxyConfig, ProxyProtocolVersion,
+    QuicListenerConfig, ServerConfig, SocketKind, Timeouts,
+    UpstreamDtlsConfig, UpstreamTlsConfig, VHostConfig, VHostName,
+};
+use ::kdl::KdlNode;
+use anyhow::{Context, anyhow, bail};
+use ipnet::IpNet;
+use std::collections::HashMap;
+use std::net::IpAddr;
+
+mod tls;
+pub(super) use tls::parse_certificate;
+use tls::{parse_listener_tls, parse_tls_options};
+
+mod auth;
+use auth::parse_auth_backend;
+
+mod handler;
+use handler::parse_handler;
+
+mod policy;
+use policy::parse_policy_statements;
+
+mod matcher;
+use matcher::parse_matcher;
+
+pub(super) fn node_line(src: &str, node: &KdlNode) -> usize {
+    src[..node.span().offset()]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count()
+        + 1
+}
+
+// Property readers.  Positional args use `arg_str`; repeated
+// single-arg children use `repeated_strs`.
+pub(super) fn prop_str(node: &KdlNode, key: &str) -> Option<String> {
+    node.get(key).and_then(|e| e.as_string()).map(String::from)
+}
+pub(super) fn prop_bool(node: &KdlNode, key: &str) -> Option<bool> {
+    node.get(key).and_then(|e| e.as_bool())
+}
+pub(super) fn prop_i64(node: &KdlNode, key: &str) -> Option<i64> {
+    node.get(key).and_then(|e| e.as_integer()).map(|n| n as i64)
+}
+
+// Three-way: property absent, property = #null, or property = string.
+pub(super) fn prop_null_or_str(
+    node: &KdlNode,
+    key: &str,
+) -> Option<Option<String>> {
+    let v = node.get(key)?;
+    Some(if v.is_null() {
+        None
+    } else {
+        v.as_string().map(String::from)
+    })
+}
+
+// Collect every value of a repeating single-arg child by name.
+//   children:  domain "a"; domain "b"  ->  ["a", "b"]
+pub(super) fn repeated_strs(node: &KdlNode, key: &str) -> Vec<String> {
+    node.children()
+        .map(|doc| {
+            doc.nodes()
+                .iter()
+                .filter(|n| n.name().value() == key)
+                .filter_map(|n| arg_str(n, 0))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(super) fn parse_server(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<ServerConfig> {
+    let tls_defaults = node
+        .children()
+        .and_then(|doc| {
+            doc.nodes().iter().find(|n| n.name().value() == "tls-options")
+        })
+        .map(|n| parse_tls_options(n, src, name))
+        .transpose()?
+        .unwrap_or_default();
+    let auth = node
+        .children()
+        .and_then(|doc| doc.nodes().iter().find(|n| n.name().value() == "auth"))
+        .map(|n| parse_auth_backend(n, src, name))
+        .transpose()?;
+    let geoip = node
+        .children()
+        .and_then(|doc| {
+            doc.nodes().iter().find(|n| n.name().value() == "geoip")
+        })
+        .map(|n| parse_geoip(n, src, name))
+        .transpose()?;
+    let health = node
+        .children()
+        .and_then(|doc| {
+            doc.nodes().iter().find(|n| n.name().value() == "health")
+        })
+        .map(|n| HealthConfig {
+            // `health` enables health endpoint when present.  Use
+            // `health enabled=#false` to explicitly disable.
+            enabled: prop_bool(n, "enabled").unwrap_or(true),
+        })
+        .unwrap_or_default();
+    // Collect named policy blocks defined in the server node.
+    let mut policies = HashMap::new();
+    for child in node.children().map(|d| d.nodes()).unwrap_or_default() {
+        let child_name = child.name().value();
+        if child_name == "policy" {
+            let child_line = node_line(src, child);
+            let policy_name = arg_str(child, 0).ok_or_else(|| {
+                anyhow!(
+                    "{name}:{child_line}: 'policy' requires \
+                     a name argument"
+                )
+            })?;
+            let stmts = parse_policy_statements(child, src, name, false)?;
+            if policies.insert(policy_name.clone(), stmts).is_some() {
+                bail!(
+                    "{name}:{child_line}: duplicate policy \
+                     name '{policy_name}'"
+                );
+            }
+        }
+    }
+
+    // Collect error-page entries from the server node.
+    let mut error_pages = Vec::new();
+    for child in node.children().map(|d| d.nodes()).unwrap_or_default() {
+        if child.name().value() == "error-page" {
+            let child_line = node_line(src, child);
+            let code = child
+                .entries()
+                .iter()
+                .find(|e| e.name().is_none())
+                .and_then(|e| e.value().as_integer())
+                .map(|n| n as u16)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{name}:{child_line}: 'error-page' requires a \
+                     numeric status code as first argument"
+                    )
+                })?;
+            let path = child.get("path").and_then(|e| e.as_string());
+            let html = child.get("html").and_then(|e| e.as_string());
+            let def = match (path, html) {
+                (Some(_), Some(_)) => bail!(
+                    "{name}:{child_line}: 'error-page' accepts only one \
+                     of path=\"...\" or html=\"...\""
+                ),
+                (Some(p), None) => ErrorPageDef::File(p.to_owned()),
+                (None, Some(h)) => ErrorPageDef::Inline(h.to_owned()),
+                (None, None) => bail!(
+                    "{name}:{child_line}: 'error-page' requires \
+                     path=\"...\" or html=\"...\" property"
+                ),
+            };
+            error_pages.push((code, def));
+        }
+    }
+
+    let access_log = node
+        .children()
+        .and_then(|doc| {
+            doc.nodes().iter().find(|n| n.name().value() == "access-log")
+        })
+        .map(|n| parse_access_log(n, src, name))
+        .transpose()?;
+
+    // Reload / binary-upgrade tunables.  Both default to safe values
+    // when the operator hasn't set them; both reject negatives so a
+    // misconfigured value fails parse rather than silently behaving
+    // like 0.
+    let graceful_drain_timeout =
+        parse_nonneg_u32(node, "graceful-drain-timeout", 0)
+            .context("server.graceful-drain-timeout")?;
+    let upgrade_startup_timeout =
+        parse_nonneg_u32(node, "upgrade-startup-timeout", 60)
+            .context("server.upgrade-startup-timeout")?;
+
+    Ok(ServerConfig {
+        state_dir: prop_str(node, "state-dir"),
+        tls_defaults,
+        user: prop_str(node, "user"),
+        group: prop_str(node, "group"),
+        inherit_supplementary_groups: prop_bool(
+            node,
+            "inherit-supplementary-groups",
+        )
+        .unwrap_or(false),
+        auth,
+        geoip,
+        health,
+        policies,
+        error_pages,
+        cert_key_mode: parse_file_mode(node, "cert-key-mode")
+            .context("server.cert-key-mode")?,
+        access_log,
+        graceful_drain_timeout,
+        upgrade_startup_timeout,
+    })
+}
+
+// Helper: read a non-negative-integer property.  Returns the default
+// when absent; errors when present but negative (catches the "I typed
+// -1 expecting 'never'" footgun rather than silently overflowing to a
+// huge u32).
+fn parse_nonneg_u32(
+    node: &KdlNode,
+    key: &str,
+    default: u32,
+) -> anyhow::Result<u32> {
+    match prop_i64(node, key) {
+        Some(v) if v >= 0 && v <= u32::MAX as i64 => Ok(v as u32),
+        Some(v) => bail!(
+            "'{key}' must be a non-negative integer (got {v})"
+        ),
+        None => Ok(default),
+    }
+}
+
+// Parse `access-log "<format>" path="..."` (single-line form).  The
+// positional format is mandatory; without it we error rather than
+// silently fall back to a different format than the operator asked
+// for.  The path is optional for non-tracing formats (stderr if
+// absent) and ignored for `tracing`.
+fn parse_access_log(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<crate::config::AccessLogConfig> {
+    use crate::config::{AccessLogConfig, AccessLogFormatConfig};
+    let line = node_line(src, node);
+    let format_str = req_arg_str(node, 0).with_context(|| {
+        format!(
+            "{name}:{line}: access-log requires a format as its first \
+             argument (tracing | json | common | combined)"
+        )
+    })?;
+    let format = match format_str.as_str() {
+        "tracing" => AccessLogFormatConfig::Tracing,
+        "json" => AccessLogFormatConfig::Json,
+        "common" => AccessLogFormatConfig::Common,
+        "combined" => AccessLogFormatConfig::Combined,
+        other => bail!(
+            "{name}:{line}: unknown access-log format {other:?}; \
+             expected one of: tracing, json, common, combined"
+        ),
+    };
+    let path = prop_str(node, "path");
+    Ok(AccessLogConfig { format, path })
+}
+
+// Parse an octal file-mode string such as "0640" or "0o640".
+// Returns None if the property is absent.
+fn parse_file_mode(node: &KdlNode, key: &str) -> anyhow::Result<Option<u32>> {
+    let Some(s) = prop_str(node, key) else {
+        return Ok(None);
+    };
+    let digits = s
+        .strip_prefix("0o")
+        .or_else(|| s.strip_prefix('0'))
+        .unwrap_or(s.as_str());
+    u32::from_str_radix(digits, 8)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid octal mode: {s:?}"))
+}
+
+fn parse_geoip(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<GeoIpConfig> {
+    let line = node_line(src, node);
+    let db = prop_str(node, "db").ok_or_else(|| {
+        anyhow!(
+            "{name}:{line}: geoip requires db=\"<path-to-.mmdb>\""
+        )
+    })?;
+    Ok(GeoIpConfig { db })
+}
+
+// Returns (config, raw_default_vhost) where raw_default_vhost is:
+//   None          - child node absent; resolved to first vhost
+//   Some(None)    - explicitly set to null
+//   Some(Some(s)) - explicitly set to a hostname string
+pub(super) fn parse_listener(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<(ListenerConfig, Option<Option<String>>)> {
+    let line = node_line(src, node);
+    let bind_str = req_arg_str(node, 0).with_context(|| {
+        format!("{name}:{line}: listener requires a bind URL")
+    })?;
+    let bind = BoundAddr::parse(&bind_str)
+        .with_context(|| format!("{name}:{line}: invalid listener bind"))?;
+    let children = node.children().map(|d| d.nodes()).unwrap_or_default();
+    // Encryption layer.  The block name maps to the listener's
+    // socket shape:
+    //   tls "<kind>"  ->  byte-stream listeners only
+    //   quic { tls .. } -> udp:// only          (implies HTTP/3)
+    //   dtls { tls .. } -> udp:// only          (reserved)
+    let mut tls: Option<crate::config::TlsListenerConfig> = None;
+    let mut quic: Option<QuicListenerConfig> = None;
+    let mut dtls: Option<DtlsListenerConfig> = None;
+    if bind.kind == SocketKind::UdpDgram {
+        if let Some(bad) =
+            children.iter().find(|n| n.name().value() == "tls")
+        {
+            let ln = node_line(src, bad);
+            bail!(
+                "{name}:{ln}: 'tls' is only valid on byte-stream \
+                 listeners; udp:// listeners use `quic {{ tls ... }}` \
+                 (HTTP/3) or `dtls {{ tls ... }}` (reserved)"
+            );
+        }
+        if let Some(qn) =
+            children.iter().find(|n| n.name().value() == "quic")
+        {
+            let body = qn.children().map(|d| d.nodes()).unwrap_or_default();
+            let inner = parse_listener_tls(body.iter(), src, name)?
+                .ok_or_else(|| {
+                    let ln = node_line(src, qn);
+                    anyhow!(
+                        "{name}:{ln}: `quic` block requires a `tls` \
+                         child"
+                    )
+                })?;
+            quic = Some(QuicListenerConfig { tls: inner });
+        }
+        if let Some(dn) =
+            children.iter().find(|n| n.name().value() == "dtls")
+        {
+            let body = dn.children().map(|d| d.nodes()).unwrap_or_default();
+            let inner = parse_listener_tls(body.iter(), src, name)?
+                .ok_or_else(|| {
+                    let ln = node_line(src, dn);
+                    anyhow!(
+                        "{name}:{ln}: `dtls` block requires a `tls` \
+                         child"
+                    )
+                })?;
+            dtls = Some(DtlsListenerConfig { tls: inner });
+        }
+    } else {
+        for sibling in &["quic", "dtls"] {
+            if let Some(bad) =
+                children.iter().find(|n| n.name().value() == *sibling)
+            {
+                let ln = node_line(src, bad);
+                bail!(
+                    "{name}:{ln}: '{sibling}' is only valid on udp:// \
+                     listeners"
+                );
+            }
+        }
+        tls = parse_listener_tls(children.iter(), src, name)?;
+    }
+    // Optional repeated `alpn "h2"; alpn "http/1.1"` children override
+    // the listener's default ALPN list.  An empty list (no children)
+    // means "use defaults"; an `alpn` child with no positional value
+    // is a config error rather than a silent skip.
+    for c in children.iter() {
+        if c.name().value() == "alpn"
+            && c.entries().iter().all(|e| e.name().is_some())
+        {
+            let ln = node_line(src, c);
+            bail!(
+                "{name}:{ln}: 'alpn' requires a protocol identifier \
+                 (e.g. `alpn \"h2\"`)"
+            );
+        }
+    }
+    let alpn_values = repeated_strs(node, "alpn");
+    let alpn = if alpn_values.is_empty() {
+        None
+    } else {
+        Some(alpn_values)
+    };
+    // Optional `quic-transport ...` block.  All knobs are properties
+    // on the node; absent knobs fall back to quinn defaults.  Only
+    // meaningful for udp: listeners but parsed unconditionally so
+    // misplaced config produces a clear error rather than being
+    // silently ignored.
+    let quic_transport: Option<crate::config::QuicTransport> = children
+        .iter()
+        .find(|n| n.name().value() == "quic-transport")
+        .map(|n| -> anyhow::Result<crate::config::QuicTransport> {
+            let line = node_line(src, n);
+            if bind.kind != SocketKind::UdpDgram {
+                bail!(
+                    "{name}:{line}: 'quic-transport' is only valid on \
+                     udp:// listeners"
+                );
+            }
+            Ok(crate::config::QuicTransport {
+                max_concurrent_bidi_streams: prop_i64(
+                    n, "max-concurrent-bidi-streams",
+                )
+                .map(|v| v as u64),
+                max_idle_timeout_secs: prop_i64(n, "max-idle-timeout")
+                    .map(|v| v as u64),
+                keep_alive_interval_secs: prop_i64(n, "keep-alive-interval")
+                    .map(|v| v as u64),
+                zero_rtt_enabled: prop_bool(n, "zero-rtt").unwrap_or(false),
+                retry_tokens: prop_bool(n, "retry-tokens").unwrap_or(true),
+                retry_token_lifetime_secs: prop_i64(
+                    n, "retry-token-lifetime",
+                )
+                .map(|v| v as u64),
+            })
+        })
+        .transpose()?;
+    // A 'proxy' child activates proxy mode.  Stream listeners forward
+    // by connection, message listeners forward by datagram; the
+    // upstream URL scheme must match the listener's family (validated
+    // in Config::validate).
+    let proxy_node = children.iter().find(|n| n.name().value() == "proxy");
+    if let Some(proxy) = proxy_node {
+        let proxy_line = node_line(src, proxy);
+        // HTTP-only options are invalid in L4-proxy mode.
+        if node.get("default-vhost").is_some() {
+            bail!(
+                "{name}:{proxy_line}: 'default-vhost' is only valid in \
+                 HTTP listeners; L4 proxy listeners do not route by \
+                 virtual host"
+            );
+        }
+        if children.iter().any(|n| n.name().value() == "timeouts") {
+            bail!(
+                "{name}:{proxy_line}: 'timeouts' is only valid in HTTP \
+                 listeners"
+            );
+        }
+        let upstream_str = req_arg_str(proxy, 0)
+            .with_context(|| format!("{name}:{proxy_line}"))?;
+        let upstream = BoundAddr::parse(&upstream_str).with_context(
+            || format!("{name}:{proxy_line}: invalid proxy upstream"),
+        )?;
+        let proxy_children =
+            proxy.children().map(|d| d.nodes()).unwrap_or_default();
+        let upstream_tls = proxy_children
+            .iter()
+            .find(|n| n.name().value() == "tls")
+            .map(|tls_node| UpstreamTlsConfig {
+                skip_verify: prop_bool(tls_node, "skip-verify")
+                    .unwrap_or(false),
+            });
+        // `dtls` upstream block: reserved syntactically.  Carry an
+        // empty UpstreamDtlsConfig so validate() can bail with "not
+        // yet implemented" downstream.
+        let upstream_dtls = proxy_children
+            .iter()
+            .find(|n| n.name().value() == "dtls")
+            .map(|q_node| UpstreamDtlsConfig {
+                skip_verify: prop_bool(q_node, "skip-verify")
+                    .unwrap_or(false),
+            });
+        let proxy_protocol = prop_str(proxy, "proxy-protocol")
+            .map(|v| parse_proxy_protocol(&v, name, proxy_line))
+            .transpose()?;
+        let flow_idle_timeout_secs =
+            prop_i64(proxy, "flow-idle-timeout").map(|v| v as u64);
+        let policy = children
+            .iter()
+            .find(|n| n.name().value() == "policy")
+            .map(|n| parse_policy_statements(n, src, name, true))
+            .transpose()?;
+        let proxy_cfg = Some(ProxyConfig {
+            upstream,
+            upstream_tls,
+            upstream_dtls,
+            proxy_protocol,
+            policy,
+            flow_idle_timeout_secs,
+        });
+        let accept_proxy_protocol = prop_str(node, "accept-proxy-protocol")
+            .map(|v| parse_proxy_protocol(&v, name, line))
+            .transpose()?;
+        let trusted_proxies = parse_trusted_proxies(node, src, name)?;
+        if !trusted_proxies.is_empty() && accept_proxy_protocol.is_none() {
+            bail!(
+                "{name}:{line}: 'trusted-proxies' requires \
+                 'accept-proxy-protocol' on the same listener"
+            );
+        }
+        let max_connections =
+            prop_i64(node, "max-connections").map(|n| n as u32);
+        return Ok((
+            ListenerConfig {
+                bind,
+                tls,
+                quic,
+                dtls,
+                proxy: proxy_cfg,
+                accept_proxy_protocol,
+                trusted_proxies,
+                default_vhost: None,
+                timeouts: Timeouts::default(),
+                max_connections,
+                max_request_body: None,
+                auto_alt_svc: None,
+                alpn: alpn.clone(),
+                quic_transport: quic_transport.clone(),
+            },
+            // No raw default-vhost for proxy listeners.
+            Some(None),
+        ));
+    }
+
+    // HTTP mode.
+    if let Some(bad) = children.iter().find(|n| n.name().value() == "policy") {
+        let line = node_line(src, bad);
+        bail!(
+            "{name}:{line}: 'policy' at the listener level is only valid \
+             for stream listeners; put 'policy' inside a 'location' block"
+        );
+    }
+    let raw_default_vhost = prop_null_or_str(node, "default-vhost");
+    let timeouts = children
+        .iter()
+        .find(|n| n.name().value() == "timeouts")
+        .map(parse_timeouts)
+        .unwrap_or_default();
+    let accept_proxy_protocol = prop_str(node, "accept-proxy-protocol")
+        .map(|v| parse_proxy_protocol(&v, name, line))
+        .transpose()?;
+    let trusted_proxies = parse_trusted_proxies(node, src, name)?;
+    if !trusted_proxies.is_empty() && accept_proxy_protocol.is_none() {
+        bail!(
+            "{name}:{line}: 'trusted-proxies' requires \
+             'accept-proxy-protocol' on the same listener"
+        );
+    }
+    let max_connections =
+        prop_i64(node, "max-connections").map(|n| n as u32);
+    let max_request_body =
+        prop_i64(node, "max-request-body").map(|n| n as u64);
+    // default_vhost is resolved later in Config::parse.
+    Ok((
+        ListenerConfig {
+            bind,
+            tls,
+            quic,
+            dtls,
+            proxy: None,
+            accept_proxy_protocol,
+            trusted_proxies,
+            default_vhost: None,
+            timeouts,
+            max_connections,
+            max_request_body,
+            auto_alt_svc: None,
+            alpn: alpn.clone(),
+            quic_transport: quic_transport.clone(),
+        },
+        raw_default_vhost,
+    ))
+}
+
+// Parse the listener's repeating `trusted-proxies "<cidr>"` children
+// into a Vec<IpNet>.  Accepts bare IP addresses (treated as /32 or
+// /128) or CIDR ranges.  An empty list means "no allowlist enforced";
+// only malformed entries are rejected.
+fn parse_trusted_proxies(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<Vec<IpNet>> {
+    let mut nets = Vec::new();
+    let Some(children) = node.children() else {
+        return Ok(nets);
+    };
+    for n in children.nodes() {
+        if n.name().value() != "trusted-proxies" {
+            continue;
+        }
+        let line = node_line(src, n);
+        let s = req_arg_str(n, 0).with_context(|| {
+            format!(
+                "{name}:{line}: trusted-proxies requires a single IP \
+                 address or CIDR argument (repeat the node for more \
+                 entries)"
+            )
+        })?;
+        let net = s
+            .parse::<IpNet>()
+            .or_else(|_| s.parse::<IpAddr>().map(IpNet::from))
+            .map_err(|_| {
+                anyhow!(
+                    "{name}:{line}: invalid IP address or CIDR '{s}' \
+                     in 'trusted-proxies'"
+                )
+            })?;
+        nets.push(net);
+    }
+    Ok(nets)
+}
+
+pub(super) fn parse_proxy_protocol(
+    v: &str,
+    name: &str,
+    line: usize,
+) -> anyhow::Result<ProxyProtocolVersion> {
+    match v {
+        "v1" => Ok(ProxyProtocolVersion::V1),
+        "v2" => Ok(ProxyProtocolVersion::V2),
+        other => bail!(
+            "{name}:{line}: unknown proxy-protocol '{other}'; \
+             expected 'v1' or 'v2'"
+        ),
+    }
+}
+
+fn parse_timeouts(node: &KdlNode) -> Timeouts {
+    Timeouts {
+        request_header_secs: prop_i64(node, "request-header")
+            .map(|n| n as u64),
+        handler_secs: prop_i64(node, "handler").map(|n| n as u64),
+        keepalive_secs: prop_i64(node, "keepalive").map(|n| n as u64),
+    }
+}
+
+pub(super) fn parse_vhost(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<VHostConfig> {
+    let vhost_name = parse_vhost_name(node)?;
+    let children = node.children().map(|d| d.nodes()).unwrap_or_default();
+    let mut aliases = Vec::new();
+    let mut locations = Vec::new();
+    for child in children {
+        let child_line = node_line(src, child);
+        match child.name().value() {
+            "alias" => aliases.push(parse_vhost_name(child)?),
+            "location" => locations.push(parse_location(child, src, name)?),
+            "alpn" => {
+                // Single-arg repeating child (rule 4); collected
+                // below via repeated_strs.  An `alpn` child with no
+                // positional value is a config error rather than a
+                // silent skip.
+                if child.entries().iter().all(|e| e.name().is_some()) {
+                    bail!(
+                        "{name}:{child_line}: 'alpn' requires at \
+                         least one protocol identifier (e.g. \
+                         `alpn \"h2\"`)"
+                    );
+                }
+            }
+            other => bail!(
+                "{name}:{child_line}: unknown node '{other}' \
+                 in vhost '{}'",
+                vhost_name.value
+            ),
+        }
+    }
+    let alpn_values = repeated_strs(node, "alpn");
+    let alpn = if alpn_values.is_empty() {
+        None
+    } else {
+        Some(alpn_values)
+    };
+    Ok(VHostConfig {
+        name: vhost_name,
+        aliases,
+        locations,
+        alpn,
+    })
+}
+
+fn parse_vhost_name(node: &KdlNode) -> anyhow::Result<VHostName> {
+    let value = req_arg_str(node, 0)?;
+    let regex = node.get("regex").and_then(|e| e.as_bool()).unwrap_or(false);
+    Ok(VHostName { value, regex })
+}
+
+fn parse_location(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<LocationConfig> {
+    let line = node_line(src, node);
+    let path = req_arg_str(node, 0)?;
+    let children = node.children().map(|d| d.nodes()).unwrap_or_default();
+    // The first recognised handler node wins.
+    let handler_node = children
+        .iter()
+        .find(|n| {
+            matches!(
+                n.name().value(),
+                "static"
+                    | "proxy"
+                    | "redirect"
+                    | "fastcgi"
+                    | "scgi"
+                    | "cgi"
+                    | "status"
+                    | "auth-request"
+            )
+        })
+        .ok_or_else(|| {
+            anyhow!("{name}:{line}: location '{path}' has no handler node")
+        })?;
+    let handler = parse_handler(handler_node, src, name, &path)?;
+    let policy = children
+        .iter()
+        .find(|n| n.name().value() == "policy")
+        .map(|n| parse_policy_statements(n, src, name, false))
+        .transpose()?;
+    let auth = children
+        .iter()
+        .find(|n| n.name().value() == "basic-auth")
+        .map(|n| BasicAuthConfig {
+            realm: prop_str(n, "realm")
+                .unwrap_or_else(|| "Restricted".to_owned()),
+        });
+    let request_headers = children
+        .iter()
+        .find(|n| n.name().value() == "request-headers")
+        .map(|n| parse_header_ops(n, src, name))
+        .transpose()?
+        .unwrap_or_default();
+    let response_headers = children
+        .iter()
+        .find(|n| n.name().value() == "response-headers")
+        .map(|n| parse_header_ops(n, src, name))
+        .transpose()?
+        .unwrap_or_default();
+    let mut rate_limits: Vec<crate::config::RateLimitConfig> = Vec::new();
+    for (idx, n) in children
+        .iter()
+        .filter(|n| n.name().value() == "rate-limit")
+        .enumerate()
+    {
+        rate_limits.push(parse_rate_limit(
+            n,
+            src,
+            name,
+            &path,
+            idx,
+        )?);
+    }
+    let max_request_body =
+        prop_i64(node, "max-request-body").map(|n| n as u64);
+    let matcher = children
+        .iter()
+        .find(|n| n.name().value() == "match")
+        .map(|n| parse_matcher(n, src, name))
+        .transpose()?;
+    let rewrite = children
+        .iter()
+        .find(|n| n.name().value() == "rewrite")
+        .map(|n| parse_rewrite(n, src, name))
+        .transpose()?;
+    Ok(LocationConfig {
+        path,
+        handler,
+        policy,
+        auth,
+        request_headers,
+        response_headers,
+        rate_limits,
+        max_request_body,
+        matcher,
+        rewrite,
+    })
+}
+
+/// Parse a `rewrite from="<regex>" to="<template>"` directive on a
+/// location.  Both properties are required.  The regex is compiled at
+/// parse time so the operator sees malformed patterns immediately.
+/// The replacement template is not validated against the capture-group
+/// set here; an undefined capture quietly produces an empty substring
+/// at request time, matching `regex::Regex::replace`'s behaviour.
+fn parse_rewrite(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<crate::config::RewriteConfig> {
+    let line = node_line(src, node);
+    let from = prop_str(node, "from").ok_or_else(|| {
+        anyhow!("{name}:{line}: rewrite requires from=\"<regex>\"")
+    })?;
+    let to = prop_str(node, "to").ok_or_else(|| {
+        anyhow!("{name}:{line}: rewrite requires to=\"<template>\"")
+    })?;
+    regex::Regex::new(&from).map_err(|e| {
+        anyhow!("{name}:{line}: rewrite invalid `from` regex: {e}")
+    })?;
+    Ok(crate::config::RewriteConfig { from, to })
+}
+
+/// Parse one `rate-limit rate=N per="second" burst=N name="..." key=...`
+/// block.  All scalars are properties on the rate-limit node; `key`
+/// remains a child node because it has an internal structure
+/// (`key "header" "X-Foo"`) that doesn't compress into a property.
+fn parse_rate_limit(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+    loc_path: &str,
+    idx: usize,
+) -> anyhow::Result<crate::config::RateLimitConfig> {
+    let line = node_line(src, node);
+    let rate_raw = prop_i64(node, "rate").ok_or_else(|| {
+        anyhow!("{name}:{line}: rate-limit requires rate=<integer>")
+    })?;
+    if rate_raw <= 0 {
+        bail!(
+            "{name}:{line}: rate-limit `rate` must be > 0 (got \
+             {rate_raw})"
+        );
+    }
+    let per_secs = match prop_str(node, "per")
+        .as_deref()
+        .unwrap_or("second")
+    {
+        "second" => 1.0,
+        "minute" => 60.0,
+        "hour" => 3600.0,
+        other => bail!(
+            "{name}:{line}: rate-limit unknown per={other:?}; \
+             expected second, minute, or hour"
+        ),
+    };
+    let rate_per_sec = rate_raw as f64 / per_secs;
+    let burst = prop_i64(node, "burst")
+        .map(|n| {
+            if n <= 0 {
+                Err(anyhow!(
+                    "{name}:{line}: rate-limit `burst` must be > 0 \
+                     (got {n})"
+                ))
+            } else {
+                Ok(n as f64)
+            }
+        })
+        .transpose()?
+        .unwrap_or(rate_raw as f64);
+    let key_node = node.children().and_then(|d| {
+        d.nodes().iter().find(|n| n.name().value() == "key")
+    });
+    let key_node = key_node.ok_or_else(|| {
+        anyhow!(
+            "{name}:{line}: rate-limit requires a `key \"client-ip\"`, \
+             `key \"user\"`, or `key \"header\" \"<Name>\"` child"
+        )
+    })?;
+    let key = parse_rate_limit_key(key_node, src, name)?;
+    let rule_name = prop_str(node, "name").unwrap_or_else(
+        || format!("{}-rl-{}", loc_path.trim_matches('/'), idx),
+    );
+    Ok(crate::config::RateLimitConfig {
+        name: rule_name,
+        rate_per_sec,
+        burst,
+        key,
+    })
+}
+
+fn parse_rate_limit_key(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<crate::config::RateLimitKeyConfig> {
+    let line = node_line(src, node);
+    let kind = arg_str(node, 0).ok_or_else(|| {
+        anyhow!(
+            "{name}:{line}: rate-limit `key` requires a form \
+             (client-ip | user | header \"<Name>\")"
+        )
+    })?;
+    match kind.as_str() {
+        "client-ip" => Ok(crate::config::RateLimitKeyConfig::ClientIp),
+        "user" => Ok(crate::config::RateLimitKeyConfig::User),
+        "header" => {
+            let header = arg_str(node, 1).ok_or_else(|| {
+                anyhow!(
+                    "{name}:{line}: rate-limit `key \"header\"` \
+                     requires a header name (e.g. `key \"header\" \
+                     \"X-API-Key\"`)"
+                )
+            })?;
+            // Validate as a real header name; reject early so the
+            // runtime path can't hit a Header parse error.
+            hyper::header::HeaderName::from_bytes(header.as_bytes())
+                .map_err(|e| {
+                    anyhow!(
+                        "{name}:{line}: rate-limit invalid header \
+                         name {header:?}: {e}"
+                    )
+                })?;
+            Ok(crate::config::RateLimitKeyConfig::Header(
+                header.to_ascii_lowercase(),
+            ))
+        }
+        other => bail!(
+            "{name}:{line}: rate-limit unknown key form {other:?}; \
+             expected client-ip, user, or header"
+        ),
+    }
+}
+
+
+// Parse a `request-headers { }` or `response-headers { }` block.
+//
+//   request-headers {
+//       set "X-Client-IP" "{client_ip}"
+//       add "Vary"        "accept"
+//       remove "Authorization"
+//   }
+fn parse_header_ops(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<Vec<HeaderOpConfig>> {
+    let children = node.children().map(|d| d.nodes()).unwrap_or_default();
+    let parse_two_arg = |child: &KdlNode,
+                         op: &str,
+                         child_line: usize|
+     -> anyhow::Result<(String, String)> {
+        let hname = req_arg_str(child, 0)
+            .with_context(|| format!("{name}:{child_line}"))?;
+        let value = req_arg_str(child, 1).with_context(|| {
+            anyhow!(
+                "{name}:{child_line}: '{op}' requires a \
+                 header name and a value"
+            )
+        })?;
+        Ok((hname, value))
+    };
+    let mut ops = Vec::new();
+    for child in children {
+        let child_line = node_line(src, child);
+        match child.name().value() {
+            "set" => {
+                let (hname, value) = parse_two_arg(child, "set", child_line)?;
+                ops.push(HeaderOpConfig::Set { name: hname, value });
+            }
+            "add" => {
+                let (hname, value) = parse_two_arg(child, "add", child_line)?;
+                ops.push(HeaderOpConfig::Add { name: hname, value });
+            }
+            "remove" => {
+                let hname = req_arg_str(child, 0)
+                    .with_context(|| format!("{name}:{child_line}"))?;
+                ops.push(HeaderOpConfig::Remove { name: hname });
+            }
+            other => bail!(
+                "{name}:{child_line}: unknown header operation \
+                 '{other}'; expected 'set', 'add', or 'remove'"
+            ),
+        }
+    }
+    Ok(ops)
+}
+

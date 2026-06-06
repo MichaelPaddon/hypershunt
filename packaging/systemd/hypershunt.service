@@ -1,0 +1,30 @@
+[Unit]
+Description=hypershunt HTTP server
+Documentation=man:hypershunt(1)
+After=network.target
+
+[Service]
+Type=simple
+# Start as root so hypershunt can bind privileged ports, then drop to the
+# hypershunt user/group via "server user=hypershunt" in hypershunt.kdl.
+ExecStart=/usr/bin/hypershunt --config /etc/hypershunt.kdl
+Restart=on-failure
+RestartSec=5
+
+# /var/lib/hypershunt is created automatically and owned by root on startup,
+# then accessible to the hypershunt user after the privilege drop.
+# Use server state-dir="/var/lib/hypershunt" in hypershunt.kdl for ACME storage.
+StateDirectory=hypershunt
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

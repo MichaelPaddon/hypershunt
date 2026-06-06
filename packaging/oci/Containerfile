@@ -1,0 +1,78 @@
+# ── Builder stage ─────────────────────────────────────────────────────────────
+FROM rust:1-slim-trixie AS builder
+
+# aws-lc-rs build requirements: cmake (build system), clang (C compiler),
+# perl (build scripts).  pkg-config is used by several cargo build scripts.
+# libpam0g-dev: needed to link against -lpam and -lpam_misc for PAM auth.
+# pandoc: build.rs regenerates docs/manual.md from docs/hypershunt.1.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake \
+        clang \
+        perl \
+        pkg-config \
+        libpam0g-dev \
+        pandoc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# ── Dependency caching layer ──────────────────────────────────────────────────
+# Build a stub binary from the manifests alone so that Docker/podman can cache
+# the compiled dependency graph.  Re-used on subsequent builds when only src/
+# changes.
+COPY Cargo.toml ./
+RUN mkdir src \
+    && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release \
+    # Remove stub output so cargo recompiles main.rs from the real source.
+    # The dep object files in deps/ are preserved — no need to rebuild them.
+    && rm -f target/release/hypershunt target/release/hypershunt.d \
+             target/release/deps/hypershunt-* \
+    && rm -rf src
+
+# ── Real build ────────────────────────────────────────────────────────────────
+COPY src ./src
+RUN cargo build --release
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+FROM debian:trixie-slim
+
+# ca-certificates: required for ACME HTTPS requests to Let's Encrypt.
+# libpam0g: runtime shared library for PAM authentication.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        adduser \
+        ca-certificates \
+        libpam0g \
+    && rm -rf /var/lib/apt/lists/* \
+    && addgroup --system hypershunt \
+    && adduser --system --ingroup hypershunt \
+               --no-create-home --home /nonexistent \
+               --shell /usr/sbin/nologin \
+               --gecos "hypershunt HTTP server" hypershunt \
+    # Operator web root — empty by default.  Bind-mount your own
+    # content over this to take over /.
+    && install -d -o hypershunt -g hypershunt -m 755 /var/www/hypershunt \
+    # Bundled documentation site — read-only assets owned by root.
+    && install -d -o root -g root -m 755 /usr/share/doc/hypershunt \
+    && install -d -o root -g root -m 755 /usr/share/doc/hypershunt/site \
+    # State dir — ACME certificates and account keys.  700: private keys.
+    && install -d -o hypershunt -g hypershunt -m 700 /var/lib/hypershunt
+
+COPY --from=builder /build/target/release/hypershunt /usr/bin/hypershunt
+
+# Bundled documentation site, served at /docs/ by the default vhost.
+COPY docs/ /usr/share/doc/hypershunt/site/
+
+COPY packaging/oci/hypershunt-container.kdl /etc/hypershunt.kdl
+
+# Start as root so hypershunt can bind ports 80/443, then drop to hypershunt:hypershunt
+# via server.user in the config.  In rootless podman "root" inside the
+# container maps to the host user in the user namespace, not host root.
+LABEL org.opencontainers.image.description="HTTP/reverse-proxy server with TLS, virtual hosts, and static file serving"
+LABEL org.opencontainers.image.source="https://github.com/michaelpaddon/hypershunt"
+LABEL org.opencontainers.image.licenses="BSD-2-Clause"
+
+EXPOSE 80 443
+
+ENTRYPOINT ["/usr/bin/hypershunt"]
+CMD ["--config", "/etc/hypershunt.kdl"]

@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+
+      # The Containerfile is the single build environment — it handles
+      # all native deps (cmake, clang, PAM) so the runner stays clean.
+      - name: Build OCI image
+        run: |
+          podman build \
+            -f packaging/oci/Containerfile \
+            -t hypershunt:$VERSION-${{ matrix.arch }} \
+            .
+
+      # Extract the compiled binary so cargo-deb and cargo-generate-rpm
+      # can package it without a second compilation pass.
+      - name: Extract binary from image
+        run: |
+          mkdir -p target/release
+          CID=$(podman create hypershunt:$VERSION-${{ matrix.arch }})
+          podman cp $CID:/usr/bin/hypershunt target/release/hypershunt
+          podman rm $CID
+
+      # cargo-deb and cargo-generate-rpm only need Cargo.toml metadata
+      # plus the pre-built binary (--no-build / default behaviour).
+      # Cache the installed tools keyed on Cargo.lock + arch so a
+      # repeated release tag push doesn't reinstall from scratch.
+      - name: Cache cargo tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.toml') }}
+
+      - name: Install packaging tools
+        run: |
+          command -v cargo-deb         || cargo install cargo-deb
+          command -v cargo-generate-rpm || cargo install cargo-generate-rpm
+
+      # Sanitize semver pre-release separators for each package format.
+      # Debian: '-' is reserved as epoch/upstream/revision separator;
+      #   '~' sorts before the release version (standard pre-release form).
+      # RPM: '-' is not allowed in the version field.
+      - name: Sanitize package versions
+        run: |
+          echo "DEB_VERSION=${VERSION//-/\~}" >> $GITHUB_ENV
+          echo "RPM_VERSION=${VERSION//-/_}"  >> $GITHUB_ENV
+
+      - name: Build Debian package
+        run: cargo deb --no-build --deb-version "$DEB_VERSION"
+
+      - name: Build RPM package
+        run: cargo generate-rpm --set-metadata "version=\"$RPM_VERSION\""
+
+      - name: Push arch-tagged OCI image
+        run: |
+          OWNER=${GITHUB_REPOSITORY_OWNER,,}
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            podman login ghcr.io -u ${{ github.actor }} --password-stdin
+          podman push \
+            hypershunt:$VERSION-${{ matrix.arch }} \
+            ghcr.io/$OWNER/hypershunt:$VERSION-${{ matrix.arch }}
+
+      - name: Stage packages
+        run: |
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+          cp target/generate-rpm/*.rpm dist/
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist/
+
+      # podman 4.x does not support index-level --annotation on manifest
+      # create; per-image labels are set via LABEL in the Containerfile.
+      - name: Push multi-arch OCI manifest
+        run: |
+          OWNER=${GITHUB_REPOSITORY_OWNER,,}
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+          podman manifest create \
+            ghcr.io/$OWNER/hypershunt:$VERSION \
+            ghcr.io/$OWNER/hypershunt:$VERSION-amd64 \
+            ghcr.io/$OWNER/hypershunt:$VERSION-arm64
+          podman manifest push ghcr.io/$OWNER/hypershunt:$VERSION
+
+          podman manifest create \
+            ghcr.io/$OWNER/hypershunt:latest \
+            ghcr.io/$OWNER/hypershunt:$VERSION-amd64 \
+            ghcr.io/$OWNER/hypershunt:$VERSION-arm64
+          podman manifest push ghcr.io/$OWNER/hypershunt:latest
+
+      - name: Generate release notes
+        run: |
+          {
+            awk '/^---$/{found=1; next} found && /^## /{exit} found && NF{print}' README.md
+            echo ""
+            echo "See the [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md) for configuration and usage."
+          } > release-notes.md
+
+      - name: Create GitHub release
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "hypershunt $GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            --draft \
+            dist/*.deb \
+            dist/*.rpm
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

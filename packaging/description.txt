@@ -1,0 +1,38 @@
+hypershunt is a lightweight HTTP server and reverse proxy built on hyper and
+tokio. It is configured with a single KDL file and covers the common 80%:
+static files, reverse proxy, TLS with automatic certificates, and access
+control.
+ .
+ TLS and serving:
+  * Automatic certificates via Let's Encrypt (ACME HTTP-01)
+  * Self-signed for development; PEM file for managed certificates
+  * HTTP/1.1 and HTTP/2 (ALPN negotiation) on all TLS listeners
+  * Static file serving with streaming, Range requests, and ETag caching
+ .
+ Routing and backends:
+  * Virtual hosts with exact and regex hostname matching
+  * Reverse proxy with connection pooling and multi-upstream load
+    balancing (round-robin, least-conn, ip-hash, header-hash, random)
+  * Active and passive health checks; configurable retries
+  * Per-location rate limiting (token bucket) and body-size caps
+  * FastCGI, SCGI, and CGI backends
+  * TCP proxy with HAProxy PROXY protocol v1/v2
+  * HTTP redirects
+ .
+ Security and access control:
+  * HTTP Basic authentication via PAM or LDAP
+  * Subrequest auth (nginx auth_request style)
+  * JWT session cookies (ES256, JWKS endpoint)
+  * Firewall-style policy blocks: IP ranges, users, groups, countries
+  * Privilege drop — binds ports < 1024 as root, then runs unprivileged
+  * Per-location header injection with dynamic variables
+ .
+ Operations:
+  * Response compression (gzip and brotli)
+  * Structured access logging via RUST_LOG
+  * Configurable per-listener connection and request timeouts
+  * Built-in status page (HTML and JSON metrics)
+  * Health check endpoints (/healthz, /livez, /readyz)
+  * Custom error pages per status code
+  * fail2ban integration (filter and jail configuration included)
+  * Graceful shutdown

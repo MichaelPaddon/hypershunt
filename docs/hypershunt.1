@@ -1,0 +1,198 @@
+.TH HYPERSHUNT 1 "2026-06-06" "hypershunt 1.0.0" "User Commands"
+.
+.SH NAME
+hypershunt \- HTTP server and reverse proxy
+.
+.SH SYNOPSIS
+.B hypershunt
+.RB [ \-c | \-\-config
+.IR file ]
+.RB [ \-\-check\-config ]
+.br
+.B hypershunt
+.BR \-\-version | \-\-help
+.
+.SH DESCRIPTION
+.B hypershunt
+is a lightweight HTTP/HTTPS server and reverse proxy.
+It supports virtual host routing, automatic TLS via Let\(aqs Encrypt,
+static file serving, HTTP redirects, configurable timeouts, and
+ES256 JWT session authentication.
+.PP
+Configuration is read from a KDL file (default:
+.I hypershunt.kdl
+in the working directory).
+All sockets are bound before privileges are dropped, so
+.B hypershunt
+can be started as root to bind ports 80 and 443 and will then switch
+to an unprivileged user as specified in the configuration.
+.
+.SH OPTIONS
+.TP
+.BI \-c " file" ", " \-\-config " file"
+Read configuration from
+.I file
+instead of the default
+.IR hypershunt.kdl .
+.TP
+.B \-\-check\-config
+Parse and validate the configuration, then exit without binding any
+sockets.
+Exits 0 on success, or non-zero with diagnostics on standard error if
+the configuration has parse or semantic errors.
+Useful for CI and as a pre-flight check before sending
+.B SIGHUP
+to hot-reload a running instance.
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+Use
+.B \-\-help
+for the full description and
+.B \-h
+for the short form.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.
+.SH CONFIGURATION
+Configuration is written in KDL.
+The top-level nodes are:
+.PP
+.RS 4
+.TP
+.B server
+Global settings: privilege drop user/group, state directory for ACME
+certificates and JWT signing keys, authentication back-end, and global
+TLS defaults.
+.TP
+.B listener
+Opens a TCP socket (via
+.B bind
+or an inherited file descriptor via
+.BR fd )
+and begins accepting connections.
+Each listener optionally has a
+.B tls
+child (self-signed, PEM file, or ACME/Let\(aqs Encrypt)
+and a
+.B timeouts
+child.
+.TP
+.B vhost
+Maps one or more hostnames to URL routing rules.
+Names are matched against the
+.B Host
+request header; a leading
+.B ~
+treats the name as a regular expression.
+.TP
+.B location
+Maps a URL path prefix to a handler:
+.BR static ,
+.BR proxy ,
+.BR redirect ,
+or
+.BR fastcgi .
+.RE
+.PP
+See the configuration reference for the full directive list:
+.UR https://github.com/MichaelPaddon/hypershunt/blob/main/docs/reference.md
+.UE
+.
+.SH FILES
+.TP
+.I /etc/hypershunt.kdl
+Default system-wide configuration file when
+.B hypershunt
+is installed as a service.
+.TP
+.I /var/lib/hypershunt/
+Default state directory for ACME account keys, issued certificates,
+and JWT signing keys (set via
+.B server state\-dir
+in the configuration).
+The JWT EC private key is stored at
+.I /var/lib/hypershunt/jwt/ec\-key.pem
+and generated on first startup with mode 0600.
+.TP
+.I /var/www/hypershunt/
+Default document root served by the packaged configuration.
+.
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Controls log verbosity.
+The default is
+.BR hypershunt=info .
+Examples:
+.BR hypershunt=debug ,
+.BR hypershunt=trace .
+See
+.UR https://docs.rs/tracing\-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
+.UE
+for the full filter syntax.
+.
+.SH SIGNALS
+.TP
+.BR SIGINT ", " SIGTERM
+Initiates graceful shutdown.
+Listening sockets stop accepting new connections; in-flight requests are
+given up to 30 seconds to complete before the process exits.
+.TP
+.B SIGHUP
+Hot-reloads the configuration from the same path given at startup.
+Routing (vhosts, locations, handlers, header rules, access policies,
+rate limits), the listener set (listeners are added or drained), and
+named TLS certificates are applied atomically; on any parse or bind
+error the running configuration is left serving unchanged.
+Changes to the authentication back-end are refused with a logged
+warning and require a restart.
+.TP
+.B SIGUSR2
+Performs a seamless binary upgrade: re-execs the on-disk
+.B hypershunt
+binary, handing the inherited listening sockets to the new process so
+no connections are dropped across the swap.
+.
+.SH EXAMPLES
+Start with the default configuration file in the current directory:
+.PP
+.RS 4
+.EX
+hypershunt
+.EE
+.RE
+.PP
+Start with an explicit configuration file:
+.PP
+.RS 4
+.EX
+hypershunt \-\-config /etc/hypershunt.kdl
+.EE
+.RE
+.PP
+Run with debug logging enabled:
+.PP
+.RS 4
+.EX
+RUST_LOG=hypershunt=debug hypershunt \-\-config /etc/hypershunt.kdl
+.EE
+.RE
+.
+.SH SEE ALSO
+.BR systemctl (1)
+.PP
+Documentation:
+.UR https://github.com/MichaelPaddon/hypershunt/tree/main/docs
+.UE
+.RB ( quickstart.md ", " guide.md ", " reference.md ", " grammar.md ).
+.
+.SH BUGS
+HAProxy PROXY protocol over QUIC is not supported; the wire format
+is still an IETF draft.  Terminate QUIC at HAProxy and forward
+HTTP/1.1 or HTTP/2 over TCP to hypershunt if source-IP preservation on
+HTTP/3 traffic is required.
+.
+.SH AUTHOR
+Michael Paddon

@@ -1,0 +1,269 @@
+// hypershunt.kdl -- annotated reference configuration
+//
+// Run with:  hypershunt [--config hypershunt.kdl]
+// Defaults to hypershunt.kdl in the working directory when --config is omitted.
+
+// --- Server-wide settings ---
+//
+// Privilege drop: started as root to bind port 80/443, then drops to
+// user/group immediately after sockets are bound.  group defaults to
+// the user's primary group.  Omitting user while root triggers a warning.
+//
+// state-dir is required when any listener uses tls "acme" -- omitting
+// it produces a clear error message at startup.
+//
+// Global TLS floor (optional) -- inherited by every TLS listener that
+// does not supply its own tls-options block.
+server user="hypershunt"
+// server user="hypershunt" group="hypershunt" state-dir="/var/lib/hypershunt" {
+//     tls-options min-version="1.3" {
+//         cipher "TLS13_AES_256_GCM_SHA384"
+//         cipher "TLS13_CHACHA20_POLY1305_SHA256"
+//         cipher "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+//     }
+// }
+
+// --- Listeners ---
+//
+// Every listener carries a bind URL as its positional argument:
+//   tcp://host:port
+//   udp://host:port               (HTTP/3 with a `quic` block)
+//   unix-stream:/path
+//   unix-dgram:/path              (L4 datagram proxy only)
+//   unix-seqpacket:/path          (Linux; L4 datagram proxy only)
+//
+// If hypershunt is started by systemd with socket activation, or by a parent
+// hypershunt process passing its sockets, it automatically detects and reuses
+// any inherited listening socket whose address matches a bind address.
+//
+// default-vhost chooses the virtual host used when no Host header
+// matches.  Omit it to fall back to the first vhost defined below;
+// set it to #null to return 404 for unrecognised hosts instead.
+
+// Plain HTTP on port 80.
+// Required for ACME / Let's Encrypt HTTP-01 challenges -- Let's Encrypt
+// makes a request to http://<domain>/.well-known/acme-challenge/...
+// to verify domain ownership before issuing a certificate.
+listener "tcp://[::]:80" { }
+
+// HTTPS -- ephemeral self-signed cert.
+// Useful for development or when a real cert is not yet available.
+listener "tcp://[::]:443" {
+    tls "self-signed"
+}
+
+// HTTPS -- explicit PEM cert/key (production)
+// listener "tcp://[::]:443" {
+//     tls "files" cert="/etc/hypershunt/cert.pem" key="/etc/hypershunt/key.pem"
+// }
+
+// HTTPS -- ACME / Let's Encrypt (inline form).
+// Requires the port-80 listener above (HTTP-01 challenge) and
+// state-dir in the server block (see above).
+//
+// If the initial certificate acquisition fails, hypershunt falls back to a
+// self-signed certificate and retries at retry-interval (default 3600s).
+// 3600s keeps well within Let's Encrypt's rate limit of 5 failed
+// validations per account per hostname per hour.
+// listener "tcp://[::]:443" {
+//     tls "acme" email="admin@example.com" {
+//         domain "example.com"
+//         domain "www.example.com"
+//         // retry-interval 3600
+//     }
+// }
+
+// --- Named certificates (shared across listeners) ---
+//
+// Define a certificate once at the top level and reference it from any
+// number of listeners with `tls "ref" name="<cert>"`.  All references
+// share a single ACME manager, on-disk cert directory, and renewal
+// loop, so only one HTTP-01 challenge runs per renewal regardless of
+// how many listeners terminate with the same cert.
+//
+// Use this whenever two or more listeners would otherwise need
+// identical inline `tls "acme"` blocks -- hypershunt rejects such
+// configurations at parse time (they would race on the same cert
+// directory).
+//
+// certificate "main" {
+//     tls "acme" email="admin@example.com" {
+//         domain "example.com"
+//         domain "www.example.com"
+//         // staging #true
+//     }
+// }
+// listener "tcp://[::]:443" {
+//     tls "ref" name="main"
+// }
+// listener "tcp://[::]:8443" {
+//     tls "ref" name="main"      // shares the cert above
+// }
+//
+// File-based and self-signed sources work the same way:
+// certificate "internal" {
+//     tls "files" cert="/etc/hypershunt/internal.crt" key="/etc/hypershunt/internal.key"
+// }
+// certificate "dev" {
+//     tls "self-signed"
+// }
+
+// Listener with explicit timeout settings.  Each timeout is a
+// property on the `timeouts` node; absent values inherit the built-in
+// defaults.
+// listener "tcp://[::]:80" {
+//     timeouts request-header=30 handler=60 keepalive=75
+//     //  request-header  seconds to wait for headers (Slowloris)
+//     //  handler         seconds before slow handler gets a 408
+//     //  keepalive       idle keep-alive timeout; 0 disables keep-alive
+// }
+
+// HTTP/3 over QUIC.
+// The bind URL uses the `udp://` scheme; the encryption layer is a
+// `quic { ... }` block carrying a single `tls "<kind>"` node.  ACME
+// renewals roll over the QUIC endpoint alongside the TCP TLS acceptor
+// without restarting hypershunt.
+//
+// When a TCP/TLS listener and a UDP listener share the same port,
+// hypershunt auto-injects `Alt-Svc: h3=":<port>"; ma=86400` on the TCP
+// listener's HTTP/1.1 and HTTP/2 responses so browsers can discover
+// the HTTP/3 endpoint.  Use `response-headers { set "Alt-Svc" "..." }`
+// to override, or `remove "Alt-Svc"` to suppress.
+// listener "udp://[::]:443" {
+//     quic {
+//         tls "acme" {
+//             domain "example.com"
+//         }
+//     }
+//     // Optional QUIC transport tuning.  Unset knobs use quinn defaults.
+//     // quic-transport max-concurrent-bidi-streams=100 \
+//     //     max-idle-timeout=30 keep-alive-interval=10 \
+//     //     zero-rtt=#false retry-tokens=#true \
+//     //     retry-token-lifetime=15
+//     // Optional ALPN override.  Defaults to ["h3"]; add legacy
+//     // draft versions like "h3-29" here if needed.
+//     // alpn "h3"
+// }
+
+
+// --- Virtual hosts ---
+//
+// Vhost names are matched against the Host request header.
+//
+// A vhost may override the listener's advertised ALPN list via one or
+// more `alpn` children.  hypershunt looks at the ClientHello SNI before
+// the TLS handshake completes and picks the matching vhost's config,
+// so a vhost containing `alpn "http/1.1"` truly disables HTTP/2 for
+// that one host while leaving it enabled for the others on the same
+// listener.  Regex vhosts and QUIC connections fall back to the
+// listener default.
+//
+// Plain string: exact match.
+//   vhost "example.com" { ... }
+//
+// Set regex=#true to treat the name as an anchored regular expression.
+//   vhost ".+\.example\.com" regex=#true { ... }
+//
+// Matching order per request:
+//   1. Exact literal match (all literal vhosts, O(1)).
+//   2. Regex patterns in config declaration order.
+//   3. Listener default-vhost fallback.
+//
+// alias adds extra names (literal or regex) that map to the same vhost.
+
+vhost "localhost" {
+    // Built-in status page: current load, request rates, latency
+    // histogram.  Responds with HTML by default; add Accept:
+    // application/json for JSON.
+    location "/status" {
+        status
+    }
+
+    // Bundled documentation site (docsify-rendered markdown).
+    // Sourced from the package, never overwritten by operator
+    // content.  Remove this location if you don't want the docs
+    // exposed.
+    location "/docs/" {
+        static root="/usr/share/doc/hypershunt/site/" strip-prefix=#true {
+            index-file "index.html"
+        }
+    }
+
+    // Operator content.  The package ships an empty webroot; until
+    // the operator drops an `index.html` (or any other index-file
+    // candidate) in /var/www/hypershunt/, requests to "/" redirect to
+    // /docs/.  Drop a file in and the redirect stops firing
+    // automatically.
+    location "/" {
+        static root="/var/www/hypershunt" fallback-redirect="/docs/" {
+            index-file "index.html"
+            index-file "index.htm"
+        }
+    }
+}
+
+// Exact vhost with an alias and multiple location types.
+// vhost "example.com" {
+//     alias "www.example.com"
+//
+//     // Restrict an admin area to a trusted network.  policy rules
+//     // are evaluated top-to-bottom; first match wins.  A rule with
+//     // no predicate matches everything (catch-all).
+//     //
+//     //   Predicates (inline or AND block):
+//     //     address "cidr"       -- source IP or CIDR (multiple = OR)
+//     //     country "US" "CA"    -- ISO country codes (multiple = OR)
+//     //     user "name"          -- authenticated username
+//     //     group "name"         -- group membership
+//     //     authenticated        -- any logged-in user
+//     //     not <predicate>      -- negate a predicate
+//     //
+//     //   Actions:
+//     //     allow                       -- permit the request
+//     //     deny [code=N]               -- reject (default 403)
+//     //     redirect to="url" [code=N]  -- redirect (default 302)
+//     //     apply "name"                -- inline a named policy
+//     //
+//     location "/admin/" {
+//         policy {
+//             allow address "10.0.0.0/8" "192.168.0.0/16"
+//             deny code=403
+//         }
+//         static root="/var/www/admin"
+//     }
+//
+//     // Redirect a legacy section permanently.
+//     location "/old-section/" {
+//         redirect to="/new-section/" code=301
+//     }
+//
+//     // Reverse-proxy the API to a backend.
+//     location "/api/" {
+//         proxy {
+//             upstream "http://127.0.0.1:3000"
+//         }
+//     }
+//
+//     // PHP via FastCGI.
+//     location "/php/" {
+//         fastcgi socket="unix-stream:/run/php/php-fpm.sock" \
+//                 root="/var/www/example" \
+//                 index="index.php"
+//     }
+//
+//     // Static files for everything else.
+//     location "/" {
+//         static root="/var/www/example" {
+//             index-file "index.html"
+//         }
+//     }
+// }
+
+// Regex vhost -- matches any subdomain of example.com
+// vhost ".+\.example\.com" regex=#true {
+//     location "/" {
+//         static root="/var/www/wildcard" {
+//             index-file "index.html"
+//         }
+//     }
+// }

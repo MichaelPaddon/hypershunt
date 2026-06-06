@@ -1,0 +1,51 @@
+// hypershunt-container.kdl -- container default configuration
+//
+// Designed for rootless podman / docker.  The process runs as the hypershunt
+// user (set via USER in the Containerfile), so no privilege drop is
+// needed and no server block is present.
+//
+// Listens on port 80 (HTTP) and 443 (HTTPS, ephemeral self-signed cert).
+// Starts as root to bind those ports, then drops to the hypershunt user --
+// the same pattern used by the systemd service.
+//
+// Override this file to use a real cert or enable ACME:
+//
+//   podman run -v ./my-config.kdl:/etc/hypershunt.kdl:ro,Z hypershunt:latest
+//
+// When using `tls "acme"`, also mount /var/lib/hypershunt for certificate
+// storage and add `state-dir "/var/lib/hypershunt"` to the server block.
+
+server user="hypershunt"
+
+listener "tcp://[::]:80" { }
+listener "tcp://[::]:443" {
+    tls "self-signed"
+}
+
+vhost "localhost" {
+    // Built-in status page.  Useful for container health checks:
+    //   curl -f http://localhost:80/status
+    // Restrict to internal IPs in production via a policy block.
+    location "/status" {
+        status
+    }
+
+    // Bundled documentation site at /docs/.
+    location "/docs/" {
+        static root="/usr/share/doc/hypershunt/site/" strip-prefix=#true {
+            index-file "index.html"
+        }
+    }
+
+    // Operator content.  The image ships an empty webroot; until
+    // an `index.html` (or `index.htm`) appears in /var/www/hypershunt/,
+    // requests to "/" redirect to /docs/.  Bind-mount your own
+    // files over /var/www/hypershunt/ to take over this URL -- the
+    // redirect stops firing automatically.
+    location "/" {
+        static root="/var/www/hypershunt" fallback-redirect="/docs/" {
+            index-file "index.html"
+            index-file "index.htm"
+        }
+    }
+}

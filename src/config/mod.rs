@@ -1,0 +1,1300 @@
+// KDL configuration file parsing and validation.
+//
+// Config::load() reads a .kdl file; Config::parse() accepts a string
+// (used in tests).  All fields are resolved to concrete values before
+// validate() is called so downstream code never sees partial state.
+
+use crate::access::{PolicyAction, Predicate};
+use ::kdl::KdlDocument;
+use anyhow::{Context, anyhow, bail};
+use hyper::header::HeaderName;
+use miette::Diagnostic as _;
+use regex::Regex;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+mod kdl;
+mod parse;
+mod types_socket;
+pub use types_socket::{AddrLocation, BoundAddr, SocketKind};
+use parse::{
+    node_line, parse_certificate, parse_listener, parse_server, parse_vhost,
+};
+#[cfg(test)]
+mod tests;
+
+// -- Public types --------------------------------------------------
+
+/// Unresolved policy rule as parsed from KDL.  Apply references are
+/// inlined to a flat Vec<PolicyRule> in router.rs during resolution.
+#[derive(Debug, Clone)]
+pub enum PolicyRuleDef {
+    Rule {
+        predicate: Option<Predicate>,
+        action: PolicyAction,
+    },
+    /// Inline the named policy's rules at this point.
+    Apply { name: String },
+}
+
+/// Source for a custom error page HTML body.
+#[derive(Debug, Clone)]
+pub enum ErrorPageDef {
+    /// File path; contents are read from disk on each error response.
+    File(String),
+    /// Inline HTML stored directly in the config.
+    Inline(String),
+}
+
+#[derive(Debug, Default)]
+pub struct Config {
+    pub server: ServerConfig,
+    pub listeners: Vec<ListenerConfig>,
+    // Ordered; the router builds an index keyed by name + aliases.
+    pub vhosts: Vec<VHostConfig>,
+    // Top-level named certificate definitions.  Listeners refer to
+    // these by name via `tls cert="<name>"`, so a single ACME manager
+    // and on-disk certificate directory can be shared across listeners.
+    pub certificates: Vec<CertificateDef>,
+}
+
+/// A named certificate defined at the top level of the config.  Multiple
+/// listeners may reference the same definition; at startup it produces
+/// exactly one acceptor (and, for ACME, one renewal loop) that is shared
+/// among them via `Arc<ArcSwap<TlsAcceptor>>`.
+#[derive(Debug, Clone)]
+pub struct CertificateDef {
+    pub name: String,
+    /// The certificate source.  Never `TlsConfig::Ref` (refs cannot
+    /// nest); validated at parse time.
+    pub source: TlsConfig,
+}
+
+#[derive(Debug)]
+pub struct ServerConfig {
+    pub state_dir: Option<String>,
+    // Default TLS options applied to every listener that
+    // does not supply its own.
+    pub tls_defaults: TlsOptions,
+    // Unix user to switch to after binding sockets (privilege drop).
+    // Only effective when the process starts as root.
+    pub user: Option<String>,
+    // Unix group to switch to; defaults to the user's primary group.
+    pub group: Option<String>,
+    // When true, skip setgroups() so supplementary groups inherited at
+    // startup (e.g. from podman --group-add keep-groups) survive the
+    // privilege drop.  Only set this in controlled container environments
+    // where the inherited groups are known and intentional.
+    pub inherit_supplementary_groups: bool,
+    // Authentication back-end; None means anonymous-only.
+    pub auth: Option<AuthBackend>,
+    // GeoIP database configuration; None means no geo conditions can be used.
+    pub geoip: Option<GeoIpConfig>,
+    pub health: HealthConfig,
+    // Named policy blocks available to all vhosts/locations.
+    pub policies: HashMap<String, Vec<PolicyRuleDef>>,
+    // Per-status-code custom error pages.
+    pub error_pages: Vec<(u16, ErrorPageDef)>,
+    // Unix file mode for ACME private key files (key.pem).
+    // None means use the default 0o600 (owner read-write only).
+    // Set to e.g. Some(0o640) to make cert keys group-readable.
+    // acme_account.json is always written 0o600 regardless of this setting.
+    pub cert_key_mode: Option<u32>,
+    /// Access-log format + sink.  None means the historical default
+    /// (`tracing` format, no file sink — lines flow through the global
+    /// tracing subscriber).
+    pub access_log: Option<AccessLogConfig>,
+    /// Seconds the *parent* process lingers after a successful
+    /// SIGUSR2 binary upgrade before force-closing any connections
+    /// that haven't drained yet.  `0` (the default) means "wait
+    /// indefinitely" -- the parent stays alive as long as any
+    /// connection task it accepted is still running.  Has no effect
+    /// on SIGHUP (in-process reload never force-closes anything).
+    #[allow(dead_code)] // consumed by SIGUSR2 drain loop (#110)
+    pub graceful_drain_timeout: u32,
+    /// Seconds the parent waits for the SIGUSR2 child to signal
+    /// "ready" (one byte on the inherited pipe) before declaring
+    /// the upgrade failed, killing the child, and resuming normal
+    /// accept behaviour.  Default 60.
+    #[allow(dead_code)] // consumed by SIGUSR2 ready-pipe protocol (#109)
+    pub upgrade_startup_timeout: u32,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            state_dir: None,
+            tls_defaults: Default::default(),
+            user: None,
+            group: None,
+            inherit_supplementary_groups: false,
+            auth: None,
+            geoip: None,
+            health: Default::default(),
+            policies: HashMap::new(),
+            error_pages: Vec::new(),
+            cert_key_mode: None,
+            access_log: None,
+            graceful_drain_timeout: 0,
+            // Mirror parse_server()'s default for the same key.
+            upgrade_startup_timeout: 60,
+        }
+    }
+}
+
+/// Operator-facing access-log configuration.  See `crate::access_log`
+/// for the formatters; this struct only carries parsed config values.
+#[derive(Debug, Clone)]
+pub struct AccessLogConfig {
+    pub format: AccessLogFormatConfig,
+    /// Filesystem path of the sink.  `None` means stdout for the
+    /// text/JSON formats; ignored for `Tracing` (always goes through
+    /// the global tracing subscriber).
+    pub path: Option<String>,
+}
+
+/// Mirror of `crate::access_log::AccessLogFormat`.  Kept separate so
+/// the config crate doesn't depend on the runtime module.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AccessLogFormatConfig {
+    #[default]
+    Tracing,
+    Json,
+    Common,
+    Combined,
+}
+
+/// Built-in health endpoint configuration.
+///
+/// When enabled (the default), GET/HEAD requests to `/healthz`,
+/// `/livez`, and `/readyz` are intercepted before vhost routing and
+/// answered with a lightweight JSON response.  Disable only if you
+/// need those paths for application traffic.
+#[derive(Debug, Clone)]
+pub struct HealthConfig {
+    pub enabled: bool,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        HealthConfig { enabled: true }
+    }
+}
+
+/// Path to a MaxMind MMDB database used for country lookups.
+#[derive(Debug, Clone)]
+pub struct GeoIpConfig {
+    /// Filesystem path to the MMDB file
+    /// (e.g. `/etc/hypershunt/GeoLite2-Country.mmdb`).
+    pub db: String,
+}
+
+mod types_auth;
+pub use types_auth::*;
+
+/// Per-listener connection and request timeout configuration.
+/// All durations are in whole seconds.  `None` means no limit.
+#[derive(Debug, Clone, Default)]
+pub struct Timeouts {
+    // Maximum seconds to wait for a complete request-line + headers.
+    // Connections that don't send headers in time are closed.
+    // Protects against Slowloris-style attacks.
+    pub request_header_secs: Option<u64>,
+    // Maximum seconds a handler may run before the request is
+    // cancelled and a 408 is returned to the client.
+    pub handler_secs: Option<u64>,
+    // Seconds an idle HTTP/1.1 keep-alive connection is kept open
+    // before it is closed.  Set to 0 to disable keep-alive entirely.
+    pub keepalive_secs: Option<u64>,
+}
+
+/// Which version of the HAProxy PROXY protocol to prepend.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProxyProtocolVersion {
+    V1,
+    V2,
+}
+
+/// Proxy mode for a listener: forward bytes (byte-stream listener)
+/// or datagrams (datagram-stream listener) to an upstream instead of
+/// doing HTTP routing.  Set via a `proxy` child on a `listener`
+/// block.
+///
+/// The listener's socket kind dictates the semantics: a byte-stream
+/// listener (`tcp://`, `unix-stream:`) opens one upstream connection
+/// per accepted client connection; a datagram-stream listener
+/// (`udp://`, `unix-dgram:`, `unix-seqpacket:`) opens (or reuses)
+/// one upstream socket per source-address flow and forwards
+/// datagrams.
+///
+/// Encryption on the upstream side mirrors the listener model:
+/// - `upstream_tls` is valid only when the upstream is a byte-stream
+///   kind (`tcp://`, `unix-stream:`).
+/// - `upstream_dtls` (future) is reserved on `udp://` upstreams; the
+///   parser accepts the block but validate() rejects until DTLS
+///   implementation lands.
+#[derive(Debug, Clone)]
+pub struct ProxyConfig {
+    /// Upstream address in the strict URL form parsed by `BoundAddr`.
+    pub upstream: BoundAddr,
+    /// When set, connect to the upstream using TLS (re-encryption).
+    /// Only valid for byte-stream upstreams; rejected by validation
+    /// otherwise.
+    pub upstream_tls: Option<UpstreamTlsConfig>,
+    /// When set, connect to the upstream over DTLS.  Reserved for
+    /// future use; presence here causes validate() to bail with
+    /// "not yet implemented" so the config slot is squatted without
+    /// runtime path.
+    pub upstream_dtls: Option<UpstreamDtlsConfig>,
+    /// Prepend a PROXY protocol header so the backend sees the real
+    /// client IP even though it only sees hypershunt's connection.  Only
+    /// meaningful for byte-stream upstreams; rejected for datagram
+    /// upstreams (no spec-stable mapping over UDP).
+    pub proxy_protocol: Option<ProxyProtocolVersion>,
+    /// Optional IP/country-based access control.  User, group, and
+    /// `authenticated` predicates are rejected at parse time because
+    /// raw L4 listeners have no HTTP authentication layer.
+    pub policy: Option<Vec<PolicyRuleDef>>,
+    /// Idle-timeout for datagram-proxy flows (seconds).  Ignored by
+    /// byte-stream proxies, which use connection close as the
+    /// teardown signal.  Defaults to 30 s when unset.
+    pub flow_idle_timeout_secs: Option<u64>,
+}
+
+/// TLS options for the upstream connection in stream proxy mode.
+#[derive(Debug, Clone)]
+pub struct UpstreamTlsConfig {
+    /// Skip certificate verification.  Only use for internal or dev
+    /// upstreams with self-signed certificates.
+    pub skip_verify: bool,
+}
+
+/// DTLS options for the upstream connection in datagram proxy mode.
+/// Reserved -- the parser accepts the block on a `udp://` upstream
+/// so the syntax slot is documented, but validate() bails with "not
+/// yet implemented" until a DTLS client implementation lands.
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamDtlsConfig {
+    #[allow(dead_code)] // reserved -- mirrors UpstreamTlsConfig
+    pub skip_verify: bool,
+}
+
+/// QUIC server-side termination block on a UDP listener.  Aliases
+/// the existing `TlsListenerConfig` because QUIC's encryption layer
+/// IS TLS 1.3 (RFC 9001): the same cert source / OCSP / ALPN
+/// children apply unchanged.  When present on a `udp://` listener
+/// the handler is implicitly HTTP/3.
+#[derive(Debug, Clone)]
+pub struct QuicListenerConfig {
+    pub tls: TlsListenerConfig,
+}
+
+/// DTLS server-side termination block on a UDP listener.  Reserved
+/// for future use; presence here causes validate() to bail.
+#[derive(Debug, Clone)]
+pub struct DtlsListenerConfig {
+    #[allow(dead_code)] // reserved -- mirrors QuicListenerConfig
+    pub tls: TlsListenerConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenerConfig {
+    /// Bind address in strict URL form (tcp://, udp://,
+    /// unix-stream:, unix-dgram:, unix-seqpacket:).
+    pub bind: BoundAddr,
+    /// TLS termination block.  Valid only on byte-stream listeners
+    /// (`tcp://`, `unix-stream:`).  Rejected by validate() on every
+    /// datagram-stream kind.
+    pub tls: Option<TlsListenerConfig>,
+    /// QUIC server-side termination block.  Valid only on `udp://`
+    /// listeners.  Presence implies the HTTP/3 handler (the only
+    /// handler QUIC supports here).
+    pub quic: Option<QuicListenerConfig>,
+    /// DTLS termination block.  Reserved -- parser accepts on
+    /// `udp://` listeners; validate() bails with "not yet
+    /// implemented".
+    pub dtls: Option<DtlsListenerConfig>,
+    /// When Some: proxy mode (raw bytes or datagrams forwarded to
+    /// upstream).  When None: HTTP routing mode (vhost/location
+    /// dispatch on stream listeners; HTTP/3 on message listeners).
+    pub proxy: Option<ProxyConfig>,
+    // When set, read and strip a PROXY protocol header immediately after
+    // accept(), before TLS or HTTP parsing.  The header's source address
+    // replaces the TCP peer address for the duration of the connection.
+    // Use when hypershunt sits behind HAProxy or another load balancer that
+    // speaks PROXY protocol on the incoming side.
+    pub accept_proxy_protocol: Option<ProxyProtocolVersion>,
+    // Allowlist of peer addresses permitted to send a PROXY header.
+    // Empty (the default) means "trust any peer" -- only safe on a
+    // listener that is not reachable from untrusted networks.  When
+    // non-empty, a connection from a peer outside the list is dropped
+    // before the PROXY header is parsed, preventing header injection
+    // from arbitrary clients.  Only meaningful when
+    // `accept_proxy_protocol` is set.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
+    // HTTP-only fields; unused in stream mode:
+    pub default_vhost: Option<String>,
+    pub timeouts: Timeouts,
+    // Cap on simultaneous open connections; None = unlimited.
+    // New connections are deferred (not dropped) at the limit.
+    pub max_connections: Option<u32>,
+    // Reject requests whose Content-Length exceeds this (bytes).
+    // None = unlimited.  Checked before any handler runs.
+    pub max_request_body: Option<u64>,
+    // Pre-computed `Alt-Svc` header value to auto-inject on responses
+    // from this TCP/TLS listener.  Populated by `Config::parse` when a
+    // matching UDP listener (same port) is defined so that h1/h2 clients
+    // can discover the HTTP/3 endpoint without any extra config.  Only
+    // applied when the response does not already carry an `Alt-Svc`
+    // header, so user header rules always win.
+    pub auto_alt_svc: Option<String>,
+    // Optional ALPN override.  When None the listener uses the protocol
+    // defaults (`["h2", "http/1.1"]` for TCP/TLS, `["h3"]` for UDP/QUIC).
+    // Empty Vec is rejected at parse time.  Per-vhost ALPN selection
+    // (via SNI) is a follow-up; today this is per-listener.
+    pub alpn: Option<Vec<String>>,
+    // QUIC transport tuning -- only meaningful for udp: listeners.  None
+    // means "use quinn defaults".  See `QuicTransport` for the knobs.
+    pub quic_transport: Option<QuicTransport>,
+}
+
+/// One backend in a reverse-proxy upstream pool.  A pool with a single
+/// entry behaves exactly like the pre-LB single-upstream proxy.
+#[derive(Debug, Clone)]
+pub struct UpstreamConfig {
+    pub url: String,
+    /// Relative pick weight; defaults to 1.  `0` excludes the upstream
+    /// from selection (useful for temporarily parking a backend).
+    pub weight: u32,
+}
+
+/// Picker policy for multi-upstream proxy locations.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LbPolicy {
+    #[default]
+    RoundRobin,
+    LeastConn,
+    Random,
+    IpHash,
+    /// Hashes the named request header.  Falls back to round-robin
+    /// when the header is absent on a given request.
+    HeaderHash,
+}
+
+/// Active health-check tuning.  Present only when the operator wrote
+/// an `active-health { }` block.
+#[derive(Debug, Clone)]
+pub struct ActiveHealthConfig {
+    pub path: String,
+    pub interval_secs: u64,
+    pub timeout_secs: u64,
+    /// Expected response status; defaults to 200.  Treated as exact.
+    pub expect_status: u16,
+    pub unhealthy_after: u32,
+    pub healthy_after: u32,
+}
+
+/// Passive (error-driven) ejection tuning.  Defaults disable ejection
+/// (`eject_after = u32::MAX`) so an operator opts in explicitly.
+#[derive(Debug, Clone)]
+pub struct PassiveHealthConfig {
+    pub eject_after: u32,
+    pub eject_for_secs: u64,
+}
+
+impl Default for PassiveHealthConfig {
+    fn default() -> Self {
+        // `eject_after = u32::MAX` is effectively "never eject" without
+        // requiring a separate Option layer.
+        PassiveHealthConfig {
+            eject_after: u32::MAX,
+            eject_for_secs: 30,
+        }
+    }
+}
+
+/// Retry tuning.  `max == 0` (default) means "no retry"; positive
+/// values are the number of *additional* attempts beyond the first.
+#[derive(Debug, Clone, Default)]
+pub struct RetryConfig {
+    pub max: u32,
+    /// Response status codes that trigger a retry, in addition to
+    /// connect/IO failures (which always trigger).  Empty by default.
+    pub on_status: Vec<u16>,
+}
+
+/// Wire protocol used by the reverse proxy to reach its upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProxyUpstreamScheme {
+    /// Use the existing hyper-util Client (h1/h2 via ALPN).  Default.
+    #[default]
+    Auto,
+    /// Force HTTP/3 over QUIC.  Requires an `https://` upstream URL.
+    H3,
+    /// Force HTTP/2 prior-knowledge over plaintext TCP (RFC 7540
+    /// §3.4).  Used today only by the upgrade-bridge to open
+    /// extended-CONNECT tunnels (RFC 8441) against `http://`
+    /// upstreams that speak h2 directly; non-upgrade requests on
+    /// `Auto` will keep negotiating via the hyper-util pool.
+    H2c,
+}
+
+/// QUIC transport-layer tuning, applied to the `quinn::Endpoint` for
+/// `udp:` listeners.  All fields are optional; unset fields fall back
+/// to quinn defaults.
+#[derive(Debug, Clone, Default)]
+pub struct QuicTransport {
+    /// Maximum concurrent bidirectional streams a client may open on
+    /// one QUIC connection.  Quinn default is 100.
+    pub max_concurrent_bidi_streams: Option<u64>,
+    /// Idle timeout in seconds.  A connection with no activity past
+    /// this is silently dropped.  Quinn default is 30 s.
+    pub max_idle_timeout_secs: Option<u64>,
+    /// Send a keep-alive PING every N seconds when otherwise idle.
+    /// `Some(0)` disables.  Quinn default is no keep-alive.
+    pub keep_alive_interval_secs: Option<u64>,
+    /// Enable 0-RTT (early data) on the TLS layer.  Per RFC 9001
+    /// §4.6.1 the NewSessionTicket `max_early_data_size` for QUIC is
+    /// fixed at `0xFFFFFFFF`; actual byte-level bounding of replayed
+    /// data is performed by the QUIC `initial_max_data` transport
+    /// parameter, not by the TLS layer.  The application is
+    /// responsible for idempotency since 0-RTT data is replayable.
+    pub zero_rtt_enabled: bool,
+    /// Require source-address validation via Retry tokens.  When `true`
+    /// quinn issues a Retry packet to every new client whose address
+    /// hasn't been validated, making spoofed-source connection floods
+    /// expensive.  Defaults to `true`; set `#false` only if the
+    /// listener sits behind a trusted load balancer that has already
+    /// validated source addresses.
+    pub retry_tokens: bool,
+    /// Lifetime of a Retry token in seconds.  Quinn default is 15 s.
+    pub retry_token_lifetime_secs: Option<u64>,
+}
+
+impl ListenerConfig {
+    // Canonical string identifier used as the router key and in logs.
+    pub fn local_name(&self) -> String {
+        self.bind.to_url()
+    }
+}
+
+mod types_tls;
+pub use types_tls::*;
+
+/// A vhost name or alias.  `regex == true` means the value is an
+/// (anchored, `^(?:...)$`) regex matched against the request Host;
+/// otherwise it is a literal hostname.
+#[derive(Debug, Clone)]
+pub struct VHostName {
+    pub value: String,
+    pub regex: bool,
+}
+
+#[derive(Debug)]
+pub struct VHostConfig {
+    // Primary hostname; also used as the map key in the router.
+    pub name: VHostName,
+    pub aliases: Vec<VHostName>,
+    pub locations: Vec<LocationConfig>,
+    // Optional ALPN override for connections whose SNI matches this
+    // vhost (or one of its literal aliases).  When set, the TCP/TLS
+    // listener picks this list at handshake time via
+    // `LazyConfigAcceptor`.  Empty Vec is rejected at parse time.
+    // Regex vhosts cannot participate in SNI-keyed ALPN selection;
+    // configurations that mix `alpn` with `regex=#true` fall back to
+    // the listener's default ALPN.  Has no effect on QUIC listeners
+    // (quinn 0.11 doesn't expose ClientHello before handshake).
+    pub alpn: Option<Vec<String>>,
+}
+
+/// Config-level header operation: raw strings before name validation.
+/// Converted to `headers::HeaderOp` (validated) in `router.rs`.
+#[derive(Debug, Clone)]
+pub enum HeaderOpConfig {
+    Set { name: String, value: String },
+    Add { name: String, value: String },
+    Remove { name: String },
+}
+
+impl HeaderOpConfig {
+    pub fn header_name(&self) -> &str {
+        match self {
+            HeaderOpConfig::Set { name, .. }
+            | HeaderOpConfig::Add { name, .. }
+            | HeaderOpConfig::Remove { name } => name,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LocationConfig {
+    // URL path prefix; locations are tested in config order.
+    pub path: String,
+    pub handler: HandlerConfig,
+    // Firewall-style access policy (unresolved; resolved in router.rs).
+    pub policy: Option<Vec<PolicyRuleDef>>,
+    // HTTP Basic auth realm; None means no WWW-Authenticate challenge.
+    pub auth: Option<BasicAuthConfig>,
+    // Header rules applied before the handler sees the request.
+    pub request_headers: Vec<HeaderOpConfig>,
+    // Header rules applied to the response before it reaches the client.
+    pub response_headers: Vec<HeaderOpConfig>,
+    // Token-bucket rate-limit rules, evaluated in declaration order
+    // after auth/policy and before the handler runs.  Empty Vec
+    // means no limiting.
+    pub rate_limits: Vec<RateLimitConfig>,
+    // Override for the listener-wide `max-request-body` cap.  Bytes;
+    // `None` keeps the listener cap.  Enforced after routing
+    // resolves the location; the listener-wide cap still applies as
+    // a defense-in-depth bound and is checked first.
+    pub max_request_body: Option<u64>,
+    // Optional request matcher; when present the router only
+    // dispatches this location for requests that satisfy every
+    // predicate.  Failed matches fall through to the next
+    // candidate location (next-shortest prefix, declaration order
+    // on ties).
+    pub matcher: Option<MatcherConfig>,
+    // Optional URL rewrite.  When present, the router evaluates
+    // it against the request URI; if the regex matches, the URI
+    // is replaced with the substituted target and the request is
+    // re-routed from scratch (with a cycle cap).  When the regex
+    // does not match, the location's own handler runs on the
+    // original URI -- so a non-matching rewrite is a no-op.
+    pub rewrite: Option<RewriteConfig>,
+}
+
+/// One configured `rewrite from="..." to="..."` directive.
+/// The regex is compiled at config load; the replacement
+/// template is a raw `regex::Regex::replace` template and may
+/// contain capture references like `$1` or `$name`.
+#[derive(Debug, Clone)]
+pub struct RewriteConfig {
+    pub from: String,
+    pub to: String,
+}
+
+/// Parsed `match { ... }` block on a location.  Empty predicate
+/// list is rejected at parse time, so a `MatcherConfig` always
+/// has at least one predicate.
+#[derive(Debug, Clone)]
+pub struct MatcherConfig {
+    pub predicates: Vec<MatchPredicateConfig>,
+}
+
+/// One predicate inside a matcher.  Multiple values within a
+/// single predicate combine with OR; predicates combine with AND.
+#[derive(Debug, Clone)]
+pub enum MatchPredicateConfig {
+    /// `method "GET" "POST"`.
+    Method(Vec<String>),
+    /// `header "X-Foo" "bar" "~^baz$"`.  Values prefixed with `~`
+    /// are compiled as regexes; everything else is exact match.
+    Header { name: String, values: Vec<String> },
+    /// `header-absent "X-Foo"` -- matches when the header is
+    /// missing from the request.
+    HeaderAbsent { name: String },
+    /// `query "format" "json" "yaml"`.
+    Query { name: String, values: Vec<String> },
+    /// `path "regex" "regex"...` -- one or more regexes against
+    /// the URI path; OR within the list.
+    Path(Vec<String>),
+    /// `not { ... }` -- AND-of-inner with the result negated.
+    /// The parser rejects empty bodies so this Vec is never empty
+    /// in a validated config.
+    Not(Vec<MatchPredicateConfig>),
+}
+
+/// One configured rate-limit block.  Converted to a
+/// `rate_limit::RateLimitRule` (with its bucket map) in router.rs.
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    /// Display name; defaults to `loc-<i>-rl-<j>` when not given.
+    pub name: String,
+    /// Tokens added per second (`rate / per-window-seconds`).
+    pub rate_per_sec: f64,
+    /// Bucket capacity.  Defaults to `rate` (non-bursty).
+    pub burst: f64,
+    pub key: RateLimitKeyConfig,
+}
+
+/// Built-in rate-limit key forms.  Templated keys are deferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimitKeyConfig {
+    ClientIp,
+    User,
+    /// Lowercased; validated as a `hyper::header::HeaderName` at
+    /// parse time.
+    Header(String),
+}
+
+#[derive(Debug)]
+pub enum HandlerConfig {
+    Static {
+        // Filesystem root the handler serves from.  Mutually
+        // exclusive with `userdir`: a static block must set
+        // exactly one of them.
+        root: Option<String>,
+        index_files: Vec<String>,
+        strip_prefix: bool,
+        // Ordered list of candidate path templates the handler
+        // tries in turn before giving up with 404.  Each template
+        // is a path relative to the URL space (`/index.html`,
+        // `{path}.html`); the literal token `{path}` is
+        // substituted with the resolved request URI path (after
+        // any strip-prefix).  Empty Vec disables try-files and
+        // restores the default index-file flow.
+        try_files: Vec<String>,
+        /// When true, GETs against a directory with no matching
+        /// index file render an HTML listing of the directory's
+        /// contents.  Default false (404 as before).  Dotfiles
+        /// are always excluded from the listing.
+        directory_listing: bool,
+        /// Optional URL the handler 302-redirects to when the
+        /// resolved request path is a directory with no matching
+        /// index file and no directory listing.  Useful for
+        /// "redirect '/' to /docs/ until the operator puts real
+        /// content in /var/www/hypershunt/" -- the moment an
+        /// `index.html` shows up, the redirect stops firing.
+        /// Does not apply to non-existent paths (which still 404).
+        fallback_redirect: Option<String>,
+        /// Per-user web directory under each user's HOME.  When
+        /// set, the handler resolves URLs of the form
+        /// `/~<user>/<rest>` to `HOME/<userdir>/<rest>`.  Unix-only;
+        /// mutually exclusive with `root`.
+        userdir: Option<String>,
+        /// Optional allowlist for `~user` paths: only the listed
+        /// usernames may be served.  Empty list means "anyone with
+        /// UID >= `userdir_min_uid`".
+        userdir_allowlist: Vec<String>,
+        /// Minimum UID that may be served via the `~user` syntax.
+        /// Defaults to 1000 to keep system accounts (root, daemon,
+        /// services with home dirs) off the public web.
+        userdir_min_uid: u32,
+    },
+    Proxy {
+        // One entry per backend.  A single positional `proxy "url"` form
+        // still parses (yielding a 1-entry Vec); multi-upstream load
+        // balancing kicks in when there are two or more entries.
+        upstreams: Vec<UpstreamConfig>,
+        // Picker policy when more than one upstream is present.  Default
+        // is round-robin.
+        lb_policy: LbPolicy,
+        // Required when `lb_policy == HeaderHash`; parsed from the
+        // `header=` property on the same `lb-policy` node.  Otherwise
+        // unused.
+        lb_hash_header: Option<String>,
+        // Optional active probe.  `None` disables active health checks
+        // entirely; otherwise a background task probes each upstream.
+        active_health: Option<ActiveHealthConfig>,
+        // Passive eject-on-error tuning.  Always present (with defaults
+        // that mean "never eject" when no failures occur).
+        passive_health: PassiveHealthConfig,
+        // Retry tuning.  `retry.max == 0` (default) disables retry.
+        retry: RetryConfig,
+        strip_prefix: bool,
+        proxy_protocol: Option<ProxyProtocolVersion>,
+        // Wire protocol used to talk to the upstream.  `Auto` (default)
+        // lets the existing hyper-util Client negotiate h1/h2 via ALPN.
+        // `H3` forces HTTP/3 over QUIC -- only valid for `https://`
+        // upstreams (QUIC mandates TLS).
+        scheme: ProxyUpstreamScheme,
+        // Idle timeout (seconds) for cached upstream connections.
+        // For h3: how long a QUIC connection sits unused before the
+        // reaper closes it.  For h1/h2: forwarded to hyper-util's
+        // built-in `pool_idle_timeout`.  `None` = use defaults (90 s);
+        // `Some(0)` disables reaping entirely.
+        pool_idle_timeout_secs: Option<u64>,
+        // Cap on idle upstream connections per host.  Only meaningful
+        // for h1/h2 (hyper-util's `pool_max_idle_per_host`).  `None`
+        // leaves hyper-util's effectively-unbounded default in place.
+        // h3 holds at most one connection per handler today, so the
+        // knob is silently ignored there.
+        pool_max_idle: Option<u32>,
+        // Upstream TLS options.  Mirrors the existing stream-proxy
+        // `tls { skip-verify }` syntax.  When `skip_verify` is true,
+        // the rustls client config used for h1/h2/h3 upstream
+        // connections accepts any certificate.  Only intended for
+        // internal upstreams with self-signed certs.
+        upstream_tls: Option<UpstreamTlsConfig>,
+        // Maximum seconds to wait for the upstream connect step.
+        // For h1/h2: passed to hyper-util's
+        // `HttpConnector::set_connect_timeout`.  For h3: bounds the
+        // `endpoint.connect(...).await` future via tokio::time::timeout.
+        // `None` keeps the underlying defaults (effectively unbounded
+        // for h1/h2; quinn's idle/handshake defaults for h3).
+        connect_timeout_secs: Option<u64>,
+    },
+    Redirect {
+        to: String,
+        code: u16,
+    },
+    FastCgi {
+        socket: String,
+        root: String,
+        index: Option<String>,
+    },
+    Scgi {
+        socket: String,
+        root: String,
+        index: Option<String>,
+    },
+    Cgi {
+        root: String,
+    },
+    Status,
+    /// Return 200 + identity headers; the surrounding `access` block
+    /// handles the actual authentication and authorisation decision
+    /// before this handler is reached.
+    AuthRequest,
+}
+
+// -- Config loading ------------------------------------------------
+
+impl Config {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let name = path.display().to_string();
+        Self::parse_named(&text, &name)
+    }
+
+    #[cfg(test)]
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        Self::parse_named(text, "")
+    }
+
+    fn parse_named(text: &str, name: &str) -> anyhow::Result<Self> {
+        let doc: KdlDocument = text.parse().map_err(|e: ::kdl::KdlError| {
+            // KDL's own error message is a generic placeholder ("An
+            // unspecified error occurred.").  Extract the byte offset
+            // from the miette label instead and compute a line number.
+            let offset = e
+                .labels()
+                .and_then(|mut it| it.next())
+                .map(|l| l.offset())
+                .unwrap_or(0)
+                .min(text.len());
+            let line =
+                text[..offset].bytes().filter(|&b| b == b'\n').count() + 1;
+            let snippet = text
+                .lines()
+                .nth(line.saturating_sub(1))
+                .unwrap_or("")
+                .trim();
+            if name.is_empty() {
+                anyhow!("line {line}: syntax error -- `{snippet}`")
+            } else {
+                anyhow!("{name}:{line}: syntax error -- `{snippet}`")
+            }
+        })?;
+        let mut config = Config::default();
+        // Raw default-vhost specs, one per listener, in order:
+        //   None          - child node absent; resolved to first vhost
+        //   Some(None)    - explicit null; no fallback vhost
+        //   Some(Some(s)) - named vhost
+        let mut raw_defaults: Vec<Option<Option<String>>> = Vec::new();
+        for node in doc.nodes() {
+            let line = node_line(text, node);
+            match node.name().value() {
+                "server" => {
+                    config.server = parse_server(node, text, name)?;
+                }
+                "listener" => {
+                    let (listener, raw) = parse_listener(node, text, name)?;
+                    config.listeners.push(listener);
+                    raw_defaults.push(raw);
+                }
+                "vhost" => {
+                    config.vhosts.push(parse_vhost(node, text, name)?);
+                }
+                "certificate" => {
+                    config
+                        .certificates
+                        .push(parse_certificate(node, text, name)?);
+                }
+                other => {
+                    bail!("{name}:{line}: unknown top-level node '{other}'")
+                }
+            }
+        }
+        // Resolve: absent -> first vhost name, null -> None, named -> Some(s).
+        // Stream listeners have no default_vhost; skip the assignment for them.
+        let first = config.vhosts.first().map(|v| v.name.value.clone());
+        for (listener, raw) in config.listeners.iter_mut().zip(raw_defaults) {
+            if listener.proxy.is_none() {
+                listener.default_vhost = match raw {
+                    None => first.clone(),
+                    Some(None) => None,
+                    Some(Some(name)) => Some(name),
+                };
+            }
+        }
+        // Auto-Alt-Svc: for every TCP/TLS listener whose port matches a
+        // UDP listener's port, pre-build an `Alt-Svc: h3=":<port>"; ma=...`
+        // header value.  The listener service injects it on responses that
+        // don't already carry an Alt-Svc header so user header rules can
+        // still override.  Cross-listener inference is intentionally scoped
+        // to "same port number" -- topology beyond that (h3 on a different
+        // port, multi-endpoint advertisements) is handled by the existing
+        // `headers { response { set "Alt-Svc" "..." } }` mechanism.
+        // Auto Alt-Svc only points at QUIC HTTP/3 listeners (udp://
+        // with a quic{} block), not raw UDP L4 proxies.
+        let udp_ports: std::collections::HashSet<u16> = config
+            .listeners
+            .iter()
+            .filter(|l| {
+                l.bind.kind == SocketKind::UdpDgram && l.quic.is_some()
+            })
+            .filter_map(|l| l.bind.as_inet().map(|sa| sa.port()))
+            .collect();
+        if !udp_ports.is_empty() {
+            for listener in config.listeners.iter_mut() {
+                // Auto Alt-Svc only makes sense for TCP listeners that
+                // serve HTTP (TLS terminated, no proxy): the H3
+                // advertisement is then served alongside h1/h2 on the
+                // same port.
+                if listener.bind.kind != SocketKind::TcpStream
+                    || listener.tls.is_none()
+                    || listener.proxy.is_some()
+                {
+                    continue;
+                }
+                if let Some(port) =
+                    listener.bind.as_inet().map(|sa| sa.port())
+                    && udp_ports.contains(&port)
+                {
+                    listener.auto_alt_svc =
+                        Some(format!("h3=\":{port}\"; ma=86400"));
+                }
+            }
+        }
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.listeners.is_empty() {
+            bail!("config must define at least one listener");
+        }
+        // Vhosts are only required when at least one HTTP listener
+        // is present.  An "HTTP listener" today is any non-proxy
+        // listener -- stream listeners with no proxy serve h1/h2/h3
+        // and need vhost dispatch.
+        let has_http = self.listeners.iter().any(|l| l.proxy.is_none());
+        if has_http && self.vhosts.is_empty() {
+            bail!("config must define at least one vhost");
+        }
+        // Per-listener layer matrix:
+        //
+        //   socket --> optional encryption --> handler
+        //
+        // The encryption layer is named by family:
+        //   tls{}  -> byte-stream listeners (tcp://, unix-stream:)
+        //   quic{} -> udp:// only           (implies HTTP/3)
+        //   dtls{} -> udp:// only           (reserved; not yet impl.)
+        for (i, l) in self.listeners.iter().enumerate() {
+            let kind = l.bind.kind;
+            let has_tls = l.tls.is_some();
+            let has_quic = l.quic.is_some();
+            let has_dtls = l.dtls.is_some();
+            let has_proxy = l.proxy.is_some();
+
+            // Encryption-block / socket-family checks.
+            if has_tls && !kind.is_byte_stream() {
+                bail!(
+                    "listener[{i}] ({}) carries a `tls {{ }}` block; \
+                     TLS termination is only valid on byte-stream \
+                     listeners (tcp://, unix-stream:).  Use `quic {{ }}` \
+                     for HTTP/3 on udp://.",
+                    l.bind.to_url()
+                );
+            }
+            if has_quic && kind != SocketKind::UdpDgram {
+                bail!(
+                    "listener[{i}] ({}) carries a `quic {{ }}` block; \
+                     QUIC termination is only valid on udp:// listeners.",
+                    l.bind.to_url()
+                );
+            }
+            if has_dtls && kind != SocketKind::UdpDgram {
+                bail!(
+                    "listener[{i}] ({}) carries a `dtls {{ }}` block; \
+                     DTLS termination is only valid on udp:// listeners.",
+                    l.bind.to_url()
+                );
+            }
+            if has_quic && has_dtls {
+                bail!(
+                    "listener[{i}] ({}) carries both `quic {{ }}` and \
+                     `dtls {{ }}`; pick at most one encryption layer.",
+                    l.bind.to_url()
+                );
+            }
+            if has_dtls {
+                bail!(
+                    "listener[{i}] ({}) uses `dtls {{ }}` -- DTLS \
+                     termination is not yet implemented; the config \
+                     slot is reserved.  Remove the dtls block to \
+                     proceed.",
+                    l.bind.to_url()
+                );
+            }
+            // QUIC must be HTTP/3; combining quic{} with a proxy is
+            // a layer violation.
+            if has_quic && has_proxy {
+                bail!(
+                    "listener[{i}] ({}) carries both `quic {{ }}` and \
+                     `proxy {{ }}`; QUIC must be HTTP/3.  Use a plain \
+                     udp:// listener with `proxy {{ }}` for raw \
+                     datagram forwarding.",
+                    l.bind.to_url()
+                );
+            }
+            // Datagram listeners with no encryption need a proxy
+            // (there is no HTTP path for raw UDP / unix-dgram /
+            // unix-seqpacket).
+            if kind.is_datagram_stream()
+                && !has_quic
+                && !has_dtls
+                && !has_proxy
+            {
+                bail!(
+                    "listener[{i}] ({}) has no handler: a datagram-\
+                     stream listener requires either a `quic {{ }}` \
+                     block (HTTP/3) or a `proxy {{ }}` block (raw \
+                     datagram forward).",
+                    l.bind.to_url()
+                );
+            }
+
+            // Proxy-side family + encryption-block checks.
+            if let Some(p) = &l.proxy {
+                let upstream_kind = p.upstream.kind;
+                if kind.is_byte_stream() && !upstream_kind.is_byte_stream() {
+                    bail!(
+                        "listener[{i}] ({}) is a byte-stream listener \
+                         but its proxy upstream {} is a datagram \
+                         socket; byte-stream listeners must forward \
+                         to a byte-stream upstream (tcp:// or \
+                         unix-stream:).",
+                        l.bind.to_url(),
+                        p.upstream.to_url()
+                    );
+                }
+                if kind.is_datagram_stream()
+                    && !upstream_kind.is_datagram_stream()
+                {
+                    bail!(
+                        "listener[{i}] ({}) is a datagram-stream \
+                         listener but its proxy upstream {} is a \
+                         byte-stream socket; datagram listeners must \
+                         forward to a datagram upstream (udp://, \
+                         unix-dgram:, unix-seqpacket:).",
+                        l.bind.to_url(),
+                        p.upstream.to_url()
+                    );
+                }
+                if p.upstream_tls.is_some() && !upstream_kind.is_byte_stream()
+                {
+                    bail!(
+                        "listener[{i}] ({}) proxy carries an upstream \
+                         `tls` block but the upstream {} is a datagram \
+                         socket; TLS origination is byte-stream only.",
+                        l.bind.to_url(),
+                        p.upstream.to_url()
+                    );
+                }
+                if p.upstream_dtls.is_some()
+                    && upstream_kind != SocketKind::UdpDgram
+                {
+                    bail!(
+                        "listener[{i}] ({}) proxy carries an upstream \
+                         `dtls` block but the upstream {} is not \
+                         udp://; DTLS origination is UDP-only.",
+                        l.bind.to_url(),
+                        p.upstream.to_url()
+                    );
+                }
+                if p.upstream_dtls.is_some() {
+                    bail!(
+                        "listener[{i}] ({}) proxy uses `dtls` upstream \
+                         origination -- not yet implemented; the \
+                         config slot is reserved.",
+                        l.bind.to_url()
+                    );
+                }
+                if p.proxy_protocol.is_some()
+                    && !upstream_kind.is_byte_stream()
+                {
+                    bail!(
+                        "listener[{i}] ({}) proxy uses `proxy-protocol` \
+                         but the upstream {} is a datagram socket; \
+                         HAProxy PROXY protocol is byte-stream only.",
+                        l.bind.to_url(),
+                        p.upstream.to_url()
+                    );
+                }
+            }
+        }
+        // JWT mode requires a state_dir for key storage.
+        if matches!(self.server.auth, Some(AuthBackend::Jwt { .. }))
+            && self.server.state_dir.is_none()
+        {
+            bail!(
+                "server.state-dir is required when auth jwt is \
+                 configured"
+            );
+        }
+        // Certificate names must be unique.
+        {
+            let mut seen: HashSet<&str> = HashSet::new();
+            for c in &self.certificates {
+                if !seen.insert(c.name.as_str()) {
+                    bail!("duplicate certificate name '{}'", c.name);
+                }
+            }
+        }
+        // Every listener `TlsConfig::Ref` must resolve.
+        for (i, l) in self.listeners.iter().enumerate() {
+            if let Some(t) = &l.tls
+                && let TlsConfig::Ref(name) = &t.cert
+                && !self.certificates.iter().any(|c| &c.name == name)
+            {
+                bail!(
+                    "listener[{i}] references unknown certificate \
+                     '{name}'; define it at the top level with \
+                     `certificate \"{name}\" {{ ... }}`"
+                );
+            }
+        }
+        // ACME mode requires a state_dir for cert/account storage.
+        // Detect ACME via direct usage *or* a Ref that resolves to ACME.
+        let uses_acme = self
+            .listeners
+            .iter()
+            .filter_map(|l| l.tls.as_ref())
+            .any(|t| {
+                self.resolve_cert(&t.cert)
+                    .is_some_and(|c| matches!(c, TlsConfig::Acme { .. }))
+            })
+            || self
+                .certificates
+                .iter()
+                .any(|c| matches!(c.source, TlsConfig::Acme { .. }));
+        if uses_acme && self.server.state_dir.is_none() {
+            bail!(
+                "server.state-dir is required when any listener \
+                 uses tls mode=acme"
+            );
+        }
+        // On-disk identity check: two distinct cert sources cannot
+        // claim the same persistent storage slot.  For ACME this is
+        // the cert directory name (explicit `name` or domains[0]); for
+        // file-based certs it is the (cert_path, key_path) tuple.  This
+        // catches the historical foot-gun of two listeners each carrying
+        // an inline `tls-acme` block with the same default name.
+        self.check_cert_identity_conflicts()?;
+        // Validate regex syntax for any vhost name or alias flagged
+        // with regex=#true.  Compile errors are caught here rather
+        // than at the first incoming request.
+        for v in &self.vhosts {
+            let names = std::iter::once(&v.name).chain(v.aliases.iter());
+            for n in names {
+                if n.regex {
+                    Regex::new(&n.value).with_context(|| {
+                        format!("invalid regex in vhost name '{}'", n.value,)
+                    })?;
+                }
+            }
+        }
+        // Verify every default-vhost reference resolves (HTTP listeners only).
+        let known = self.vhost_names();
+        for (i, l) in self.listeners.iter().enumerate() {
+            if l.proxy.is_none()
+                && let Some(ref name) = l.default_vhost
+                && !known.contains(name.as_str())
+            {
+                bail!(
+                    "listener[{i}] default-vhost '{name}' \
+                             not found in vhosts"
+                );
+            }
+        }
+        // Validate header names in request-headers and response-headers.
+        for v in &self.vhosts {
+            for loc in &v.locations {
+                for ops in [&loc.request_headers, &loc.response_headers] {
+                    for op in ops.iter() {
+                        let n = op.header_name();
+                        HeaderName::from_bytes(n.as_bytes()).map_err(|_| {
+                            anyhow!(
+                                "invalid header name '{n}' in \
+                                 location '{}'",
+                                loc.path
+                            )
+                        })?;
+                    }
+                }
+            }
+        }
+        // If any policy uses country predicates, a geoip db must be
+        // configured.  Recurse through Apply references so a named
+        // policy with a country predicate is caught even if it is only
+        // referenced via apply.
+        let uses_country = {
+            let mut visited = HashSet::new();
+            self.vhosts.iter().any(|v| {
+                v.locations.iter().any(|loc| {
+                    loc.policy.as_ref().is_some_and(|s| {
+                        policy_needs_geoip(
+                            s,
+                            &self.server.policies,
+                            &mut visited,
+                        )
+                    })
+                })
+            }) || self.listeners.iter().any(|l| {
+                l.proxy
+                    .as_ref()
+                    .and_then(|s| s.policy.as_ref())
+                    .is_some_and(|s| {
+                        policy_needs_geoip(
+                            s,
+                            &self.server.policies,
+                            &mut visited,
+                        )
+                    })
+            }) || self.server.policies.values().any(|s| {
+                policy_needs_geoip(s, &self.server.policies, &mut visited)
+            })
+        };
+        if uses_country && self.server.geoip.is_none() {
+            bail!(
+                "policy 'country' predicates require \
+                 server {{ geoip {{ db \"...\" }} }}"
+            );
+        }
+        Ok(())
+    }
+
+    // Reject configurations where two distinct certificate sources
+    // would claim the same on-disk slot.
+    fn check_cert_identity_conflicts(&self) -> anyhow::Result<()> {
+        // Collect every concrete cert source the server will instantiate,
+        // tagged with a human-readable origin for error messages.  A
+        // listener that refers to a top-level certificate by name is
+        // skipped: the named cert is already in the list and we don't
+        // want to double-count a deliberate share.
+        let mut sources: Vec<(String, &TlsConfig)> = Vec::new();
+        for c in &self.certificates {
+            sources.push((format!("certificate \"{}\"", c.name), &c.source));
+        }
+        for (i, l) in self.listeners.iter().enumerate() {
+            let Some(t) = &l.tls else { continue };
+            if matches!(t.cert, TlsConfig::Ref(_)) {
+                continue;
+            }
+            sources.push((format!("listener[{i}] inline tls"), &t.cert));
+        }
+
+        // Group by on-disk identity.  Self-signed sources have no
+        // persistent identity (each is ephemeral and in-memory), so we
+        // skip them.
+        let mut by_acme_name: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut by_files: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+        for (origin, src) in &sources {
+            match src {
+                TlsConfig::Acme { domains, name, .. } => {
+                    let key = name.as_deref().unwrap_or(&domains[0]);
+                    by_acme_name.entry(key).or_default().push(origin);
+                }
+                TlsConfig::Files { cert, key } => {
+                    by_files
+                        .entry((cert.as_str(), key.as_str()))
+                        .or_default()
+                        .push(origin);
+                }
+                TlsConfig::SelfSigned | TlsConfig::Ref(_) => {}
+            }
+        }
+        for (key, owners) in &by_acme_name {
+            if owners.len() > 1 {
+                bail!(
+                    "ACME cert directory '{key}' is claimed by multiple \
+                     sources: {}. Define a single top-level \
+                     `certificate \"{key}\" {{ acme {{ ... }} }}` and \
+                     have each listener reference it via \
+                     `tls cert=\"{key}\"` to share one renewal loop \
+                     and on-disk slot",
+                    owners.join(", ")
+                );
+            }
+        }
+        for ((cert, key), owners) in &by_files {
+            if owners.len() > 1 {
+                bail!(
+                    "file-based cert (cert=\"{cert}\", key=\"{key}\") is \
+                     claimed by multiple sources: {}. Define a single \
+                     top-level `certificate \"...\" {{ files cert=... \
+                     key=... }}` and have each listener reference it",
+                    owners.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a TlsConfig to its concrete source, following one level
+    /// of `Ref`.  Returns `None` only if a `Ref` points at an unknown
+    /// name (which validation rejects, so callers post-validation can
+    /// `.expect()`).
+    pub fn resolve_cert<'a>(
+        &'a self,
+        cfg: &'a TlsConfig,
+    ) -> Option<&'a TlsConfig> {
+        match cfg {
+            TlsConfig::Ref(name) => self
+                .certificates
+                .iter()
+                .find(|c| &c.name == name)
+                .map(|c| &c.source),
+            other => Some(other),
+        }
+    }
+
+    // Returns the set of all known hostnames (names + aliases).
+    pub fn vhost_names(&self) -> std::collections::HashSet<&str> {
+        self.vhosts
+            .iter()
+            .flat_map(|v| {
+                std::iter::once(v.name.value.as_str())
+                    .chain(v.aliases.iter().map(|a| a.value.as_str()))
+            })
+            .collect()
+    }
+}
+
+// Returns true iff any rule in `stmts` (recursively through Apply
+// references) uses a Country predicate.  `visited` prevents infinite
+// loops on circular Apply chains (which are caught later at resolution
+// time; here we just skip cycles safely).
+fn policy_needs_geoip(
+    stmts: &[PolicyRuleDef],
+    policies: &HashMap<String, Vec<PolicyRuleDef>>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    stmts.iter().any(|s| match s {
+        PolicyRuleDef::Rule { predicate, .. } => {
+            predicate.as_ref().is_some_and(|p| p.needs_geoip())
+        }
+        PolicyRuleDef::Apply { name } => {
+            if visited.contains(name) {
+                return false;
+            }
+            visited.insert(name.clone());
+            policies.get(name).is_some_and(|inner| {
+                policy_needs_geoip(inner, policies, visited)
+            })
+        }
+    })
+}

@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>hypershunt</title>
+  <link rel="stylesheet" href="vendor/vue.css">
+  <style>
+    /* Slightly tighter sidebar font + better code blocks. */
+    .sidebar { font-size: 14.5px; }
+    pre[data-lang] { position: relative; }
+
+    /* Home-page card grid: the README wraps its link list in
+       <div class="cards"> -- each consecutive paragraph
+       containing a link becomes a card. */
+    .markdown-section .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1rem;
+      margin: 2rem 0;
+    }
+    .markdown-section .cards p {
+      margin: 0;
+      padding: 1.1rem 1.2rem;
+      border: 1px solid var(--theme-color, #42b983);
+      border-radius: 8px;
+      background: #fafdff;
+      transition: transform 0.12s ease, box-shadow 0.12s ease;
+    }
+    .markdown-section .cards p:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 16px rgba(0,0,0,0.07);
+    }
+    .markdown-section .cards p a {
+      font-weight: 700;
+      text-decoration: none;
+      display: inline-block;
+      margin-bottom: 0.3rem;
+    }
+    .markdown-section .cards p a:hover { text-decoration: underline; }
+
+    /* KDL syntax-highlight palette (matches the vue theme). */
+    .token.keyword { color: #c0392b; font-weight: 600; }
+    .token.property, .token.attr-name { color: #2980b9; }
+    .token.string { color: #16a085; }
+    .token.boolean, .token.number { color: #8e44ad; }
+    .token.comment { color: #7f8c8d; font-style: italic; }
+    .token.punctuation { color: #34495e; }
+  </style>
+</head>
+<body>
+  <div id="app">Loading documentation&hellip;</div>
+
+  <script>
+    window.$docsify = {
+      name: 'hypershunt',
+      repo: 'https://github.com/MichaelPaddon/hypershunt',
+      logo: 'hypershunt-logo.png',
+      loadSidebar: true,
+      subMaxLevel: 3,
+      auto2top: true,
+      relativePath: true,
+      homepage: 'README.md',
+      notFoundPage: false,
+      search: {
+        paths: 'auto',
+        placeholder: 'Search docs',
+        noData: 'No results.',
+        depth: 4,
+        namespace: 'hypershunt-docs'
+      },
+      copyCode: {
+        buttonText: 'Copy',
+        errorText: 'Error',
+        successText: 'Copied'
+      },
+      executeScript: false,
+      noEmoji: true
+    };
+  </script>
+
+  <!-- docsify core + plugins, all vendored -->
+  <script src="vendor/docsify.min.js"></script>
+  <script src="vendor/search.min.js"></script>
+  <script src="vendor/docsify-copy-code.min.js"></script>
+
+  <!-- Prism core + bundled languages -->
+  <script src="vendor/prism.min.js"></script>
+  <script src="vendor/prism-bash.min.js"></script>
+  <script src="vendor/prism-json.min.js"></script>
+  <script src="vendor/prism-yaml.min.js"></script>
+
+  <!-- KDL Prism grammar (no maintained upstream package; minimal
+       in-page definition is enough to colourise node names,
+       properties, strings, and the #true/#false/#null literals). -->
+  <script>
+    Prism.languages.kdl = {
+      'comment': {
+        pattern: /\/\/.*|\/\*[\s\S]*?\*\//,
+        greedy: true
+      },
+      'string': {
+        pattern: /"(?:\\.|[^"\\])*"/,
+        greedy: true
+      },
+      'boolean':  /#(?:true|false|null)\b/,
+      'number':   /\b-?\d+(?:\.\d+)?\b/,
+      'property': {
+        pattern: /\b[a-zA-Z][\w-]*(?=\s*=)/,
+        alias: 'attr-name'
+      },
+      'punctuation': /[{}=;\\]/,
+      'keyword': {
+        pattern: /^[ \t]*[a-zA-Z][\w-]*/m,
+        alias: 'tag'
+      }
+    };
+  </script>
+</body>
+</html>
