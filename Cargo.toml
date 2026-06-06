@@ -151,30 +151,8 @@ opt-level = 3
 lto       = "thin"
 strip     = "symbols"
 
-[package.metadata.scripts]
-
-# Build with:  cargo run-script smoke
-# Requires:    cargo install cargo-run-script
-smoke = '''
-set -e
-cd "$CARGO_MANIFEST_DIR"
-cargo build --release
-# h3get is the HTTP/3 client used by the integration suite (Debian
-# curl can't do --http3).  Built as a release example so the
-# container picks up an optimised binary.
-cargo build --release --example h3get
-podman build -f tests/integration/Containerfile -t hypershunt-test .
-podman run hypershunt-test
-'''
-
-# Build with:  cargo run-script oci
-# Requires:    cargo install cargo-run-script
-oci = '''
-set -e
-cd "$CARGO_MANIFEST_DIR"
-VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-podman build -f packaging/oci/Containerfile -t "hypershunt:$VERSION" -t hypershunt:latest .
-'''
+# Integration tests:  ./tests/integration/smoke.sh
+# OCI image (local):  ./packaging/oci/build.sh
 
 # -- Debian package ------------------------------------------------
 # Build with:  cargo deb

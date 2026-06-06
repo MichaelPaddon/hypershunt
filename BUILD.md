@@ -65,23 +65,25 @@ via `pandoc`, so the two never drift.
 ## Integration tests
 
 The integration suite runs inside a container (it exercises real TLS,
-HTTP/3, and reverse-proxy paths). It needs `podman`:
+HTTP/3, and reverse-proxy paths). It is intentionally **not** part of
+`cargo test` (which runs only the fast in-process unit tests). It needs
+`podman` (or set `CONTAINER_ENGINE=docker`):
 
 ```sh
-cargo install cargo-run-script        # one-time
-cargo run-script smoke                # release build + build & run the
-                                      # integration container
+./tests/integration/smoke.sh
 ```
 
-`smoke` also builds the `h3get` example (an HTTP/3 client the suite uses
-because Debian's `curl` lacks `--http3`).
+The script builds the release binary plus the test-only `h3get` (an
+HTTP/3 client, since Debian's `curl` lacks `--http3`) and
+`h2c_connect_echo` helpers, builds the test container, and runs the
+suite. CI runs the same script, so there's one source of truth.
 
 ## Packaging
 
 Install the packaging helpers once:
 
 ```sh
-cargo install cargo-deb cargo-generate-rpm cargo-run-script
+cargo install cargo-deb cargo-generate-rpm
 ```
 
 ### Debian (`.deb`)
@@ -103,7 +105,7 @@ cargo generate-rpm           # -> target/generate-rpm/hypershunt-<version>-1.<ar
 Multi-stage build on `debian:trixie-slim`. Needs `podman`:
 
 ```sh
-cargo run-script oci         # tags hypershunt:<version> and hypershunt:latest
+./packaging/oci/build.sh     # tags hypershunt:<version> and hypershunt:latest
 ```
 
 or directly:

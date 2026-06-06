@@ -45,25 +45,9 @@ jobs:
     - name: Install system dependencies
       run: sudo apt-get install -y libpam0g-dev podman
 
-    - name: Build release binary
-      run: cargo build --release
-
-    - name: Build h3get HTTP/3 test client
-      # Used by the integration container to exercise the QUIC
-      # listener; Debian's packaged curl lacks --http3 support.
-      run: cargo build --release --example h3get
-
-    - name: Build h2c_connect_echo test backend
-      # Used by suite_websocket_h1_h2c to drive hypershunt's h1<->h2c
-      # upgrade bridge against a real h2 prior-knowledge server.
-      run: cargo build --release --example h2c_connect_echo
-
-    - name: Build test container
-      run: >
-        podman build
-        -f tests/integration/Containerfile
-        -t hypershunt-test
-        .
-
+    # smoke.sh builds the release binary + the h3get / h2c_connect_echo
+    # example helpers, builds the test container, and runs the suite.
+    # The same script is the documented local entry point, so the recipe
+    # lives in exactly one place.
     - name: Run integration tests
-      run: podman run --rm hypershunt-test
+      run: tests/integration/smoke.sh
