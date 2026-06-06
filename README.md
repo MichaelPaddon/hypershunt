@@ -76,6 +76,9 @@ podman run --rm -p 80:80 -p 443:443 ghcr.io/michaelpaddon/hypershunt:latest
 cargo build --release
 ```
 
+Building from source (prerequisites, tests, and packaging) is covered in
+[BUILD.md](BUILD.md).
+
 A fresh install ships an empty `/var/www/hypershunt/` and redirects `/`
 to the bundled docs at `/docs/`; drop your own `index.html` into
 the webroot and the redirect stops firing.
