@@ -263,11 +263,17 @@ impl Authenticator for LdapAuthenticator {
                 Principal::Authenticated(Identity { username, groups })
             }
             Ok(Err(e)) => {
-                tracing::warn!(username, "auth failed: {e}");
+                // Backend operational detail; the canonical, peer-bearing
+                // security signal is emitted at the listener.  Debug, and
+                // `username` stays a structured field so a crafted value
+                // is escaped (no log injection).
+                tracing::debug!(username, "ldap auth rejected: {e}");
                 Principal::Anonymous
             }
             Err(_) => {
-                tracing::warn!("LDAP auth timed out for {username}");
+                // Was inline-interpolated (unescaped); use a structured
+                // field so an attacker-controlled username can't inject.
+                tracing::warn!(username, "ldap auth timed out");
                 Principal::Anonymous
             }
         }
@@ -647,7 +653,10 @@ impl Authenticator for PamAuthenticator {
                 Principal::Authenticated(Identity { username, groups })
             }
             Ok(Err(e)) => {
-                tracing::warn!(username, "auth failed: {e}");
+                // Backend operational detail; the canonical, peer-bearing
+                // security signal is emitted at the listener.  See the
+                // LDAP arm for the rationale.
+                tracing::debug!(username, "pam auth rejected: {e}");
                 Principal::Anonymous
             }
             Err(e) => {

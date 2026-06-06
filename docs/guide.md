@@ -1976,6 +1976,62 @@ logrotate's stock postrotate of `kill -HUP` handles this.
 
 **See also**: [Reference -- access-log](reference.md#access-log).
 
+## Security signals (fail2ban)
+
+Beyond the access log, hypershunt emits **security events** on a
+dedicated, stable log target: `hypershunt::security`.  Each event is one
+line with a distinct kebab-case token, designed to be both human-readable
+and matched by an intrusion-detection tool such as fail2ban:
+
+```
+2026-06-06T12:34:56Z WARN hypershunt::security: auth-failure peer=1.2.3.4:5678 method=GET path="/admin" host="example.com"
+```
+
+The target is fixed (it never moves with code refactors), so filters
+keyed on it don't silently break.
+
+### The tokens
+
+| token | level | meaning | key fields |
+|---|---|---|---|
+| `auth-failure` | WARN | credentials were **presented but rejected** (bad password, invalid bearer token, invalid/expired session cookie) | `peer`, `method`, `path`, `host` |
+| `auth-challenge` | INFO | a protected resource was hit with **no** credentials → 401 challenge (benign / abandoned) | `peer`, `method`, `path`, `host` |
+| `access-denied` | WARN | denied by access policy (IP / geo / group → 403; also raw-TCP stream proxy) | `peer`, `method`, `status`, `path`, `host` |
+| `rate-limited` | WARN | a rate-limit rule returned 429 | `peer`, `rule`, `retry_after` |
+| `bad-client-cert` | WARN | the mTLS handshake rejected the client certificate | `peer`, `reason` (`no-cert`/`untrusted`/`expired`/`revoked`/…) |
+
+`auth-failure` vs `auth-challenge` is the important distinction: a client
+that merely *gets challenged* (no credentials) is **not** an attacker, so
+it is logged as `auth-challenge` and is **not** banned by default — only
+genuine rejected credentials (`auth-failure`) are.
+
+### Injection safety
+
+`peer` is the real accepted socket address (never a forwarded header) and
+always precedes any request-derived field.  Attacker-controlled fields
+(`path`, `host`) are escaped by the logger (a newline becomes `\n`), so a
+crafted request cannot forge a fake log line or a fake `peer=`.  fail2ban
+extracts the IP from the trusted `peer=` token, so bans always target the
+real client.
+
+### Enabling the bans
+
+The packages install a parametrized fail2ban filter
+(`/etc/fail2ban/filter.d/hypershunt.conf`) and a set of jails
+(`/etc/fail2ban/jail.d/hypershunt.conf`), **all disabled by default**.
+Each jail reads the systemd journal and maps one token to a ban policy:
+
+```ini
+[hypershunt-auth]
+enabled = true          # turn on the ones you want
+filter  = hypershunt[event=auth-failure]
+```
+
+Shipped jails: `hypershunt-auth` (auth-failure), `hypershunt-access`
+(access-denied), `hypershunt-ratelimit` (rate-limited), `hypershunt-mtls`
+(bad-client-cert).  Adjust `maxretry` / `findtime` / `bantime` to taste,
+then `systemctl reload fail2ban`.
+
 ## Running unprivileged
 
 Binding to ports below 1024 requires root.  Hypershunt drops

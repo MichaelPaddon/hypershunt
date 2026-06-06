@@ -641,15 +641,31 @@ impl HypershuntService {
                             match outcome {
                                 PolicyOutcome::Allow => {}
                                 PolicyOutcome::Deny(401) => {
-                                    state.metrics.auth_failures.fetch_add(
-                                        1,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    tracing::warn!(
-                                        %peer, %method,
-                                        path, host,
-                                        "auth failed"
-                                    );
+                                    // Distinguish a real failed attempt
+                                    // (credentials presented but rejected)
+                                    // from a benign challenge (no creds)
+                                    // so fail2ban bans the former, not a
+                                    // browser hitting a protected page.
+                                    let session_cookie = state
+                                        .jwt_manager
+                                        .as_deref()
+                                        .map(|m| m.cookie_name());
+                                    if presented_credentials(
+                                        req.headers(),
+                                        session_cookie,
+                                    ) {
+                                        state.metrics.auth_failures.fetch_add(
+                                            1,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        crate::security::auth_failure(
+                                            peer, &method, &path, &host,
+                                        );
+                                    } else {
+                                        crate::security::auth_challenge(
+                                            peer, &method, &path, &host,
+                                        );
+                                    }
                                     // OIDC SSO: a browser hitting a
                                     // protected location with no
                                     // valid session cookie should be
@@ -687,11 +703,8 @@ impl HypershuntService {
                                     );
                                 }
                                 PolicyOutcome::Deny(code) => {
-                                    tracing::warn!(
-                                        %peer, %method,
-                                        path, host,
-                                        status = code,
-                                        "access denied"
+                                    crate::security::access_denied(
+                                        peer, &method, code, &path, &host,
                                     );
                                     return (
                                         response_status(
@@ -815,11 +828,8 @@ impl HypershuntService {
                                 1,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
-                            tracing::info!(
-                                %peer,
-                                rule = %rule_name,
-                                retry_after = retry_after_secs,
-                                "rate limit triggered"
+                            crate::security::rate_limited(
+                                peer, &rule_name, retry_after_secs as u64,
                             );
                             return (
                                 response_429(retry_after_secs),
@@ -998,6 +1008,31 @@ impl HypershuntService {
     }
 }
 
+// True iff the request carried credential material -- an `Authorization`
+// header or the configured JWT session cookie.  Used at a 401 to tell a
+// real rejected attempt (`auth-failure`) from a benign challenge with no
+// credentials (`auth-challenge`) for the security log stream.
+fn presented_credentials(
+    headers: &hyper::HeaderMap,
+    session_cookie: Option<&str>,
+) -> bool {
+    if headers.contains_key(hyper::header::AUTHORIZATION) {
+        return true;
+    }
+    let Some(name) = session_cookie else {
+        return false;
+    };
+    headers.get_all(hyper::header::COOKIE).iter().any(|v| {
+        v.to_str().is_ok_and(|s| {
+            s.split(';').any(|kv| {
+                kv.trim_start()
+                    .split_once('=')
+                    .is_some_and(|(k, _)| k == name)
+            })
+        })
+    })
+}
+
 // Emit one access-log line per completed request.  Dispatches through
 // the configured `AccessLogger`, which picks tracing / json / common /
 // combined.  `bytes_sent` is read from the response's Content-Length
@@ -1077,5 +1112,46 @@ fn record_compression(
         counter.fetch_add(1, Ordering::Relaxed);
     } else if stats.skipped {
         metrics.compress_skipped_total.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::presented_credentials;
+    use hyper::HeaderMap;
+    use hyper::header::{AUTHORIZATION, COOKIE, HeaderValue};
+
+    #[test]
+    fn authorization_header_counts_as_credentials() {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, HeaderValue::from_static("Basic eg=="));
+        assert!(presented_credentials(&h, Some("sess")));
+        assert!(presented_credentials(&h, None));
+    }
+
+    #[test]
+    fn session_cookie_counts_as_credentials() {
+        let mut h = HeaderMap::new();
+        h.insert(COOKIE, HeaderValue::from_static("a=1; sess=xyz; b=2"));
+        assert!(presented_credentials(&h, Some("sess")));
+        // A different / absent cookie name is not a match.
+        assert!(!presented_credentials(&h, Some("other")));
+    }
+
+    #[test]
+    fn no_credential_material_is_challenge() {
+        let mut h = HeaderMap::new();
+        h.insert(COOKIE, HeaderValue::from_static("a=1; b=2"));
+        assert!(!presented_credentials(&h, Some("sess")));
+        assert!(!presented_credentials(&HeaderMap::new(), Some("sess")));
+        assert!(!presented_credentials(&HeaderMap::new(), None));
+    }
+
+    #[test]
+    fn cookie_name_is_not_prefix_matched() {
+        // A cookie "session_x" must not satisfy session name "sess".
+        let mut h = HeaderMap::new();
+        h.insert(COOKIE, HeaderValue::from_static("session_x=1"));
+        assert!(!presented_credentials(&h, Some("sess")));
     }
 }

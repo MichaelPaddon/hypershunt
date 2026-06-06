@@ -33,6 +33,7 @@ mod proxy_proto;
 mod rate_limit;
 mod reload;
 mod router;
+mod security;
 mod task;
 #[cfg(test)]
 mod test;

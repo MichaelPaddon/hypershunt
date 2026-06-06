@@ -905,4 +905,111 @@ mod tests {
         assert!(err.contains("no CA certificates"), "got: {err}");
         let _ = std::fs::remove_file(ca_path);
     }
+
+    /// End-to-end proof that a rejected client certificate (here: none
+    /// presented to a required-mTLS server) surfaces from tokio-rustls as
+    /// an `io::Error` that `security::client_cert_rejection` can downcast
+    /// and classify.  This is the assumption the `bad-client-cert` signal
+    /// depends on -- if tokio-rustls ever changes its error wrapping, this
+    /// test catches it.
+    #[tokio::test]
+    async fn missing_client_cert_classifies_as_bad_client_cert() {
+        use tokio_rustls::TlsConnector;
+
+        install_provider();
+
+        // Required-mTLS server config.
+        let ca_path = write_tmp(&make_ca_pem(), "ca-loopback");
+        let mtls = MtlsConfig {
+            cas: vec![ca_path.to_string_lossy().into_owned()],
+            mode: MtlsMode::Required,
+            crls: vec![],
+            crl_refresh_secs: 0,
+        };
+        let verifier = build_client_verifier(&mtls).unwrap();
+        let pair = build_self_signed_pair().unwrap();
+        let server_cfg = make_rustls_server_config(
+            &pair,
+            &TlsOptions::default(),
+            None,
+            Some(verifier),
+        )
+        .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+
+        // Client that trusts any server cert and presents NO client cert.
+        #[derive(Debug)]
+        struct NoVerify;
+        impl rustls::client::danger::ServerCertVerifier for NoVerify {
+            fn verify_server_cert(
+                &self,
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &[rustls::pki_types::CertificateDer<'_>],
+                _: &rustls::pki_types::ServerName<'_>,
+                _: &[u8],
+                _: rustls::pki_types::UnixTime,
+            ) -> Result<
+                rustls::client::danger::ServerCertVerified,
+                rustls::Error,
+            > {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<
+                rustls::client::danger::HandshakeSignatureValid,
+                rustls::Error,
+            > {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _: &[u8],
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<
+                rustls::client::danger::HandshakeSignatureValid,
+                rustls::Error,
+            > {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(
+                &self,
+            ) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::aws_lc_rs::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move { acceptor.accept(server_io).await });
+        let client = tokio::spawn(async move {
+            let name = rustls::pki_types::ServerName::try_from("localhost")
+                .unwrap();
+            // The client side will see the server's fatal alert; we only
+            // care about the server-side error.
+            let _ = connector.connect(name, client_io).await;
+        });
+
+        let server_err = server
+            .await
+            .unwrap()
+            .expect_err("required mTLS must reject a client with no cert");
+        let _ = client.await;
+        assert_eq!(
+            crate::security::client_cert_rejection(&server_err),
+            Some("no-cert"),
+            "server handshake error did not classify as a client-cert rejection"
+        );
+        let _ = std::fs::remove_file(ca_path);
+    }
 }

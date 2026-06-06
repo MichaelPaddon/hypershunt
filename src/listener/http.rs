@@ -272,6 +272,13 @@ pub async fn run_tls(
                                     state.metrics
                                         .tls_handshake_failures_total
                                         .fetch_add(1, Ordering::Relaxed);
+                                    if let Some(reason) =
+                                        crate::security::client_cert_rejection(&e)
+                                    {
+                                        crate::security::bad_client_cert(
+                                            peer_addr, reason,
+                                        );
+                                    }
                                     debug!(%peer_addr,
                                         "TLS handshake failed: {e}");
                                     return;
