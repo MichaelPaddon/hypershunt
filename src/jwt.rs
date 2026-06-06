@@ -120,7 +120,7 @@ impl JwtManager {
             })?;
             tracing::info!(
                 path = %key_path.display(),
-                "jwt: generated new EC key"
+                "generated new EC key"
             );
             key
         };
@@ -181,7 +181,7 @@ impl JwtManager {
         // Slow path: full ECDSA verification.
         let parts: Vec<&str> = token.splitn(3, '.').collect();
         if parts.len() != 3 {
-            tracing::debug!("jwt: invalid token format");
+            tracing::debug!("invalid token format");
             return JwtResult::Invalid;
         }
         let (header_b64, payload_b64, sig_b64) = (parts[0], parts[1], parts[2]);
@@ -197,12 +197,12 @@ impl JwtManager {
                 Err(_) => return JwtResult::Invalid,
             };
         if header.get("alg").and_then(|v| v.as_str()) != Some("ES256") {
-            tracing::debug!("jwt: unexpected algorithm in header");
+            tracing::debug!("unexpected algorithm in header");
             return JwtResult::Invalid;
         }
         if header.get("kid").and_then(|v| v.as_str()) != Some(self.kid.as_str())
         {
-            tracing::debug!("jwt: kid mismatch (not our token)");
+            tracing::debug!("kid mismatch (not our token)");
             return JwtResult::NotMine;
         }
 
@@ -218,7 +218,7 @@ impl JwtManager {
         let signed_input = format!("{header_b64}.{payload_b64}");
         let digest = Sha256::new_with_prefix(signed_input.as_bytes());
         if self.verifying_key.verify_digest(digest, &sig).is_err() {
-            tracing::debug!("jwt: signature verification failed");
+            tracing::debug!("signature verification failed");
             return JwtResult::Invalid;
         }
 
@@ -238,7 +238,7 @@ impl JwtManager {
             None => return JwtResult::Invalid,
         };
         if exp <= now {
-            tracing::debug!("jwt: token expired");
+            tracing::debug!("token expired");
             return JwtResult::Expired;
         }
 

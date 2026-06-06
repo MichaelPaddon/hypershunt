@@ -66,7 +66,7 @@ impl CgiHandler {
             None => {
                 tracing::warn!(
                     path = %uri_path,
-                    "cgi: path traversal attempt or script not found"
+                    "path traversal attempt or script not found"
                 );
                 return response_404();
             }
@@ -78,7 +78,7 @@ impl CgiHandler {
                 self.metrics
                     .cgi_errors_total
                     .fetch_add(1, Ordering::Relaxed);
-                tracing::error!("cgi: failed to read request body: {e}");
+                tracing::error!("failed to read request body: {e}");
                 return response_502();
             }
         };
@@ -110,7 +110,7 @@ impl CgiHandler {
                     .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     script = %script_path.display(),
-                    "cgi: failed to spawn script: {e}"
+                    "failed to spawn script: {e}"
                 );
                 return response_502();
             }
@@ -122,7 +122,7 @@ impl CgiHandler {
             && let Err(e) = stdin.write_all(&body_bytes).await
         {
             self.metrics.cgi_errors_total.fetch_add(1, Ordering::Relaxed);
-            tracing::error!("cgi: failed to write stdin: {e}");
+            tracing::error!("failed to write stdin: {e}");
             let _ = child.kill().await;
             return response_502();
         }
@@ -135,7 +135,7 @@ impl CgiHandler {
                     .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     script = %script_path.display(),
-                    "cgi: script execution failed: {e}"
+                    "script execution failed: {e}"
                 );
                 return response_502();
             }
@@ -145,7 +145,7 @@ impl CgiHandler {
             tracing::warn!(
                 script = %script_path.display(),
                 status = %output.status,
-                "cgi: script exited with non-zero status"
+                "script exited with non-zero status"
             );
         }
 
@@ -157,7 +157,7 @@ impl CgiHandler {
                     .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     script = %script_path.display(),
-                    "cgi: malformed response: {e}"
+                    "malformed response: {e}"
                 );
                 response_502()
             }

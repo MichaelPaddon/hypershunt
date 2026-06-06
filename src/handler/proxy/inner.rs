@@ -362,7 +362,7 @@ impl InnerProxyClient {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(
-                    "proxy upgrade: failed to build backend URI: {e}"
+                    "upgrade: failed to build backend URI: {e}"
                 );
                 return crate::error::response_502();
             }
@@ -598,7 +598,7 @@ impl InnerProxyClient {
             match self.prepare_backend_request(req, matched_prefix) {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::error!("proxy: failed to build backend URI: {e}");
+                    tracing::error!("failed to build backend URI: {e}");
                     return response_502();
                 }
             };
@@ -610,7 +610,7 @@ impl InnerProxyClient {
             return match h3.request(backend_req).await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    tracing::error!("proxy h3: backend request failed: {e:#}");
+                    tracing::error!("h3: backend request failed: {e:#}");
                     response_502()
                 }
             };
@@ -669,7 +669,7 @@ impl InnerProxyClient {
                     m.proxy_upstream_connect_errors_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                tracing::error!("proxy: backend request failed: {e}");
+                tracing::error!("backend request failed: {e}");
                 response_502()
             }
         }
@@ -833,7 +833,7 @@ impl InnerProxyClient {
             match self.prepare_backend_request(req, matched_prefix) {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::error!("proxy: failed to build backend URI: {e}");
+                    tracing::error!("failed to build backend URI: {e}");
                     return response_502();
                 }
             };
@@ -864,12 +864,12 @@ impl InnerProxyClient {
                 Ok(s) => s,
                 Err(e) => {
                     self.count_connect_error();
-                    tracing::error!("proxy: unix upstream connect failed: {e}");
+                    tracing::error!("unix upstream connect failed: {e}");
                     return response_502();
                 }
             };
             if let Err(e) = stream.write_all(&header).await {
-                tracing::error!("proxy: writing PROXY header failed: {e}");
+                tracing::error!("writing PROXY header failed: {e}");
                 return response_502();
             }
             return match send_http1_request(TokioIo::new(stream), backend_req)
@@ -877,7 +877,7 @@ impl InnerProxyClient {
             {
                 Ok(r) => convert_response(r),
                 Err(e) => {
-                    tracing::error!("proxy: backend request failed: {e}");
+                    tracing::error!("backend request failed: {e}");
                     response_502()
                 }
             };
@@ -892,13 +892,13 @@ impl InnerProxyClient {
             Ok(s) => s,
             Err(e) => {
                 self.count_connect_error();
-                tracing::error!("proxy: upstream connect failed: {e}");
+                tracing::error!("upstream connect failed: {e}");
                 return response_502();
             }
         };
 
         if let Err(e) = stream.write_all(&header).await {
-            tracing::error!("proxy: writing PROXY header failed: {e}");
+            tracing::error!("writing PROXY header failed: {e}");
             return response_502();
         }
 
@@ -910,7 +910,7 @@ impl InnerProxyClient {
                 Ok(n) => n,
                 Err(e) => {
                     tracing::error!(
-                        "proxy: invalid upstream hostname '{host}': {e}"
+                        "invalid upstream hostname '{host}': {e}"
                     );
                     return response_502();
                 }
@@ -926,7 +926,7 @@ impl InnerProxyClient {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::error!("proxy: TLS handshake failed: {e}");
+                    tracing::error!("TLS handshake failed: {e}");
                     return response_502();
                 }
             };
@@ -938,7 +938,7 @@ impl InnerProxyClient {
         match resp {
             Ok(r) => convert_response(r),
             Err(e) => {
-                tracing::error!("proxy: backend request failed: {e}");
+                tracing::error!("backend request failed: {e}");
                 response_502()
             }
         }

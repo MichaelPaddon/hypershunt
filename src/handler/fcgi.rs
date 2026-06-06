@@ -254,7 +254,7 @@ pub fn parse_fcgi_stdout(data: &[u8]) -> anyhow::Result<Vec<u8>> {
                 if let Ok(msg) = std::str::from_utf8(content) {
                     let msg = msg.trim();
                     if !msg.is_empty() {
-                        tracing::warn!("fastcgi stderr: {msg}");
+                        tracing::warn!(msg, "stderr");
                     }
                 }
             }

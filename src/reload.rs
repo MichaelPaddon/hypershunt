@@ -4,6 +4,11 @@
 // hypershunt apply a new configuration -- or replace its own binary --
 // without dropping in-flight connections.
 
+/// Fixed tracing target for config-reload (SIGHUP) and binary-upgrade
+/// (SIGUSR2) events, so operators can filter this stream regardless of
+/// internal module moves.  Mirrors `crate::security::TARGET`.
+pub(crate) const TARGET: &str = "hypershunt::reload";
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -123,7 +128,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("{e:#}");
-            tracing::warn!(
+            tracing::warn!(target: TARGET,
                 path = %reload_state.config_path.display(),
                 "SIGHUP: config reload failed (parse/validate): {msg}"
             );
@@ -149,7 +154,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
         format!("{:?}", new_config.server.auth);
     let old_auth_fingerprint = reload_state.auth_fingerprint.load_full();
     if new_auth_fingerprint != *old_auth_fingerprint {
-        tracing::warn!(
+        tracing::warn!(target: TARGET,
             "SIGHUP: server.auth (PAM/LDAP/file/JWT/OIDC) changed; \
              v1 reload does not rebuild authenticators -- reload \
              aborted, old config still serving.  Restart hypershunt to \
@@ -185,7 +190,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
     {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(
+            tracing::warn!(target: TARGET,
                 "SIGHUP: building named cert registry failed: {e:#}; \
                  reload aborted, old config still serving"
             );
@@ -210,7 +215,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
                 for ph in prev {
                     ph.abort();
                 }
-                tracing::info!(
+                tracing::info!(target: TARGET,
                     cert = %name,
                     "SIGHUP: aborted prior ACME renewal (cert source changed)"
                 );
@@ -242,7 +247,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
     ) {
         Ok(r) => Arc::new(r),
         Err(e) => {
-            tracing::warn!(
+            tracing::warn!(target: TARGET,
                 "SIGHUP: building new router failed: {e:#}"
             );
             return ReloadOutcome::ParseError(format!("{e:#}"));
@@ -260,7 +265,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
         Some(g) => match geoip::open(&g.db) {
             Ok(reader) => Some(Arc::new(reader)),
             Err(e) => {
-                tracing::warn!(
+                tracing::warn!(target: TARGET,
                     "SIGHUP: re-opening geoip database failed: {e:#}"
                 );
                 return ReloadOutcome::ParseError(format!("{e:#}"));
@@ -288,7 +293,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
     ) {
         Ok(a) => a,
         Err(e) => {
-            tracing::warn!(
+            tracing::warn!(target: TARGET,
                 "SIGHUP: rebuilding access log failed: {e:#}"
             );
             return ReloadOutcome::ParseError(format!("{e:#}"));
@@ -326,7 +331,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
         match crate::listener::bind_socket(cfg, &mut empty) {
             Ok(socket) => staged_binds.push((cfg.clone(), socket)),
             Err(e) => {
-                tracing::warn!(
+                tracing::warn!(target: TARGET,
                     bind = %cfg.bind,
                     "SIGHUP: failed to bind new listener: {e:#}; \
                      reload aborted, old config still serving"
@@ -371,7 +376,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
             .remove(&removed.bind.to_url())
         {
             let _ = tx.send(true);
-            tracing::info!(
+            tracing::info!(target: TARGET,
                 bind = %removed.bind,
                 "SIGHUP: stopping listener removed from config"
             );
@@ -388,7 +393,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
                 h.abort();
             }
             if n > 0 {
-                tracing::debug!(
+                tracing::debug!(target: TARGET,
                     bind = %removed.bind,
                     helpers = n,
                     "SIGHUP: aborted per-listener helper tasks"
@@ -421,7 +426,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
             for h in handles {
                 h.abort();
             }
-            tracing::info!(
+            tracing::info!(target: TARGET,
                 cert = %name,
                 "SIGHUP: aborted ACME renewal for removed cert"
             );
@@ -528,14 +533,14 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
             };
             match fut {
                 Ok(future) => {
-                    tracing::info!(
+                    tracing::info!(target: TARGET,
                         %bind, kind = kind_label,
                         "SIGHUP: spawned new listener"
                     );
                     future.await;
                 }
                 Err(e) => {
-                    tracing::error!(
+                    tracing::error!(target: TARGET,
                         %bind, kind = kind_label,
                         "SIGHUP: building added listener failed: {e:#}"
                     );
@@ -550,7 +555,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
         .current_listeners
         .store(Arc::new(new_config.listeners.clone()));
 
-    tracing::info!(
+    tracing::info!(target: TARGET,
         path = %reload_state.config_path.display(),
         added = diff.added.len(),
         removed = diff.removed.len(),

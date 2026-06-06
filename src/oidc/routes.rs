@@ -378,7 +378,7 @@ pub(crate) async fn handle_oidc_backchannel_logout(
             metrics
                 .oidc_backchannel_logouts
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::info!(removed, "oidc: back-channel logout processed");
+            tracing::info!(removed, "back-channel logout processed");
             Response::builder()
                 .status(StatusCode::OK)
                 .header(hyper::header::CACHE_CONTROL, "no-store")
@@ -391,7 +391,7 @@ pub(crate) async fn handle_oidc_backchannel_logout(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 error = %format!("{e:#}"),
-                "oidc: back-channel logout rejected"
+                "back-channel logout rejected"
             );
             response_status(400, Some(error_pages)).await
         }
@@ -518,7 +518,7 @@ pub(crate) async fn handle_oidc_callback(
             tracing::warn!(
                 expected = %canonical,
                 got = %iss,
-                "oidc: callback iss mismatch"
+                "callback iss mismatch"
             );
             return response_status(400, Some(error_pages)).await;
         }
@@ -526,7 +526,7 @@ pub(crate) async fn handle_oidc_callback(
         metrics
             .oidc_callback_iss_mismatches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tracing::warn!("oidc: callback missing required iss param");
+        tracing::warn!("callback missing required iss param");
         return response_status(400, Some(error_pages)).await;
     }
     // CSRF: the state-id must also be carried by the browser as the
@@ -534,7 +534,7 @@ pub(crate) async fn handle_oidc_callback(
     // not the other was either replayed or cross-site.
     let cookie_state = cookie_value(headers, "__hypershunt_oidc_state");
     if cookie_state.as_deref() != Some(state.as_str()) {
-        tracing::warn!("oidc: state cookie/query mismatch");
+        tracing::warn!("state cookie/query mismatch");
         return response_status(400, Some(error_pages)).await;
     }
 
@@ -542,7 +542,7 @@ pub(crate) async fn handle_oidc_callback(
         match oidc.complete_login(code, &state).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("oidc: callback failed: {e:#}");
+                tracing::warn!("callback failed: {e:#}");
                 return response_status(400, Some(error_pages)).await;
             }
         };
@@ -551,7 +551,7 @@ pub(crate) async fn handle_oidc_callback(
     // the post-login identity would have nowhere to go.
     let Some(jwt) = jwt else {
         tracing::error!(
-            "oidc: callback succeeded but no JWT manager is configured"
+            "callback succeeded but no JWT manager is configured"
         );
         return response_status(500, Some(error_pages)).await;
     };
@@ -559,7 +559,7 @@ pub(crate) async fn handle_oidc_callback(
     let session_cookie = match jwt.make_set_cookie(&identity, is_tls) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("oidc: jwt issue failed: {e:#}");
+            tracing::error!("jwt issue failed: {e:#}");
             return response_status(500, Some(error_pages)).await;
         }
     };

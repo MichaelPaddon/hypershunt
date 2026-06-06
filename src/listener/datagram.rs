@@ -490,7 +490,7 @@ async fn get_or_create_flow(
         Err(e) => {
             tracing::warn!(
                 upstream = %proxy.upstream,
-                "datagram proxy: failed to open upstream: {e:#}"
+                "failed to open upstream: {e:#}"
             );
             return (None, false);
         }
@@ -605,7 +605,7 @@ async fn build_upstream(
             Ok(UpstreamSocket::UnixSeqpacket(Arc::new(async_fd)))
         }
         (kind, _) => Err(anyhow!(
-            "datagram proxy: unsupported upstream kind {kind:?}"
+            "unsupported upstream kind {kind:?}"
         )),
     }
 }
@@ -725,20 +725,20 @@ async fn send_to_upstream(
     match up {
         UpstreamSocket::Udp(s) => {
             if let Err(e) = s.send(payload).await {
-                tracing::warn!("datagram proxy: udp send: {e}");
+                tracing::warn!("udp send: {e}");
             }
         }
         #[cfg(unix)]
         UpstreamSocket::UnixDgram(s) => {
             if let Err(e) = s.send(payload).await {
-                tracing::warn!("datagram proxy: unix-dgram send: {e}");
+                tracing::warn!("unix-dgram send: {e}");
             }
         }
         #[cfg(unix)]
         UpstreamSocket::UnixSeqpacket(fd) => {
             if let Err(e) = seqpacket_send(fd, payload).await {
                 tracing::warn!(
-                    "datagram proxy: unix-seqpacket send: {e}"
+                    "unix-seqpacket send: {e}"
                 );
             }
         }
@@ -773,7 +773,7 @@ fn spawn_reply_task(
                     Ok(n) => n,
                     Err(e) => {
                         tracing::warn!(
-                            "datagram proxy: upstream recv: {e}"
+                            "upstream recv: {e}"
                         );
                         break;
                     }
@@ -784,7 +784,7 @@ fn spawn_reply_task(
                     Ok(n) => n,
                     Err(e) => {
                         tracing::warn!(
-                            "datagram proxy: upstream recv: {e}"
+                            "upstream recv: {e}"
                         );
                         break;
                     }
@@ -796,7 +796,7 @@ fn spawn_reply_task(
                         Ok(n) => n,
                         Err(e) => {
                             tracing::warn!(
-                                "datagram proxy: seqpacket recv: {e}"
+                                "seqpacket recv: {e}"
                             );
                             break;
                         }
@@ -805,7 +805,7 @@ fn spawn_reply_task(
             };
             if let Err(e) = listener.send_to(&buf[..n], peer).await {
                 tracing::warn!(
-                    "datagram proxy: send_to client {peer}: {e}"
+                    "send_to client {peer}: {e}"
                 );
                 break;
             }
@@ -845,7 +845,7 @@ fn spawn_unix_reply_task(
                     Ok(n) => n,
                     Err(e) => {
                         tracing::warn!(
-                            "datagram proxy: upstream recv: {e}"
+                            "upstream recv: {e}"
                         );
                         break;
                     }
@@ -854,7 +854,7 @@ fn spawn_unix_reply_task(
                     Ok(n) => n,
                     Err(e) => {
                         tracing::warn!(
-                            "datagram proxy: upstream recv: {e}"
+                            "upstream recv: {e}"
                         );
                         break;
                     }
@@ -865,7 +865,7 @@ fn spawn_unix_reply_task(
                         Ok(n) => n,
                         Err(e) => {
                             tracing::warn!(
-                                "datagram proxy: seqpacket recv: {e}"
+                                "seqpacket recv: {e}"
                             );
                             break;
                         }
@@ -874,7 +874,7 @@ fn spawn_unix_reply_task(
             };
             if let Err(e) = listener.send_to(&buf[..n], &peer_path).await {
                 tracing::warn!(
-                    "datagram proxy: send_to client {}: {e}",
+                    "send_to client {}: {e}",
                     peer_path.display()
                 );
                 break;

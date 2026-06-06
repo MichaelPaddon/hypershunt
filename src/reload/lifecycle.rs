@@ -58,15 +58,15 @@ pub fn spawn_sigusr2_listener(
         let mut sig = match signal(SignalKind::user_defined2()) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("installing SIGUSR2 handler failed: {e}");
+                tracing::error!(target: crate::reload::TARGET, "installing SIGUSR2 handler failed: {e}");
                 return;
             }
         };
-        tracing::info!("SIGUSR2 listener installed");
+        tracing::info!(target: crate::reload::TARGET, "SIGUSR2 listener installed");
         while sig.recv().await.is_some() {
-            tracing::info!("SIGUSR2 received; starting binary upgrade");
+            tracing::info!(target: crate::reload::TARGET, "SIGUSR2 received; starting binary upgrade");
             if let Err(e) = perform_upgrade(&upgrade_state).await {
-                tracing::warn!("SIGUSR2: upgrade failed: {e:#}");
+                tracing::warn!(target: crate::reload::TARGET, "SIGUSR2: upgrade failed: {e:#}");
                 // Parent keeps serving normally.
             }
             // On success, perform_upgrade() has already fired
@@ -153,7 +153,7 @@ async fn perform_upgrade(state: &UpgradeState) -> anyhow::Result<()> {
 
             match ready {
                 Ok(Ok(())) => {
-                    tracing::info!(
+                    tracing::info!(target: crate::reload::TARGET,
                         pid = child.as_raw(),
                         "SIGUSR2: child reported ready; \
                          beginning parent drain"
@@ -162,7 +162,7 @@ async fn perform_upgrade(state: &UpgradeState) -> anyhow::Result<()> {
                     // then signal main.rs to run its bounded drain.
                     let txs = state.stop_accept_txs.lock().unwrap();
                     for (bind, tx) in txs.iter() {
-                        tracing::debug!(%bind, "stop-accept fired");
+                        tracing::debug!(target: crate::reload::TARGET, %bind, "stop-accept fired");
                         let _ = tx.send(true);
                     }
                     drop(txs);
@@ -268,13 +268,13 @@ pub fn signal_upgrade_ready() {
     let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
     use std::io::Write;
     if let Err(e) = f.write_all(b".") {
-        tracing::warn!("upgrade ready signal write failed: {e}");
+        tracing::warn!(target: crate::reload::TARGET, "upgrade ready signal write failed: {e}");
     }
     drop(f); // close fd
     // SAFETY: we are the only writer; clear the env var so a future
     // re-exec of this child doesn't see a stale value.
     unsafe { std::env::remove_var(UPGRADE_READY_FD_ENV) };
-    tracing::info!("upgrade: signalled parent that child is ready");
+    tracing::info!(target: crate::reload::TARGET, "upgrade: signalled parent that child is ready");
 }
 
 /// Spawn a task that listens for SIGHUP and calls `reload()` for
@@ -291,13 +291,13 @@ pub fn spawn_sighup_listener(
         let mut sig = match signal(SignalKind::hangup()) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("installing SIGHUP handler failed: {e}");
+                tracing::error!(target: crate::reload::TARGET, "installing SIGHUP handler failed: {e}");
                 return;
             }
         };
-        tracing::info!("SIGHUP listener installed");
+        tracing::info!(target: crate::reload::TARGET, "SIGHUP listener installed");
         while sig.recv().await.is_some() {
-            tracing::info!("SIGHUP received; reloading config");
+            tracing::info!(target: crate::reload::TARGET, "SIGHUP received; reloading config");
             // reload() is async to accommodate ACME cert build
             // (network I/O); future signals queue up at tokio's
             // SignalKind dedup window and only fire after this

@@ -320,7 +320,7 @@ impl OidcProvider {
                         );
                         tracing::info!(
                             issuer = %p.cfg.issuer,
-                            "oidc: discovery succeeded"
+                            "discovery succeeded"
                         );
                         break;
                     }
@@ -333,7 +333,7 @@ impl OidcProvider {
                             tracing::error!(
                                 issuer = %p.cfg.issuer,
                                 error = %format!("{e:#}"),
-                                "oidc: discovery failed (retry disabled); \
+                                "discovery failed (retry disabled); \
                                  provider will remain unavailable"
                             );
                             return;
@@ -344,7 +344,7 @@ impl OidcProvider {
                             issuer = %p.cfg.issuer,
                             retry_in = secs,
                             error = %format!("{e:#}"),
-                            "oidc: discovery failed; retrying"
+                            "discovery failed; retrying"
                         );
                         drop(p);
                         tokio::time::sleep(Duration::from_secs(secs)).await;
@@ -383,7 +383,7 @@ impl OidcProvider {
                         );
                         tracing::debug!(
                             issuer = %p.cfg.issuer,
-                            "oidc: discovery refreshed"
+                            "discovery refreshed"
                         );
                     }
                     Err(e) => {
@@ -394,7 +394,7 @@ impl OidcProvider {
                         tracing::warn!(
                             issuer = %p.cfg.issuer,
                             error = %format!("{e:#}"),
-                            "oidc: periodic discovery failed; \
+                            "periodic discovery failed; \
                              keeping previous client"
                         );
                     }
@@ -463,7 +463,7 @@ impl OidcProvider {
                 // failure below; log once but don't keep retrying.
                 tracing::warn!(
                     error = %format!("{e:#}"),
-                    "oidc: userinfo not configurable for this IdP"
+                    "userinfo not configurable for this IdP"
                 );
                 return (id_token_username.to_owned(), id_token_groups);
             }
@@ -480,7 +480,7 @@ impl OidcProvider {
                 );
                 tracing::warn!(
                     error = %format!("{e:#}"),
-                    "oidc: userinfo request failed; falling back \
+                    "userinfo request failed; falling back \
                      to ID-token claims"
                 );
                 return (id_token_username.to_owned(), id_token_groups);
@@ -675,7 +675,7 @@ impl OidcProvider {
                 Err(e) => {
                     tracing::debug!(
                         error = %format!("{e:#}"),
-                        "oidc: revocation not configurable on this \
+                        "revocation not configurable on this \
                          IdP; skipping"
                     );
                     return;
@@ -687,7 +687,7 @@ impl OidcProvider {
                         1,
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    tracing::debug!("oidc: refresh token revoked");
+                    tracing::debug!("refresh token revoked");
                 }
                 Err(e) => {
                     metrics.oidc_revocation_failures.fetch_add(
@@ -696,7 +696,7 @@ impl OidcProvider {
                     );
                     tracing::warn!(
                         error = %format!("{e:#}"),
-                        "oidc: refresh token revocation failed"
+                        "refresh token revocation failed"
                     );
                 }
             }

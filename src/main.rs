@@ -634,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
             "upgrade: draining parent connections (no timeout)"
         );
     } else {
-        tracing::info!("shutdown: draining (up to {drain_secs} s)");
+        tracing::info!(drain_secs, "shutdown: draining");
     }
     let drain = async { while handles.join_next().await.is_some() {} };
     if via_upgrade && drain_secs == 0 {

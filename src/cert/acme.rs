@@ -2,6 +2,10 @@
 // AcmeManager acquires an initial certificate at startup and renews it
 // in a background task when fewer than 30 days remain before expiry.
 
+/// Fixed tracing target for ACME issuance/renewal events, so operators
+/// can filter this stream regardless of internal module moves.
+const TARGET: &str = "hypershunt::acme";
+
 use crate::config::TlsOptions;
 use crate::cert::tls;
 use crate::metrics::Metrics;
@@ -182,7 +186,7 @@ impl AcmeManager {
         provisioner: Arc<dyn Provisioner>,
     ) -> Self {
         if config.is_staging() {
-            tracing::info!(
+            tracing::info!(target: TARGET,
                 cert = config.cert_name(),
                 "ACME staging mode -- \
                  certificates are NOT trusted by browsers"
@@ -239,7 +243,7 @@ impl AcmeManager {
     // Ensure a valid cert exists; acquire if missing or near expiry.
     pub async fn ensure_valid_cert(&self) -> anyhow::Result<TlsAcceptor> {
         if self.cert_needs_renewal() {
-            tracing::info!(
+            tracing::info!(target: TARGET,
                 domains = ?self.config.domains,
                 "acquiring ACME certificate"
             );
@@ -250,7 +254,7 @@ impl AcmeManager {
                     return Err(e).context("ACME certificate acquisition");
                 }
             }
-            tracing::info!(
+            tracing::info!(target: TARGET,
                 domains = ?self.config.domains,
                 "ACME certificate acquired"
             );
@@ -279,7 +283,7 @@ impl AcmeManager {
             } else {
                 self.time_until_renewal()
             };
-            tracing::info!(
+            tracing::info!(target: TARGET,
                 cert = self.config.cert_name(),
                 sleep_secs = sleep.as_secs(),
                 "ACME: next attempt scheduled"
@@ -307,7 +311,7 @@ impl AcmeManager {
                                     self.publish_cert_state();
                                     last_failed = false;
                                     self.count(|m| &m.acme_renewals_total);
-                                    tracing::info!(
+                                    tracing::info!(target: TARGET,
                                         cert = self.config.cert_name(),
                                         "ACME certificate acquired and \
                                          activated"
@@ -318,7 +322,7 @@ impl AcmeManager {
                                     self.count(
                                         |m| &m.acme_renewal_failures_total,
                                     );
-                                    tracing::error!(
+                                    tracing::error!(target: TARGET,
                                         "failed to build acceptor from \
                                          renewed ACME cert: {e:#}"
                                     );
@@ -328,7 +332,7 @@ impl AcmeManager {
                         Err(e) => {
                             last_failed = true;
                             self.count(|m| &m.acme_renewal_failures_total);
-                            tracing::error!(
+                            tracing::error!(target: TARGET,
                                 "failed to load ACME cert: {e:#}"
                             );
                         }
@@ -337,7 +341,7 @@ impl AcmeManager {
                 Err(e) => {
                     last_failed = true;
                     self.count(|m| &m.acme_renewal_failures_total);
-                    tracing::warn!(
+                    tracing::warn!(target: TARGET,
                         cert = self.config.cert_name(),
                         retry_secs = self.config.retry_interval.as_secs(),
                         "ACME acquisition failed: {e:#}"
@@ -446,7 +450,7 @@ impl AcmeManager {
                 }
             }
             Err(e) => {
-                tracing::warn!("cert_state lock poisoned: {e}");
+                tracing::warn!(target: TARGET, "cert_state lock poisoned: {e}");
             }
         }
     }
@@ -571,7 +575,7 @@ impl ChallengeCleanup {
             if let Err(e) =
                 provider.clear_txt(fqdn, value).await
             {
-                tracing::warn!(
+                tracing::warn!(target: TARGET,
                     fqdn = %fqdn,
                     "DNS-01: failed to clear TXT record: {e:#}"
                 );
@@ -768,7 +772,7 @@ impl RealProvisioner {
         let contact_refs: Vec<&str> =
             contact.iter().map(String::as_str).collect();
 
-        tracing::info!("creating new ACME account");
+        tracing::info!(target: TARGET, "creating new ACME account");
         let (account, creds) = Account::builder()
             .context("building ACME account")?
             .create(
@@ -867,7 +871,7 @@ fn warn_if_not_yet_valid(pem: &[u8]) {
         .unwrap_or_default()
         .as_secs() as i64;
     if not_before > now {
-        tracing::warn!(
+        tracing::warn!(target: TARGET,
             secs_until_valid = not_before - now,
             "certificate notBefore is in the future -- \
              check that the server clock is set to UTC"
