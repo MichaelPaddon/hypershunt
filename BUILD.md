@@ -62,6 +62,29 @@ via `pandoc`, so the two never drift.
 - CI installs `pandoc` and fails if the committed `docs/manual.md` is
   out of date, so it can't go stale on `main`.
 
+## Test coverage
+
+Requires `cargo-llvm-cov` (install once):
+
+```sh
+cargo install cargo-llvm-cov
+```
+
+Terminal summary:
+
+```sh
+cargo llvm-cov
+```
+
+HTML report (drill into individual uncovered lines):
+
+```sh
+cargo llvm-cov --open
+```
+
+Note: only the ~339 in-process unit tests are measured. The integration
+tests run inside a container and are not included.
+
 ## Integration tests
 
 The integration suite runs inside a container (it exercises real TLS,
