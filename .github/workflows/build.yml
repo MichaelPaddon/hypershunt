@@ -23,13 +23,14 @@ jobs:
     - name: Build
       run: cargo build --verbose
 
-    - name: Check man-page Markdown mirror is in sync
-      # `cargo build` ran build.rs, which regenerated docs/manual.md from
-      # the man page.  If it differs from the committed copy, someone
-      # edited docs/hypershunt.1 without regenerating the mirror.
+    - name: Check man page + Markdown mirror are in sync
+      # `cargo build` ran build.rs, which (1) synced the man page's .TH
+      # version to the crate version and (2) regenerated docs/manual.md.
+      # A diff here means docs/hypershunt.1 or docs/manual.md was left
+      # stale (e.g. a version bump or man-page edit wasn't rebuilt+committed).
       run: |
-        git diff --exit-code docs/manual.md \
-          || { echo "::error::docs/manual.md is stale — edit docs/hypershunt.1, run 'cargo build', and commit docs/manual.md"; exit 1; }
+        git diff --exit-code docs/hypershunt.1 docs/manual.md \
+          || { echo "::error::docs/hypershunt.1 or docs/manual.md is stale — run 'cargo build' and commit the result"; exit 1; }
 
     - name: Run tests
       run: cargo test --verbose
