@@ -2032,6 +2032,43 @@ Shipped jails: `hypershunt-auth` (auth-failure), `hypershunt-access`
 (bad-client-cert).  Adjust `maxretry` / `findtime` / `bantime` to taste,
 then `systemctl reload fail2ban`.
 
+### From the container image
+
+fail2ban does **not** belong *inside* the container: a container has no
+systemd journal, no firewall capabilities, and runs hypershunt as its
+only process.  Run fail2ban on the **host** instead, watching the
+container's logs and banning on the host firewall (where bans actually
+take effect).
+
+The security signals are plain text on the container's stdout, so route
+them into the host journal with the journald log driver:
+
+```sh
+podman run -d --name hypershunt --log-driver journald \
+    -p 80:80 -p 443:443 ghcr.io/michaelpaddon/hypershunt:latest
+```
+
+The filter and jail files aren't installed by the image (there's no
+package step), but they're **bundled inside it** for you to copy out:
+
+```sh
+podman cp hypershunt:/usr/share/doc/hypershunt/fail2ban/filter.d/hypershunt.conf \
+    /etc/fail2ban/filter.d/hypershunt.conf
+podman cp hypershunt:/usr/share/doc/hypershunt/fail2ban/jail.d/hypershunt.conf \
+    /etc/fail2ban/jail.d/hypershunt.conf
+```
+
+(They're also in the source tree under `packaging/fail2ban/`.)  Then, on
+the host, point the jails at the container's journal instead of the
+systemd unit -- change `journalmatch` in each jail to:
+
+```ini
+journalmatch = CONTAINER_NAME=hypershunt
+```
+
+set `enabled = true` on the jails you want, and `systemctl reload
+fail2ban`.
+
 ## Running unprivileged
 
 Binding to ports below 1024 requires root.  Hypershunt drops

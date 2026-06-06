@@ -79,6 +79,12 @@ cargo build --release
 Building from source (prerequisites, tests, and packaging) is covered in
 [BUILD.md](BUILD.md).
 
+The `.deb`/`.rpm` packages install ready-to-use (disabled) fail2ban jails
+for the [security signals](docs/guide.md#security-signals-fail2ban); for
+the container image they're bundled at
+`/usr/share/doc/hypershunt/fail2ban/` to copy onto the host (fail2ban
+runs on the host, not in the container).
+
 A fresh install ships an empty `/var/www/hypershunt/` and redirects `/`
 to the bundled docs at `/docs/`; drop your own `index.html` into
 the webroot and the redirect stops firing.

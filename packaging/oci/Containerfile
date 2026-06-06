@@ -63,6 +63,12 @@ COPY --from=builder /build/target/release/hypershunt /usr/bin/hypershunt
 # Bundled documentation site, served at /docs/ by the default vhost.
 COPY docs/ /usr/share/doc/hypershunt/site/
 
+# fail2ban filter + jails, for HOST-side use (fail2ban does not run in
+# the container).  `podman cp` these to the host's /etc/fail2ban/ and
+# point journalmatch at CONTAINER_NAME -- see the guide's "Security
+# signals" section.
+COPY packaging/fail2ban/ /usr/share/doc/hypershunt/fail2ban/
+
 COPY packaging/oci/hypershunt-container.kdl /etc/hypershunt.kdl
 
 # Start as root so hypershunt can bind ports 80/443, then drop to hypershunt:hypershunt
