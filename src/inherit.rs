@@ -86,6 +86,28 @@ impl InheritedSockets {
         }
     }
 
+    /// Test-only constructor for pre-populating the TCP map.
+    #[cfg(test)]
+    fn from_tcp_for_test(entries: HashMap<SocketAddr, RawFd>) -> Self {
+        InheritedSockets {
+            tcp: entries,
+            udp: HashMap::new(),
+            unix: HashMap::new(),
+        }
+    }
+
+    /// Test-only constructor for pre-populating the Unix map.
+    #[cfg(test)]
+    fn from_unix_for_test(
+        entries: HashMap<std::path::PathBuf, RawFd>,
+    ) -> Self {
+        InheritedSockets {
+            tcp: HashMap::new(),
+            udp: HashMap::new(),
+            unix: entries,
+        }
+    }
+
     /// Close every inherited socket that wasn't claimed by a listener
     /// during startup.  Critical during a SIGUSR2 binary upgrade where
     /// the new config drops one of the parent's listeners: without
@@ -287,5 +309,57 @@ mod tests {
         // Reclaim the fd so it gets closed at end of test.
         use std::os::unix::io::FromRawFd;
         unsafe { drop(std::net::UdpSocket::from_raw_fd(fd)) };
+    }
+
+    #[test]
+    fn take_tcp_consumes_entry() {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let fd = l.into_raw_fd();
+
+        let mut inh =
+            InheritedSockets::from_tcp_for_test(HashMap::from([(addr, fd)]));
+        assert_eq!(inh.take_tcp(addr), Some(fd));
+        // Second take returns None -- fd already removed.
+        assert_eq!(inh.take_tcp(addr), None);
+
+        unsafe { drop(std::net::TcpListener::from_raw_fd(fd)) };
+    }
+
+    #[test]
+    fn take_unix_consumes_entry() {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        use std::path::PathBuf;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let fd = l.into_raw_fd();
+
+        let mut inh = InheritedSockets::from_unix_for_test(
+            HashMap::from([(path.clone(), fd)]),
+        );
+        assert_eq!(inh.take_unix(&path), Some(fd));
+        assert_eq!(inh.take_unix(&path), None);
+
+        let _: PathBuf = path; // keep path alive for the bind
+        unsafe { drop(std::os::unix::net::UnixListener::from_raw_fd(fd)) };
+    }
+
+    #[test]
+    fn classify_fd_detects_ipv6_tcp_listener() {
+        let l = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let fd = l.as_raw_fd();
+
+        let mut tcp = HashMap::new();
+        let mut udp = HashMap::new();
+        let mut unix = HashMap::new();
+        classify_fd(fd, &mut tcp, &mut udp, &mut unix);
+
+        assert!(udp.is_empty());
+        assert!(unix.is_empty());
+        assert_eq!(tcp.get(&addr).copied(), Some(fd));
+        drop(l);
     }
 }

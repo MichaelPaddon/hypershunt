@@ -1154,4 +1154,102 @@ mod tests {
         h.insert(COOKIE, HeaderValue::from_static("session_x=1"));
         assert!(!presented_credentials(&h, Some("sess")));
     }
+
+    #[test]
+    fn http_version_str_maps_all_variants() {
+        use super::http_version_str;
+        use hyper::Version;
+        assert_eq!(http_version_str(Version::HTTP_09), "HTTP/0.9");
+        assert_eq!(http_version_str(Version::HTTP_10), "HTTP/1.0");
+        assert_eq!(http_version_str(Version::HTTP_11), "HTTP/1.1");
+        assert_eq!(http_version_str(Version::HTTP_2), "HTTP/2.0");
+        assert_eq!(http_version_str(Version::HTTP_3), "HTTP/3.0");
+    }
+
+    #[test]
+    fn record_compression_counts_gzip() {
+        use super::record_compression;
+        use crate::compress::{CompressionStats, Encoding};
+        use crate::metrics::Metrics;
+        use std::sync::atomic::Ordering;
+
+        let m = Metrics::new();
+        let stats = CompressionStats {
+            applied: Some(Encoding::Gzip),
+            bytes_in: 100,
+            bytes_out: 60,
+            skipped: false,
+        };
+        record_compression(&m, &stats);
+        assert_eq!(m.compress_responses_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.compress_gzip_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.compress_brotli_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.compress_zstd_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.compress_bytes_in_total.load(Ordering::Relaxed), 100);
+        assert_eq!(m.compress_bytes_out_total.load(Ordering::Relaxed), 60);
+    }
+
+    #[test]
+    fn record_compression_counts_brotli_and_zstd() {
+        use super::record_compression;
+        use crate::compress::{CompressionStats, Encoding};
+        use crate::metrics::Metrics;
+        use std::sync::atomic::Ordering;
+
+        let m = Metrics::new();
+        record_compression(&m, &CompressionStats {
+            applied: Some(Encoding::Brotli),
+            bytes_in: 200,
+            bytes_out: 80,
+            skipped: false,
+        });
+        record_compression(&m, &CompressionStats {
+            applied: Some(Encoding::Zstd),
+            bytes_in: 300,
+            bytes_out: 90,
+            skipped: false,
+        });
+        assert_eq!(m.compress_responses_total.load(Ordering::Relaxed), 2);
+        assert_eq!(m.compress_brotli_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.compress_zstd_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.compress_bytes_in_total.load(Ordering::Relaxed), 500);
+        assert_eq!(m.compress_bytes_out_total.load(Ordering::Relaxed), 170);
+    }
+
+    #[test]
+    fn record_compression_none_does_not_increment() {
+        use super::record_compression;
+        use crate::compress::CompressionStats;
+        use crate::metrics::Metrics;
+        use std::sync::atomic::Ordering;
+
+        let m = Metrics::new();
+        record_compression(&m, &CompressionStats {
+            applied: None,
+            bytes_in: 0,
+            bytes_out: 0,
+            skipped: false,
+        });
+        assert_eq!(m.compress_responses_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.compress_skipped_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.compress_bytes_in_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn record_compression_skipped_increments_skipped() {
+        use super::record_compression;
+        use crate::compress::CompressionStats;
+        use crate::metrics::Metrics;
+        use std::sync::atomic::Ordering;
+
+        let m = Metrics::new();
+        record_compression(&m, &CompressionStats {
+            applied: None,
+            bytes_in: 0,
+            bytes_out: 0,
+            skipped: true,
+        });
+        assert_eq!(m.compress_skipped_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.compress_responses_total.load(Ordering::Relaxed), 0);
+    }
 }

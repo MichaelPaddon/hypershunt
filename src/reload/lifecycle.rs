@@ -277,6 +277,85 @@ pub fn signal_upgrade_ready() {
     tracing::info!(target: crate::reload::TARGET, "upgrade: signalled parent that child is ready");
 }
 
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::{read_one_byte, signal_upgrade_ready, UPGRADE_READY_FD_ENV};
+    use std::sync::Mutex;
+
+    // signal_upgrade_ready reads/writes the process env, which is
+    // global state; serialise every test that touches it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    async fn read_one_byte_success() {
+        use std::os::fd::IntoRawFd;
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        let read_raw = read_fd.into_raw_fd();
+        let write_raw = write_fd.into_raw_fd();
+
+        // Write from a blocking thread so the async await makes
+        // progress without racing the setup.
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            use std::os::fd::FromRawFd;
+            let mut f = unsafe { std::fs::File::from_raw_fd(write_raw) };
+            f.write_all(b".").unwrap();
+        });
+
+        read_one_byte(read_raw).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_one_byte_eof() {
+        use std::os::fd::IntoRawFd;
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        let read_raw = read_fd.into_raw_fd();
+        // Close write end without writing; reader gets EOF.
+        drop(write_fd);
+
+        let err = read_one_byte(read_raw).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn signal_upgrade_ready_writes_and_clears_env() {
+        use std::io::Read;
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        let read_raw = read_fd.into_raw_fd();
+        let write_raw = write_fd.into_raw_fd();
+
+        // SAFETY: single-threaded context; env lock held above.
+        unsafe {
+            std::env::set_var(
+                UPGRADE_READY_FD_ENV,
+                write_raw.to_string(),
+            );
+        }
+        signal_upgrade_ready();
+
+        assert!(std::env::var(UPGRADE_READY_FD_ENV).is_err(),
+            "env var must be removed after signalling");
+
+        // Exactly one byte must have been written.
+        let mut buf = [0u8; 1];
+        let mut r = unsafe { std::fs::File::from_raw_fd(read_raw) };
+        assert_eq!(r.read(&mut buf).unwrap(), 1);
+    }
+
+    #[test]
+    fn signal_upgrade_ready_no_env_is_noop() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: env lock held; no other thread modifies this var.
+        unsafe { std::env::remove_var(UPGRADE_READY_FD_ENV) };
+        // Must return immediately without panicking or writing.
+        signal_upgrade_ready();
+        assert!(std::env::var(UPGRADE_READY_FD_ENV).is_err());
+    }
+}
+
 /// Spawn a task that listens for SIGHUP and calls `reload()` for
 /// each one.  Returns the JoinHandle so the caller can keep it
 /// alongside the shutdown plumbing.

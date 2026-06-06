@@ -172,3 +172,130 @@ pub(super) fn extract_groups_claim_from_json(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Build a compact JWS from raw header/payload/signature bytes.
+    // The signature is not cryptographically valid; parse_compact_jws
+    // only parses structure and the alg field, it does not verify.
+    fn make_jws(header: &[u8], payload: &[u8], sig: &[u8]) -> String {
+        format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(header),
+            URL_SAFE_NO_PAD.encode(payload),
+            URL_SAFE_NO_PAD.encode(sig),
+        )
+    }
+
+    #[test]
+    fn parse_compact_jws_success_rs256() {
+        let token = make_jws(
+            br#"{"alg":"RS256"}"#,
+            br#"{"sub":"user"}"#,
+            b"\x00\x01\x02",
+        );
+        let parsed = parse_compact_jws(&token).unwrap();
+        assert_eq!(parsed.kid, None);
+        assert_eq!(parsed.payload["sub"], "user");
+        // signed_input = "header.payload" (the two base64url segments)
+        assert!(parsed.signed_input.contains('.'));
+        assert_eq!(parsed.signature_bytes, b"\x00\x01\x02");
+    }
+
+    #[test]
+    fn parse_compact_jws_with_kid() {
+        let token = make_jws(
+            br#"{"alg":"RS256","kid":"mykey"}"#,
+            br#"{"sub":"u"}"#,
+            b"\xAB\xCD",
+        );
+        let parsed = parse_compact_jws(&token).unwrap();
+        assert_eq!(parsed.kid.as_deref(), Some("mykey"));
+    }
+
+    #[test]
+    fn parse_compact_jws_too_few_parts() {
+        assert!(parse_compact_jws("a.b").is_err());
+    }
+
+    #[test]
+    fn parse_compact_jws_too_many_parts() {
+        assert!(parse_compact_jws("a.b.c.d").is_err());
+    }
+
+    #[test]
+    fn parse_compact_jws_bad_base64_header() {
+        // '!' is not valid base64url
+        assert!(parse_compact_jws("!!!.e30.AAAA").is_err());
+    }
+
+    #[test]
+    fn parse_compact_jws_bad_json_header() {
+        let h = URL_SAFE_NO_PAD.encode(b"not-json");
+        let token = format!("{h}.e30.AAAA");
+        assert!(parse_compact_jws(&token).is_err());
+    }
+
+    #[test]
+    fn parse_compact_jws_missing_alg() {
+        let token = make_jws(br#"{"kid":"x"}"#, b"{}", b"\x00");
+        assert!(parse_compact_jws(&token).is_err());
+    }
+
+    #[test]
+    fn parse_compact_jws_unknown_alg() {
+        let token = make_jws(br#"{"alg":"BOGUS"}"#, b"{}", b"\x00");
+        assert!(parse_compact_jws(&token).is_err());
+    }
+
+    #[test]
+    fn parse_compact_jws_bad_base64_payload() {
+        let h = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
+        let token = format!("{h}.!!!.AAAA");
+        assert!(parse_compact_jws(&token).is_err());
+    }
+
+    #[test]
+    fn parse_compact_jws_bad_json_payload() {
+        let h = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
+        let p = URL_SAFE_NO_PAD.encode(b"not-json");
+        let token = format!("{h}.{p}.AAAA");
+        assert!(parse_compact_jws(&token).is_err());
+    }
+
+    // extract_groups_claim_from_json ---------------------------------
+
+    #[test]
+    fn groups_from_json_array_filters_empty_strings() {
+        let json = serde_json::json!({"g": ["a", "", "b", ""]});
+        assert_eq!(
+            extract_groups_claim_from_json("g", &json),
+            ["a", "b"],
+        );
+    }
+
+    #[test]
+    fn groups_from_json_array_skips_non_string_items() {
+        let json = serde_json::json!({"g": ["a", 42, true, "b"]});
+        assert_eq!(
+            extract_groups_claim_from_json("g", &json),
+            ["a", "b"],
+        );
+    }
+
+    #[test]
+    fn groups_from_json_missing_claim_returns_empty() {
+        assert!(
+            extract_groups_claim_from_json("g", &serde_json::json!({}))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn groups_from_json_non_string_non_array_returns_empty() {
+        let json = serde_json::json!({"g": 42});
+        assert!(extract_groups_claim_from_json("g", &json).is_empty());
+    }
+}
+

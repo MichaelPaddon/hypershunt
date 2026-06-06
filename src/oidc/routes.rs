@@ -737,4 +737,155 @@ mod tests {
         assert_eq!(cookie_value(&h, "sid").as_deref(), Some("abc"));
         assert!(cookie_value(&h, "missing").is_none());
     }
+
+    // query_param ----------------------------------------------------
+
+    #[test]
+    fn query_param_first_param() {
+        assert_eq!(
+            query_param("a=1&b=2", "a").as_deref(),
+            Some("1"),
+        );
+    }
+
+    #[test]
+    fn query_param_middle_param() {
+        assert_eq!(
+            query_param("a=1&b=2&c=3", "b").as_deref(),
+            Some("2"),
+        );
+    }
+
+    #[test]
+    fn query_param_last_param() {
+        assert_eq!(
+            query_param("a=1&b=2", "b").as_deref(),
+            Some("2"),
+        );
+    }
+
+    #[test]
+    fn query_param_not_found() {
+        assert!(query_param("a=1&b=2", "c").is_none());
+    }
+
+    #[test]
+    fn query_param_empty_query() {
+        assert!(query_param("", "a").is_none());
+    }
+
+    #[test]
+    fn query_param_percent_decoded() {
+        // percent_decode turns %20 → space; verify the value is decoded
+        assert_eq!(
+            query_param("msg=hello%20world", "msg").as_deref(),
+            Some("hello world"),
+        );
+    }
+
+    // validate_hint --------------------------------------------------
+
+    #[test]
+    fn validate_hint_empty_is_err() {
+        assert!(validate_hint("").is_err());
+    }
+
+    #[test]
+    fn validate_hint_too_long_is_err() {
+        assert!(validate_hint(&"a".repeat(MAX_HINT_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn validate_hint_max_len_is_ok() {
+        assert!(validate_hint(&"a".repeat(MAX_HINT_LEN)).is_ok());
+    }
+
+    #[test]
+    fn validate_hint_non_ascii_printable_is_err() {
+        // Non-ASCII Unicode (é = U+00E9) is outside the ASCII
+        // printable range accepted by validate_hint.
+        assert!(validate_hint("helloéworld").is_err());
+    }
+
+    #[test]
+    fn validate_hint_control_char_is_err() {
+        // 0x01 is below 0x20
+        assert!(validate_hint("hello\x01world").is_err());
+    }
+
+    #[test]
+    fn validate_hint_valid_printable_ascii_is_ok() {
+        assert!(validate_hint("alice@example.com").is_ok());
+        assert!(validate_hint("prompt=none").is_ok());
+    }
+
+    // Cookie value builders -----------------------------------------
+
+    #[test]
+    fn state_cookie_value_without_tls() {
+        let v = state_cookie_value("id123", 60, false);
+        assert!(v.contains("__hypershunt_oidc_state=id123"));
+        assert!(v.contains("Max-Age=60"));
+        assert!(!v.contains("Secure"));
+    }
+
+    #[test]
+    fn state_cookie_value_with_tls() {
+        let v = state_cookie_value("id123", 60, true);
+        assert!(v.contains("Secure"));
+    }
+
+    #[test]
+    fn clear_state_cookie_without_tls() {
+        let v = clear_state_cookie(false);
+        assert!(v.contains("__hypershunt_oidc_state="));
+        assert!(v.contains("Max-Age=0"));
+        assert!(!v.contains("Secure"));
+    }
+
+    #[test]
+    fn clear_state_cookie_with_tls() {
+        assert!(clear_state_cookie(true).contains("Secure"));
+    }
+
+    #[test]
+    fn refresh_cookie_value_without_tls() {
+        let v = refresh_cookie_value("my_cookie", "sess1", 3600, false);
+        assert!(v.contains("my_cookie=sess1"));
+        assert!(v.contains("Max-Age=3600"));
+        assert!(v.contains("SameSite=Strict"));
+        assert!(!v.contains("Secure"));
+    }
+
+    #[test]
+    fn refresh_cookie_value_with_tls() {
+        let v = refresh_cookie_value("c", "s", 60, true);
+        assert!(v.contains("Secure"));
+    }
+
+    #[test]
+    fn clear_refresh_cookie_without_tls() {
+        let v = clear_refresh_cookie("my_cookie", false);
+        assert!(v.contains("my_cookie="));
+        assert!(v.contains("Max-Age=0"));
+        assert!(!v.contains("Secure"));
+    }
+
+    #[test]
+    fn clear_refresh_cookie_with_tls() {
+        assert!(clear_refresh_cookie("c", true).contains("Secure"));
+    }
+
+    #[test]
+    fn clear_jwt_cookie_without_tls() {
+        let v = clear_jwt_cookie("jwt_sess", false);
+        assert!(v.contains("jwt_sess="));
+        assert!(v.contains("Max-Age=0"));
+        assert!(!v.contains("Secure"));
+    }
+
+    #[test]
+    fn clear_jwt_cookie_with_tls() {
+        assert!(clear_jwt_cookie("j", true).contains("Secure"));
+    }
 }
