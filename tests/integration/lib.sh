@@ -8,6 +8,19 @@
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1  (${2:-})"; }
 
+# assert_log <label> <extended-regex>
+# Grep the captured server stdout/stderr (start_server redirects both to
+# $TMPDIR/hypershunt.out).  Used to assert the exact security-event lines
+# that fail2ban consumes.
+assert_log() {
+    local label="$1" pattern="$2"
+    if grep -Eq -- "$pattern" "$TMPDIR/hypershunt.out"; then
+        pass "$label"
+    else
+        fail "$label" "no log line matching: $pattern"
+    fi
+}
+
 # assert_status <label> <expected-code> <url> [curl-flags...]
 assert_status() {
     local label="$1" expected="$2" url="$3"

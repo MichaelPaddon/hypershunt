@@ -27,6 +27,11 @@ case "$1" in
         echo "  sudo systemctl enable --now hypershunt"
         echo ""
         echo "Edit /etc/hypershunt.kdl before starting."
+        echo ""
+        echo "fail2ban jails are installed but DISABLED.  To enable IP"
+        echo "banning, set enabled = true in"
+        echo "  /etc/fail2ban/jail.d/hypershunt.conf"
+        echo "then: sudo systemctl reload fail2ban"
         ;;
 esac
 

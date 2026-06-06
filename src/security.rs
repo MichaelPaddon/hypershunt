@@ -104,9 +104,11 @@ pub fn access_denied_l4(peer: impl Display) {
 /// fixed token derived from the rustls error (see
 /// [`client_cert_rejection`]); never attacker-supplied text.
 pub fn bad_client_cert(peer: impl Display, reason: &'static str) {
+    // `reason` is a fixed, trusted token -> Display (unquoted), matching
+    // the other trusted fields.
     tracing::warn!(
         target: TARGET,
-        peer = %peer, reason,
+        peer = %peer, reason = %reason,
         "bad-client-cert"
     );
 }

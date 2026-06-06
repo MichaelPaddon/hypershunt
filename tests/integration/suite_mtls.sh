@@ -148,6 +148,15 @@ EOF
             "expected handshake failure, got HTTP $untrusted_code"
     fi
 
+    # Both rejections must surface on the security stream so fail2ban can
+    # ban the peer: no cert -> reason="no-cert"; untrusted CA ->
+    # reason="untrusted".  (stdout is line-buffered; give a small margin.)
+    sleep 0.2
+    assert_log "mtls_req/bad_client_cert_no_cert" \
+        'hypershunt::security: bad-client-cert peer=127\.0\.0\.1:[0-9]+ reason=no-cert'
+    assert_log "mtls_req/bad_client_cert_untrusted" \
+        'hypershunt::security: bad-client-cert peer=127\.0\.0\.1:[0-9]+ reason=untrusted'
+
     stop_server
     rm -rf "$d"
 }

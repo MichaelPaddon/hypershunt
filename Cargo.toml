@@ -186,6 +186,9 @@ copyright  = "2026, Michael Paddon"
 license-file = "LICENSE"
 extended-description-file = "packaging/description.txt"
 depends  = "$auto"
+# Soft suggestion: hypershunt ships ready-to-use (disabled) fail2ban
+# jails, but does not require fail2ban.
+recommends = "fail2ban"
 section  = "net"
 priority = "optional"
 
@@ -262,6 +265,11 @@ conf-files = ["/etc/hypershunt.kdl",
 [package.metadata.generate-rpm]
 post_install_script  = "packaging/rpm/postinst.sh"
 pre_uninstall_script = "packaging/rpm/prerm.sh"
+
+# Soft (weak) dependency: the shipped fail2ban jails are disabled by
+# default and fail2ban is not required to run hypershunt.
+[package.metadata.generate-rpm.recommends]
+fail2ban = "*"
 
 
 [[package.metadata.generate-rpm.assets]]

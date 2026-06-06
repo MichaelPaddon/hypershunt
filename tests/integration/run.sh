@@ -64,6 +64,8 @@ source "$TESTS_DIR/suite_proxy_trust.sh"
 source "$TESTS_DIR/suite_proxy_lb.sh"
 # shellcheck source=suite_rate_limit.sh
 source "$TESTS_DIR/suite_rate_limit.sh"
+# shellcheck source=suite_security.sh
+source "$TESTS_DIR/suite_security.sh"
 # shellcheck source=suite_matchers.sh
 source "$TESTS_DIR/suite_matchers.sh"
 # shellcheck source=suite_rewrite.sh
@@ -159,6 +161,7 @@ suite_try_files_gated_by_accept
 suite_try_files_symlink_escape
 suite_rewrite_into_try_files
 suite_try_files_html_suffix
+suite_security_signals
 suite_mtls_required
 suite_mtls_optional
 suite_mtls_revocation
