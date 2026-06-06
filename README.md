@@ -1,6 +1,6 @@
 <div align="center">
   <img src="docs/hypershunt-logo.png" alt="hypershunt" width="320">
-  <p>An HTTP server and reverse proxy.<br>
+  <p>HTTP server and reverse proxy.<br>
   Simple configuration. Just works. No surprises.</p>
 </div>
 

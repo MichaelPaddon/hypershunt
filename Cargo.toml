@@ -2,7 +2,7 @@
 name = "hypershunt"
 version = "1.0.0-rc7"
 edition = "2024"
-description = "HTTP/reverse-proxy server with TLS, virtual hosts, and static file serving"
+description = "HTTP server and reverse proxy"
 authors = ["Michael Paddon <michael@paddon.org>"]
 license = "BSD-2-Clause"
 
