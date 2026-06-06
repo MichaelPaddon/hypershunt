@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-pub struct CgiHandler {
+pub(crate) struct CgiHandler {
     root: PathBuf,
     metrics: Arc<Metrics>,
 }
@@ -147,7 +147,7 @@ impl Handler for CgiHandler {
 }
 
 impl CgiHandler {
-    pub fn new(root: &str, metrics: Arc<Metrics>) -> Self {
+    pub(crate) fn new(root: &str, metrics: Arc<Metrics>) -> Self {
         Self {
             root: PathBuf::from(root),
             metrics,

@@ -24,10 +24,10 @@ impl Handler for AuthRequestHandler {
     }
 }
 
-pub struct AuthRequestHandler;
+pub(crate) struct AuthRequestHandler;
 
 impl AuthRequestHandler {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self
     }
 

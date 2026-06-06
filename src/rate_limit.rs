@@ -196,7 +196,7 @@ pub type RuleSet = arc_swap::ArcSwap<Vec<std::sync::Arc<RateLimitRule>>>;
 /// The task reads the current rule set via `rules.load()` on each
 /// tick, so SIGHUP can publish a new set without restarting this
 /// task -- see `crate::reload` for the supervisor pattern.
-pub fn spawn_eviction_task(
+pub(crate) fn spawn_eviction_task(
     rules: std::sync::Arc<RuleSet>,
     metrics: std::sync::Arc<crate::metrics::Metrics>,
 ) -> tokio::task::JoinHandle<()> {
