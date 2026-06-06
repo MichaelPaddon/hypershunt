@@ -42,8 +42,8 @@ pub trait Handler: Send + Sync {
 /// Server-internal redirect handler.  Splits the redirect target into a
 /// template + status code so the same handler can drive 301/302/307/308.
 pub struct RedirectHandler {
-    pub to: Template,
-    pub code: u16,
+    to: Template,
+    code: u16,
 }
 
 #[async_trait]

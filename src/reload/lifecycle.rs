@@ -160,7 +160,7 @@ async fn perform_upgrade(state: &UpgradeState) -> anyhow::Result<()> {
                     );
                     // Begin draining: stop accepting on every listener,
                     // then signal main.rs to run its bounded drain.
-                    let txs = state.stop_accept_txs.lock().unwrap();
+                    let txs = state.stop_accept_txs.lock().expect("reload stop-accept mutex");
                     for (bind, tx) in txs.iter() {
                         tracing::debug!(target: crate::reload::TARGET, %bind, "stop-accept fired");
                         let _ = tx.send(true);

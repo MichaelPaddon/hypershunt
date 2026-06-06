@@ -2,18 +2,24 @@
 // headers as a netstring block, forwards to a Unix or TCP socket, and
 // streams the response through parse_cgi_response().
 
-use super::cgi_util::{InFlightGuard, build_cgi_env, parse_cgi_response};
+use super::cgi_util::{InFlightGuard, build_cgi_env, collect_body, parse_cgi_response};
 use crate::error::{HttpResponse, response_502};
 use crate::error::ReqBody;
 use crate::handler::Handler;
 use crate::headers::RequestContext;
 use crate::metrics::Metrics;
 use async_trait::async_trait;
-use http_body_util::BodyExt;
 use hyper::Request;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+pub struct ScgiHandler {
+    socket: String,
+    root: String,
+    index: Option<String>,
+    metrics: Arc<Metrics>,
+}
 
 #[async_trait]
 impl Handler for ScgiHandler {
@@ -23,55 +29,22 @@ impl Handler for ScgiHandler {
         matched_prefix: &str,
         _ctx: &RequestContext<'_>,
     ) -> HttpResponse {
-        self.serve(req, matched_prefix).await
-    }
-}
-
-pub struct ScgiHandler {
-    socket: String,
-    root: String,
-    index: Option<String>,
-    metrics: Arc<Metrics>,
-}
-
-impl ScgiHandler {
-    pub fn new(
-        socket: &str,
-        root: &str,
-        index: Option<String>,
-        metrics: Arc<Metrics>,
-    ) -> Self {
-        Self {
-            socket: socket.to_owned(),
-            root: root.to_owned(),
-            index,
-            metrics,
-        }
-    }
-
-    pub async fn serve(
-        &self,
-        req: Request<ReqBody>,
-        matched_prefix: &str,
-    ) -> HttpResponse {
-        self.metrics.scgi_requests_total.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .scgi_requests_total
+            .fetch_add(1, Ordering::Relaxed);
         let _guard = InFlightGuard::new(
             self.metrics.clone(),
             |m| &m.scgi_in_flight,
         );
         let (parts, body) = req.into_parts();
-        let body_bytes = match BodyExt::collect(body).await {
-            Ok(c) => c.to_bytes(),
-            Err(e) => {
-                self.metrics
-                    .scgi_errors_total
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::error!(
-                    socket = %self.socket,
-                    "scgi: failed to read request body: {e}"
-                );
-                return response_502();
-            }
+        let body_bytes = match collect_body(
+            body,
+            &self.metrics.scgi_errors_total,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(resp) => return resp,
         };
 
         let env = build_cgi_env(
@@ -109,6 +82,23 @@ impl ScgiHandler {
             }
         }
     }
+}
+
+impl ScgiHandler {
+    pub fn new(
+        socket: &str,
+        root: &str,
+        index: Option<String>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            socket: socket.to_owned(),
+            root: root.to_owned(),
+            index,
+            metrics,
+        }
+    }
+
 
     async fn execute(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
         if let Some(path) = self.socket.strip_prefix("unix:") {

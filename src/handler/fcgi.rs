@@ -2,30 +2,17 @@
 // Unix or TCP socket using the binary FastCGI record protocol and
 // streams the response back to the HTTP client.
 
-use super::cgi_util::{InFlightGuard, build_cgi_env, parse_cgi_response};
+use super::cgi_util::{InFlightGuard, build_cgi_env, collect_body, parse_cgi_response};
 use crate::error::{HttpResponse, response_502};
 use crate::error::ReqBody;
 use crate::handler::Handler;
 use crate::headers::RequestContext;
 use crate::metrics::Metrics;
 use async_trait::async_trait;
-use http_body_util::BodyExt;
 use hyper::Request;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-#[async_trait]
-impl Handler for FcgiHandler {
-    async fn handle(
-        &self,
-        req: Request<ReqBody>,
-        matched_prefix: &str,
-        _ctx: &RequestContext<'_>,
-    ) -> HttpResponse {
-        self.serve(req, matched_prefix).await
-    }
-}
 
 // -- FastCGI constants ---------------------------------------------
 
@@ -43,32 +30,13 @@ const REQUEST_ID: u16 = 1;
 
 // -- Handler -------------------------------------------------------
 
-pub struct FcgiHandler {
-    socket: String,
-    root: String,
-    index: Option<String>,
-    metrics: Arc<Metrics>,
-}
-
-impl FcgiHandler {
-    pub fn new(
-        socket: &str,
-        root: &str,
-        index: Option<String>,
-        metrics: Arc<Metrics>,
-    ) -> Self {
-        Self {
-            socket: socket.to_owned(),
-            root: root.to_owned(),
-            index,
-            metrics,
-        }
-    }
-
-    pub async fn serve(
+#[async_trait]
+impl Handler for FcgiHandler {
+    async fn handle(
         &self,
         req: Request<ReqBody>,
         matched_prefix: &str,
+        _ctx: &RequestContext<'_>,
     ) -> HttpResponse {
         self.metrics.fcgi_requests_total.fetch_add(1, Ordering::Relaxed);
         let _guard = InFlightGuard::new(
@@ -76,18 +44,14 @@ impl FcgiHandler {
             |m| &m.fcgi_in_flight,
         );
         let (parts, body) = req.into_parts();
-        let body_bytes = match BodyExt::collect(body).await {
-            Ok(c) => c.to_bytes(),
-            Err(e) => {
-                self.metrics
-                    .fcgi_errors_total
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::error!(
-                    socket = %self.socket,
-                    "fastcgi: failed to read request body: {e}"
-                );
-                return response_502();
-            }
+        let body_bytes = match collect_body(
+            body,
+            &self.metrics.fcgi_errors_total,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(resp) => return resp,
         };
 
         let env = build_cgi_env(
@@ -137,6 +101,30 @@ impl FcgiHandler {
             }
         }
     }
+}
+
+pub struct FcgiHandler {
+    socket: String,
+    root: String,
+    index: Option<String>,
+    metrics: Arc<Metrics>,
+}
+
+impl FcgiHandler {
+    pub fn new(
+        socket: &str,
+        root: &str,
+        index: Option<String>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            socket: socket.to_owned(),
+            root: root.to_owned(),
+            index,
+            metrics,
+        }
+    }
+
 
     async fn execute(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
         if let Some(path) = self.socket.strip_prefix("unix:") {

@@ -16,11 +16,11 @@ use hyper::{Request, Response, StatusCode};
 impl Handler for AuthRequestHandler {
     async fn handle(
         &self,
-        req: Request<ReqBody>,
-        matched_prefix: &str,
+        _req: Request<ReqBody>,
+        _matched_prefix: &str,
         ctx: &RequestContext<'_>,
     ) -> HttpResponse {
-        self.serve(req, matched_prefix, ctx).await
+        Self::make_response(ctx)
     }
 }
 
@@ -54,14 +54,6 @@ impl AuthRequestHandler {
             .unwrap_or_else(|_| Response::new(bytes_body(bytes::Bytes::new())))
     }
 
-    pub async fn serve(
-        &self,
-        _req: Request<ReqBody>,
-        _matched_prefix: &str,
-        ctx: &RequestContext<'_>,
-    ) -> HttpResponse {
-        Self::make_response(ctx)
-    }
 }
 
 #[cfg(test)]
