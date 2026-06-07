@@ -106,7 +106,11 @@ jobs:
       packages: write
 
     steps:
+      # fetch-depth: 0 pulls full history and tags so release-notes.sh can
+      # diff this tag against the previous one for the "what's new" section.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Extract version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
@@ -141,13 +145,10 @@ jobs:
             ghcr.io/$OWNER/hypershunt:$VERSION-arm64
           podman manifest push ghcr.io/$OWNER/hypershunt:latest
 
+      # Notes = "what's new" from Conventional Commits since the previous
+      # tag + the current feature set lifted verbatim from the README.
       - name: Generate release notes
-        run: |
-          {
-            awk '/^---$/{found=1; next} found && /^## /{exit} found && NF{print}' README.md
-            echo ""
-            echo "See the [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md) for configuration and usage."
-          } > release-notes.md
+        run: scripts/release-notes.sh "$VERSION" > release-notes.md
 
       - name: Create GitHub release
         run: |
