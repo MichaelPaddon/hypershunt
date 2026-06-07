@@ -20,7 +20,7 @@ KDL examples.
 [**Grammar →**](grammar.md)
 Formal KDL syntax for `hypershunt.kdl`.
 
-[**Server status →**](/status)
+[**Server status →**](/status ':ignore')
 Live metrics for this hypershunt instance.
 
 [**GitHub →**](https://github.com/MichaelPaddon/hypershunt)
