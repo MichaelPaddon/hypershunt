@@ -1,10 +1,12 @@
-# Keep the OCI build context small and free of artifacts that must
-# never land in the image.  The Containerfile uses explicit `COPY`
-# paths, so this mainly (a) shrinks the context shipped to the build
-# engine and (b) stops `COPY docs/` from sweeping in design sources.
+# Keep the build context free of artifacts that must never land in an
+# image.  The packaging Containerfile uses explicit `COPY` paths, so
+# this mainly stops `COPY docs/` from sweeping in design sources.
+#
+# Do NOT exclude target/: tests/integration/Containerfile copies the
+# prebuilt binary and examples from target/release/ (repo-root build
+# context), and a root .containerignore applies to every build here.
 
-# Build artifacts and VCS metadata.
-target/
+# VCS metadata.
 .git/
 .gitignore
 
