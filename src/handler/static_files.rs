@@ -3,8 +3,8 @@
 // and directory index files.  Safe path joining prevents traversal.
 
 use crate::error::{
-    HttpResponse, bytes_body, response_400, response_403, response_404,
-    response_416, response_500,
+    HttpResponse, bytes_body, response_400, response_403,
+    response_403_no_index, response_404, response_416, response_500,
 };
 use crate::error::ReqBody;
 use crate::handler::Handler;
@@ -214,9 +214,12 @@ impl Handler for StaticHandler {
                     // config to point an empty webroot at /docs/.
                     return self.emit_fallback_redirect();
                 }
-                // 403 not 404: avoids leaking whether the directory
-                // exists when listings aren't enabled.
-                None => return response_403(),
+                // Directory exists but has no index.  Status stays 403
+                // (not 404), but the body explains how to serve content
+                // -- this is the common getting-started foot-gun.  The
+                // symlink-escape 403 above keeps the terse response_403()
+                // so the security boundary stays ambiguous.
+                None => return response_403_no_index(),
             }
         } else {
             canonical_path
@@ -1381,6 +1384,22 @@ mod tests {
             .unwrap();
         let resp = handler.handle(req, "/", &dummy_ctx()).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // Status stays 403, but the body must guide the operator to a
+        // fix rather than being a bare "403 Forbidden".
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("index.html"), "missing index hint: {s}");
+        assert!(
+            s.contains("directory-listing"),
+            "missing directory-listing hint: {s}"
+        );
+        assert!(
+            s.contains("fallback-redirect"),
+            "missing fallback-redirect hint: {s}"
+        );
     }
 
     // -- fallback-redirect ----------------------------------------

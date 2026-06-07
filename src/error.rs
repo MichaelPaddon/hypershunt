@@ -87,6 +87,43 @@ pub fn response_403() -> HttpResponse {
     html_response(StatusCode::FORBIDDEN, "<h1>403 Forbidden</h1>")
 }
 
+/// 403 for a `static` directory that has no index file (listing off,
+/// no fallback-redirect).  Unlike `response_403()` -- which guards the
+/// symlink-escape security boundary and must stay terse/ambiguous --
+/// this is only emitted on the getting-started path, so it explains how
+/// to serve content.  The status stays 403; only the body differs.
+/// Deliberately omits the filesystem root path (no server-layout leak)
+/// and any `/docs/` link (not guaranteed to exist in an arbitrary
+/// config).
+pub fn response_403_no_index() -> HttpResponse {
+    html_response(StatusCode::FORBIDDEN, NO_INDEX_403_BODY)
+}
+
+const NO_INDEX_403_BODY: &str = "<!doctype html>\
+<html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>403 - nothing to serve here</title>\
+<style>\
+body{font-family:system-ui,sans-serif;max-width:40rem;margin:4rem auto;\
+padding:0 1rem;line-height:1.5;color:#222}\
+h1{font-size:1.4rem}code{background:#f3f3f3;padding:.1em .35em;\
+border-radius:4px}ul{padding-left:1.2rem}\
+footer{margin-top:2rem;color:#888;font-size:.85rem}\
+</style></head><body>\
+<h1>403 &mdash; nothing to serve here</h1>\
+<p>This location maps to a directory that has no index file, and \
+directory listing is disabled.</p>\
+<p>To serve content, do one of:</p>\
+<ul>\
+<li>add an <code>index.html</code> (or <code>index.htm</code>) to the \
+directory;</li>\
+<li>enable a listing with <code>directory-listing=#true</code>;</li>\
+<li>redirect elsewhere with <code>fallback-redirect=\"&hellip;\"</code>.\
+</li>\
+</ul>\
+<footer>hypershunt</footer>\
+</body></html>";
+
 pub fn response_404() -> HttpResponse {
     html_response(StatusCode::NOT_FOUND, "<h1>404 Not Found</h1>")
 }
@@ -220,6 +257,22 @@ mod tests {
     #[test]
     fn response_403_status() {
         assert_eq!(response_403().status(), 403);
+    }
+
+    #[tokio::test]
+    async fn response_403_no_index_status_and_hints() {
+        let r = response_403_no_index();
+        assert_eq!(r.status(), 403);
+        let body = http_body_util::BodyExt::collect(r.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("index.html"), "missing index hint: {s}");
+        assert!(
+            s.contains("directory-listing"),
+            "missing listing hint: {s}"
+        );
     }
 
     #[test]
