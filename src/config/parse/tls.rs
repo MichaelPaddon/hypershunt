@@ -444,7 +444,7 @@ pub(crate) fn parse_certificate(
         }
     };
     let parsed = parse_tls_node(tls_node, src, name, /* allow_ref */ false)?;
-    Ok(CertificateDef { name: cert_name, source: parsed.cert })
+    Ok(CertificateDef { name: cert_name, source: parsed.cert, line })
 }
 
 /// Parse the per-source / per-server TLS options block.

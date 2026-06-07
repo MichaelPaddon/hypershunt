@@ -993,6 +993,7 @@ mod tests {
             auto_alt_svc: None,
             alpn: None,
             quic_transport: None,
+            line: 0,
         };
         let metrics = Arc::new(Metrics::new());
         let (_sd_tx, sd_rx) = tokio::sync::watch::channel(false);
@@ -1088,6 +1089,7 @@ mod tests {
             auto_alt_svc: None,
             alpn: None,
             quic_transport: None,
+            line: 0,
         };
         let metrics = Arc::new(Metrics::new());
         let (_sd_tx, sd_rx) = tokio::sync::watch::channel(false);
@@ -1176,6 +1178,7 @@ mod tests {
             auto_alt_svc: None,
             alpn: None,
             quic_transport: None,
+            line: 0,
         };
         let metrics = Arc::new(Metrics::new());
         let (_sd_tx, sd_rx) = tokio::sync::watch::channel(false);
@@ -1303,6 +1306,7 @@ mod tests {
             auto_alt_svc: None,
             alpn: None,
             quic_transport: None,
+            line: 0,
         };
         let mut inherited =
             crate::inherit::InheritedSockets::empty();

@@ -2265,6 +2265,181 @@ fn auth_subrequest_missing_url_is_error() {
     );
 }
 
+// -- Syntax / semantic error reporting -----------------------------
+//
+// These lock in accurate line numbers (the kdl crate's KdlError does
+// not expose labels(), so the offset must come from e.diagnostics) and
+// the misnesting / did-you-mean / semantic-line behaviours.
+
+#[test]
+fn syntax_error_reports_correct_line() {
+    // Unterminated string on line 5; must not collapse to line 1.
+    let src = r#"server {}
+listener "tcp://[::]:80"
+vhost "a" {
+    location "/" {
+        static root="/tmp
+    }
+}
+"#;
+    let err = Config::parse(src).unwrap_err().to_string();
+    assert!(err.contains("line 5"), "expected line 5, got: {err}");
+    assert!(!err.contains("line 1"), "should not say line 1: {err}");
+}
+
+#[test]
+fn syntax_error_includes_snippet() {
+    let src = r#"server {}
+vhost "a" {
+    location "/" {
+        static root="/tmp
+    }
+}
+"#;
+    let err = Config::parse(src).unwrap_err().to_string();
+    assert!(
+        err.contains("-- `") && err.contains("static root="),
+        "expected source snippet, got: {err}"
+    );
+}
+
+#[test]
+fn syntax_error_unaffected_by_continuation() {
+    // A `\` line continuation spans lines 2-3, but the actual error is
+    // on physical line 5; the report must name line 5, not the logical
+    // node's start.
+    let src = "server {}\nlistener \\\n    \"tcp://[::]:80\"\nvhost \"a\" {\n    static root=\"/tmp\n}\n";
+    let err = Config::parse(src).unwrap_err().to_string();
+    assert!(err.contains("line 5"), "expected line 5, got: {err}");
+}
+
+#[test]
+fn unbalanced_brace_reports_open_line_and_is_clear() {
+    // Missing one closing '}'.  kdl reports the OPENING brace line (3)
+    // with a clear message.
+    let src = r#"server {}
+listener "tcp://[::]:80"
+vhost "a" {
+    location "/" {
+        static root="/tmp"
+}
+"#;
+    let err = Config::parse(src).unwrap_err().to_string();
+    assert!(err.contains("line 3"), "expected line 3, got: {err}");
+    assert!(
+        err.to_lowercase().contains("closing"),
+        "expected a clear unbalanced-brace message, got: {err}"
+    );
+}
+
+#[test]
+fn syntax_error_non_ascii_no_panic() {
+    // A multibyte char before the error must not panic the
+    // offset->line slicing (char-boundary clamp).
+    let src = "server {}\nvhost \"ké\" {\n    location \"/\" { static root=\"/tmp\n}\n";
+    let err = Config::parse(src).unwrap_err().to_string();
+    assert!(!err.is_empty(), "expected an error, got empty");
+}
+
+#[test]
+fn misnested_listener_in_server_is_diagnosed() {
+    // Balanced braces, but an unclosed `server {` swallows the
+    // listener.  Must name the misplaced node and its line, not emit
+    // the confusing "config must define at least one listener".
+    let src = r#"server {
+    geoip db="/x.mmdb"
+
+    listener "tcp://[::]:80"
+
+    vhost "a" {
+        location "/" { static root="/tmp" }
+    }
+}
+"#;
+    let err = Config::parse(src).unwrap_err().to_string();
+    assert!(
+        err.contains("'listener' cannot be nested"),
+        "expected misnesting message, got: {err}"
+    );
+    assert!(err.contains("line 4"), "expected line 4, got: {err}");
+    assert!(
+        err.contains("line 1"),
+        "expected the parent block line, got: {err}"
+    );
+    assert!(
+        !err.contains("at least one listener"),
+        "should not surface the symptom error: {err}"
+    );
+}
+
+#[test]
+fn misnested_vhost_in_server_is_diagnosed() {
+    let src = r#"server {
+    geoip db="/x.mmdb"
+
+    vhost "a" {
+        location "/" { static root="/tmp" }
+    }
+}
+"#;
+    let err = Config::parse(src).unwrap_err().to_string();
+    assert!(
+        err.contains("'vhost' cannot be nested"),
+        "expected misnesting message, got: {err}"
+    );
+}
+
+#[test]
+fn semantic_error_carries_line() {
+    // A listener that references an undefined certificate.  The error
+    // must point at the listener's line (3), not be location-less.
+    let src = r#"server {}
+listener "tcp://[::]:80"
+listener "tcp://[::]:443" {
+    tls ref name="missing-cert"
+}
+vhost "a" {
+    location "/" { static root="/tmp" }
+}
+"#;
+    let err = Config::parse(src).unwrap_err().to_string();
+    assert!(
+        err.contains("unknown certificate"),
+        "expected cert-ref error, got: {err}"
+    );
+    assert!(err.contains("line 3"), "expected line 3, got: {err}");
+}
+
+#[test]
+fn unknown_top_level_node_suggests_nearest() {
+    let src = r#"server {}
+listner "tcp://[::]:80"
+vhost "a" {
+    location "/" { static root="/tmp" }
+}
+"#;
+    let err = Config::parse(src).unwrap_err().to_string();
+    assert!(
+        err.contains("did you mean 'listener'"),
+        "expected suggestion, got: {err}"
+    );
+}
+
+#[test]
+fn unknown_vhost_child_suggests_nearest() {
+    let src = r#"server {}
+listener "tcp://[::]:80"
+vhost "a" {
+    locaiton "/" { static root="/tmp" }
+}
+"#;
+    let err = Config::parse(src).unwrap_err().to_string();
+    assert!(
+        err.contains("did you mean 'location'"),
+        "expected suggestion, got: {err}"
+    );
+}
+
 mod tls;
 
 mod auth;

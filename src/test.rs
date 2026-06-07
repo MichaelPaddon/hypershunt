@@ -155,6 +155,7 @@ impl TestServer {
             auto_alt_svc,
             alpn: None,
             quic_transport: None,
+            line: 0,
         };
         tokio::spawn(run_plain(
             cfg,

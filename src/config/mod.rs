@@ -8,7 +8,6 @@ use crate::access::{PolicyAction, Predicate};
 use ::kdl::KdlDocument;
 use anyhow::{Context, anyhow, bail};
 use hyper::header::HeaderName;
-use miette::Diagnostic as _;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -18,10 +17,23 @@ mod parse;
 mod types_socket;
 pub use types_socket::{AddrLocation, BoundAddr, SocketKind};
 use parse::{
-    node_line, parse_certificate, parse_listener, parse_server, parse_vhost,
+    check_misnesting, did_you_mean, line_of_offset, node_line,
+    parse_certificate, parse_listener, parse_server, parse_vhost,
+    TOP_LEVEL_ONLY,
 };
 #[cfg(test)]
 mod tests;
+
+/// Format a `file:line:` (or bare `line N:`) prefix for a semantic
+/// validation error.  `name` is empty in tests (Config::parse), where
+/// the file name is omitted to keep assertions stable.
+fn loc(name: &str, line: usize) -> String {
+    if name.is_empty() {
+        format!("line {line}: ")
+    } else {
+        format!("{name}:{line}: ")
+    }
+}
 
 // -- Public types --------------------------------------------------
 
@@ -68,6 +80,8 @@ pub struct CertificateDef {
     /// The certificate source.  Never `TlsConfig::Ref` (refs cannot
     /// nest); validated at parse time.
     pub source: TlsConfig,
+    /// 1-based source line of this certificate node, for error messages.
+    pub line: usize,
 }
 
 #[derive(Debug)]
@@ -356,6 +370,8 @@ pub struct ListenerConfig {
     // QUIC transport tuning -- only meaningful for udp: listeners.  None
     // means "use quinn defaults".  See `QuicTransport` for the knobs.
     pub quic_transport: Option<QuicTransport>,
+    // 1-based source line of this listener's node, for error messages.
+    pub line: usize,
 }
 
 /// One backend in a reverse-proxy upstream pool.  A pool with a single
@@ -505,6 +521,8 @@ pub struct VHostConfig {
     // the listener's default ALPN.  Has no effect on QUIC listeners
     // (quinn 0.11 doesn't expose ClientHello before handshake).
     pub alpn: Option<Vec<String>>,
+    // 1-based source line of this vhost's node, for error messages.
+    pub line: usize,
 }
 
 /// Config-level header operation: raw strings before name validation.
@@ -561,6 +579,8 @@ pub struct LocationConfig {
     // does not match, the location's own handler runs on the
     // original URI -- so a non-matching rewrite is a no-op.
     pub rewrite: Option<RewriteConfig>,
+    // 1-based source line of this location's node, for error messages.
+    pub line: usize,
 }
 
 /// One configured `rewrite from="..." to="..."` directive.
@@ -765,28 +785,51 @@ impl Config {
 
     fn parse_named(text: &str, name: &str) -> anyhow::Result<Self> {
         let doc: KdlDocument = text.parse().map_err(|e: ::kdl::KdlError| {
-            // KDL's own error message is a generic placeholder ("An
-            // unspecified error occurred.").  Extract the byte offset
-            // from the miette label instead and compute a line number.
-            let offset = e
-                .labels()
-                .and_then(|mut it| it.next())
-                .map(|l| l.offset())
-                .unwrap_or(0)
-                .min(text.len());
-            let line =
-                text[..offset].bytes().filter(|&b| b == b'\n').count() + 1;
-            let snippet = text
-                .lines()
-                .nth(line.saturating_sub(1))
-                .unwrap_or("")
-                .trim();
-            if name.is_empty() {
-                anyhow!("line {line}: syntax error -- `{snippet}`")
+            // kdl's Diagnostic impl does NOT override labels() -- it only
+            // overrides source_code()/related(), so e.labels() is always
+            // None.  The real spans and messages live on the public
+            // `diagnostics` vec; the old e.labels() path therefore always
+            // collapsed to offset 0 -> line 1.  Read diagnostics directly.
+            let mut seen: Vec<(usize, String)> = Vec::new();
+            let mut parts: Vec<String> = Vec::new();
+            for diag in &e.diagnostics {
+                let line = line_of_offset(text, diag.span.offset());
+                let msg = diag
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "syntax error".to_string());
+                // kdl can emit several diagnostics at one site (e.g. the
+                // two unbalanced-brace messages); keep the report terse.
+                if seen.iter().any(|(l, m)| *l == line && *m == msg) {
+                    continue;
+                }
+                seen.push((line, msg.clone()));
+                let snippet = text
+                    .lines()
+                    .nth(line.saturating_sub(1))
+                    .unwrap_or("")
+                    .trim();
+                parts.push(if name.is_empty() {
+                    format!("line {line}: {msg} -- `{snippet}`")
+                } else {
+                    format!("{name}:{line}: {msg} -- `{snippet}`")
+                });
+            }
+            if parts.is_empty() {
+                // kdl always populates diagnostics on failure, but never
+                // silently collapse to a bare line 1 if that changes.
+                if name.is_empty() {
+                    anyhow!("syntax error")
+                } else {
+                    anyhow!("{name}: syntax error")
+                }
             } else {
-                anyhow!("{name}:{line}: syntax error -- `{snippet}`")
+                anyhow!("{}", parts.join("\n"))
             }
         })?;
+        // Catch balanced-but-misnested braces before semantic checks so
+        // the error names the misplaced node, not a confusing symptom.
+        check_misnesting(text, name, &doc)?;
         let mut config = Config::default();
         // Raw default-vhost specs, one per listener, in order:
         //   None          - child node absent; resolved to first vhost
@@ -813,7 +856,11 @@ impl Config {
                         .push(parse_certificate(node, text, name)?);
                 }
                 other => {
-                    bail!("{name}:{line}: unknown top-level node '{other}'")
+                    bail!(
+                        "{name}:{line}: unknown top-level node \
+                         '{other}'{}",
+                        did_you_mean(other, &TOP_LEVEL_ONLY)
+                    )
                 }
             }
         }
@@ -868,11 +915,11 @@ impl Config {
                 }
             }
         }
-        config.validate()?;
+        config.validate(name)?;
         Ok(config)
     }
 
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self, name: &str) -> anyhow::Result<()> {
         if self.listeners.is_empty() {
             bail!("config must define at least one listener");
         }
@@ -892,7 +939,8 @@ impl Config {
         //   tls{}  -> byte-stream listeners (tcp://, unix-stream:)
         //   quic{} -> udp:// only           (implies HTTP/3)
         //   dtls{} -> udp:// only           (reserved; not yet impl.)
-        for (i, l) in self.listeners.iter().enumerate() {
+        for l in self.listeners.iter() {
+            let at = loc(name, l.line);
             let kind = l.bind.kind;
             let has_tls = l.tls.is_some();
             let has_quic = l.quic.is_some();
@@ -902,7 +950,7 @@ impl Config {
             // Encryption-block / socket-family checks.
             if has_tls && !kind.is_byte_stream() {
                 bail!(
-                    "listener[{i}] ({}) carries a `tls {{ }}` block; \
+                    "{at}listener ({}) carries a `tls {{ }}` block; \
                      TLS termination is only valid on byte-stream \
                      listeners (tcp://, unix-stream:).  Use `quic {{ }}` \
                      for HTTP/3 on udp://.",
@@ -911,28 +959,28 @@ impl Config {
             }
             if has_quic && kind != SocketKind::UdpDgram {
                 bail!(
-                    "listener[{i}] ({}) carries a `quic {{ }}` block; \
+                    "{at}listener ({}) carries a `quic {{ }}` block; \
                      QUIC termination is only valid on udp:// listeners.",
                     l.bind.to_url()
                 );
             }
             if has_dtls && kind != SocketKind::UdpDgram {
                 bail!(
-                    "listener[{i}] ({}) carries a `dtls {{ }}` block; \
+                    "{at}listener ({}) carries a `dtls {{ }}` block; \
                      DTLS termination is only valid on udp:// listeners.",
                     l.bind.to_url()
                 );
             }
             if has_quic && has_dtls {
                 bail!(
-                    "listener[{i}] ({}) carries both `quic {{ }}` and \
+                    "{at}listener ({}) carries both `quic {{ }}` and \
                      `dtls {{ }}`; pick at most one encryption layer.",
                     l.bind.to_url()
                 );
             }
             if has_dtls {
                 bail!(
-                    "listener[{i}] ({}) uses `dtls {{ }}` -- DTLS \
+                    "{at}listener ({}) uses `dtls {{ }}` -- DTLS \
                      termination is not yet implemented; the config \
                      slot is reserved.  Remove the dtls block to \
                      proceed.",
@@ -943,7 +991,7 @@ impl Config {
             // a layer violation.
             if has_quic && has_proxy {
                 bail!(
-                    "listener[{i}] ({}) carries both `quic {{ }}` and \
+                    "{at}listener ({}) carries both `quic {{ }}` and \
                      `proxy {{ }}`; QUIC must be HTTP/3.  Use a plain \
                      udp:// listener with `proxy {{ }}` for raw \
                      datagram forwarding.",
@@ -959,7 +1007,7 @@ impl Config {
                 && !has_proxy
             {
                 bail!(
-                    "listener[{i}] ({}) has no handler: a datagram-\
+                    "{at}listener ({}) has no handler: a datagram-\
                      stream listener requires either a `quic {{ }}` \
                      block (HTTP/3) or a `proxy {{ }}` block (raw \
                      datagram forward).",
@@ -972,7 +1020,7 @@ impl Config {
                 let upstream_kind = p.upstream.kind;
                 if kind.is_byte_stream() && !upstream_kind.is_byte_stream() {
                     bail!(
-                        "listener[{i}] ({}) is a byte-stream listener \
+                        "{at}listener ({}) is a byte-stream listener \
                          but its proxy upstream {} is a datagram \
                          socket; byte-stream listeners must forward \
                          to a byte-stream upstream (tcp:// or \
@@ -985,7 +1033,7 @@ impl Config {
                     && !upstream_kind.is_datagram_stream()
                 {
                     bail!(
-                        "listener[{i}] ({}) is a datagram-stream \
+                        "{at}listener ({}) is a datagram-stream \
                          listener but its proxy upstream {} is a \
                          byte-stream socket; datagram listeners must \
                          forward to a datagram upstream (udp://, \
@@ -997,7 +1045,7 @@ impl Config {
                 if p.upstream_tls.is_some() && !upstream_kind.is_byte_stream()
                 {
                     bail!(
-                        "listener[{i}] ({}) proxy carries an upstream \
+                        "{at}listener ({}) proxy carries an upstream \
                          `tls` block but the upstream {} is a datagram \
                          socket; TLS origination is byte-stream only.",
                         l.bind.to_url(),
@@ -1008,7 +1056,7 @@ impl Config {
                     && upstream_kind != SocketKind::UdpDgram
                 {
                     bail!(
-                        "listener[{i}] ({}) proxy carries an upstream \
+                        "{at}listener ({}) proxy carries an upstream \
                          `dtls` block but the upstream {} is not \
                          udp://; DTLS origination is UDP-only.",
                         l.bind.to_url(),
@@ -1017,7 +1065,7 @@ impl Config {
                 }
                 if p.upstream_dtls.is_some() {
                     bail!(
-                        "listener[{i}] ({}) proxy uses `dtls` upstream \
+                        "{at}listener ({}) proxy uses `dtls` upstream \
                          origination -- not yet implemented; the \
                          config slot is reserved.",
                         l.bind.to_url()
@@ -1027,7 +1075,7 @@ impl Config {
                     && !upstream_kind.is_byte_stream()
                 {
                     bail!(
-                        "listener[{i}] ({}) proxy uses `proxy-protocol` \
+                        "{at}listener ({}) proxy uses `proxy-protocol` \
                          but the upstream {} is a datagram socket; \
                          HAProxy PROXY protocol is byte-stream only.",
                         l.bind.to_url(),
@@ -1050,18 +1098,25 @@ impl Config {
             let mut seen: HashSet<&str> = HashSet::new();
             for c in &self.certificates {
                 if !seen.insert(c.name.as_str()) {
-                    bail!("duplicate certificate name '{}'", c.name);
+                    bail!(
+                        "{}duplicate certificate name '{}'",
+                        loc(name, c.line),
+                        c.name
+                    );
                 }
             }
         }
         // Every listener `TlsConfig::Ref` must resolve.
-        for (i, l) in self.listeners.iter().enumerate() {
+        for l in self.listeners.iter() {
+            // Capture the location prefix before `name` is shadowed by
+            // the cert-ref binding below.
+            let at = loc(name, l.line);
             if let Some(t) = &l.tls
                 && let TlsConfig::Ref(name) = &t.cert
                 && !self.certificates.iter().any(|c| &c.name == name)
             {
                 bail!(
-                    "listener[{i}] references unknown certificate \
+                    "{at}listener references unknown certificate \
                      '{name}'; define it at the top level with \
                      `certificate \"{name}\" {{ ... }}`"
                 );
@@ -1102,35 +1157,41 @@ impl Config {
             for n in names {
                 if n.regex {
                     Regex::new(&n.value).with_context(|| {
-                        format!("invalid regex in vhost name '{}'", n.value,)
+                        format!(
+                            "{}invalid regex in vhost name '{}'",
+                            loc(name, v.line),
+                            n.value
+                        )
                     })?;
                 }
             }
         }
         // Verify every default-vhost reference resolves (HTTP listeners only).
         let known = self.vhost_names();
-        for (i, l) in self.listeners.iter().enumerate() {
+        for l in self.listeners.iter() {
+            // Capture the prefix before `name` is shadowed below.
+            let at = loc(name, l.line);
             if l.proxy.is_none()
                 && let Some(ref name) = l.default_vhost
                 && !known.contains(name.as_str())
             {
-                bail!(
-                    "listener[{i}] default-vhost '{name}' \
-                             not found in vhosts"
-                );
+                bail!("{at}default-vhost '{name}' not found in vhosts");
             }
         }
         // Validate header names in request-headers and response-headers.
         for v in &self.vhosts {
-            for loc in &v.locations {
-                for ops in [&loc.request_headers, &loc.response_headers] {
+            for location in &v.locations {
+                let headers =
+                    [&location.request_headers, &location.response_headers];
+                for ops in headers {
                     for op in ops.iter() {
                         let n = op.header_name();
                         HeaderName::from_bytes(n.as_bytes()).map_err(|_| {
                             anyhow!(
-                                "invalid header name '{n}' in \
+                                "{}invalid header name '{n}' in \
                                  location '{}'",
-                                loc.path
+                                loc(name, location.line),
+                                location.path
                             )
                         })?;
                     }
