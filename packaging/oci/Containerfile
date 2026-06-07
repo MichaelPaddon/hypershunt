@@ -32,9 +32,11 @@ RUN mkdir src \
 
 # ── Real build ────────────────────────────────────────────────────────────────
 COPY src ./src
-# The status page embeds this PNG via include_bytes! at compile time.
-# Copy only this file so unrelated docs edits don't bust the build cache.
+# The status page embeds these assets via include_bytes! at compile
+# time (logo PNG + favicon SVG).  Copy only these files so unrelated
+# docs edits don't bust the build cache.
 COPY docs/hypershunt-logo.png ./docs/hypershunt-logo.png
+COPY docs/hypershunt-favicon.svg ./docs/hypershunt-favicon.svg
 RUN cargo build --release
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
