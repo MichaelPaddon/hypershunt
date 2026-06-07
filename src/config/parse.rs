@@ -6,7 +6,7 @@ use super::{
     QuicListenerConfig, ServerConfig, SocketKind, Timeouts,
     UpstreamDtlsConfig, UpstreamTlsConfig, VHostConfig, VHostName,
 };
-use ::kdl::KdlNode;
+use ::kdl::{KdlDocument, KdlNode};
 use anyhow::{Context, anyhow, bail};
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -28,12 +28,99 @@ use policy::parse_policy_statements;
 mod matcher;
 use matcher::parse_matcher;
 
+/// Byte offset -> 1-based line number, counting raw '\n'.  Line
+/// continuations are handled automatically: newlines are counted in the
+/// source text, so a `\`-continued logical line still maps to the
+/// physical line the offset falls on.  The offset is clamped to a char
+/// boundary first so slicing can never panic on multibyte input.
+pub(super) fn line_of_offset(src: &str, offset: usize) -> usize {
+    let mut off = offset.min(src.len());
+    while off > 0 && !src.is_char_boundary(off) {
+        off -= 1;
+    }
+    src[..off].bytes().filter(|&b| b == b'\n').count() + 1
+}
+
 pub(super) fn node_line(src: &str, node: &KdlNode) -> usize {
-    src[..node.span().offset()]
-        .bytes()
-        .filter(|&b| b == b'\n')
-        .count()
-        + 1
+    line_of_offset(src, node.span().offset())
+}
+
+/// Levenshtein edit distance, computed with a single rolling row.
+/// Used only to suggest near-miss node names in config errors, so the
+/// inputs are always short identifiers.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr = vec![0usize; b_chars.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] =
+                (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_chars.len()]
+}
+
+/// Return ` -- did you mean 'X'?` when `word` is within edit distance 2
+/// of some candidate, else an empty string (so it can be appended to an
+/// error message unconditionally).  Picks the closest candidate; ties
+/// resolve to declaration order.
+pub(super) fn did_you_mean(word: &str, candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .map(|c| (edit_distance(word, c), *c))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| format!(" -- did you mean '{c}'?"))
+        .unwrap_or_default()
+}
+
+/// Node names that are only ever legal at the top level of a config.
+/// None of them is a valid child node name anywhere in the grammar, so
+/// finding one nested inside a block is an unambiguous mistake.
+pub(super) const TOP_LEVEL_ONLY: [&str; 4] =
+    ["server", "listener", "vhost", "certificate"];
+
+/// Reject a top-level-only node that appears nested inside another
+/// block.  Balanced-but-misnested braces (e.g. an unclosed `server {`
+/// that swallows the listeners below it) parse as perfectly valid KDL,
+/// so the parser never complains -- the user instead sees a baffling
+/// downstream error like "config must define at least one listener".
+/// Catching the misplacement here points straight at the real cause.
+pub(super) fn check_misnesting(
+    src: &str,
+    name: &str,
+    doc: &KdlDocument,
+) -> anyhow::Result<()> {
+    for node in doc.nodes() {
+        let Some(children) = node.children() else {
+            continue;
+        };
+        let parent = node.name().value();
+        for child in children.nodes() {
+            let cn = child.name().value();
+            if TOP_LEVEL_ONLY.contains(&cn) {
+                let line = node_line(src, child);
+                let parent_line = node_line(src, node);
+                let loc = if name.is_empty() {
+                    format!("line {line}")
+                } else {
+                    format!("{name}:{line}")
+                };
+                bail!(
+                    "{loc}: '{cn}' cannot be nested inside another \
+                     block (found under '{parent}' opened at line \
+                     {parent_line}) -- unclosed '{{'?"
+                );
+            }
+        }
+        // Recurse so misnesting at any depth is caught.
+        check_misnesting(src, name, children)?;
+    }
+    Ok(())
 }
 
 // Property readers.  Positional args use `arg_str`; repeated
@@ -512,6 +599,7 @@ pub(super) fn parse_listener(
                 auto_alt_svc: None,
                 alpn: alpn.clone(),
                 quic_transport: quic_transport.clone(),
+                line,
             },
             // No raw default-vhost for proxy listeners.
             Some(None),
@@ -563,6 +651,7 @@ pub(super) fn parse_listener(
             auto_alt_svc: None,
             alpn: alpn.clone(),
             quic_transport: quic_transport.clone(),
+            line,
         },
         raw_default_vhost,
     ))
@@ -660,8 +749,9 @@ pub(super) fn parse_vhost(
             }
             other => bail!(
                 "{name}:{child_line}: unknown node '{other}' \
-                 in vhost '{}'",
-                vhost_name.value
+                 in vhost '{}'{}",
+                vhost_name.value,
+                did_you_mean(other, &["alias", "location", "alpn"])
             ),
         }
     }
@@ -676,6 +766,7 @@ pub(super) fn parse_vhost(
         aliases,
         locations,
         alpn,
+        line: node_line(src, node),
     })
 }
 
@@ -774,6 +865,7 @@ fn parse_location(
         max_request_body,
         matcher,
         rewrite,
+        line,
     })
 }
 

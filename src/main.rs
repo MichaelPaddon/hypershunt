@@ -65,6 +65,21 @@ use bootstrap::{
 #[allow(dead_code)]
 pub(crate) type Result<T> = anyhow::Result<T>;
 
+/// Return the `RUST_LOG` directives that are bare words but not valid
+/// log levels.  `EnvFilter` silently treats such a word as a *target
+/// name* (e.g. the syslog level "notice", which tracing does not know),
+/// so the filter ends up enabling only that non-existent target and
+/// disabling everything else — a baffling way to lose every log line.
+/// Directives of the form `target=level` are intentional and skipped.
+fn invalid_log_levels(raw: &str) -> Vec<&str> {
+    use tracing_subscriber::filter::LevelFilter;
+    raw.split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty() && !token.contains('='))
+        .filter(|token| token.parse::<LevelFilter>().is_err())
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -94,6 +109,21 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "hypershunt=info".parse().unwrap()),
         )
         .init();
+
+    // Warn about RUST_LOG words that aren't log levels.  This must go
+    // straight to stderr, not through `tracing`: an invalid filter like
+    // RUST_LOG=notice suppresses our own log targets, so a tracing
+    // warning here would be swallowed by the very mistake it reports.
+    if let Ok(raw) = std::env::var("RUST_LOG") {
+        for token in invalid_log_levels(&raw) {
+            eprintln!(
+                "warning: RUST_LOG directive {token:?} is not a log \
+                 level (expected error, warn, info, debug, trace, or \
+                 off); it is being treated as a logging target name, \
+                 which may silence all other output"
+            );
+        }
+    }
 
     let config_path = args.config;
     let config = config::Config::load(&config_path).with_context(|| {
@@ -686,3 +716,51 @@ struct Args {
     check_config: bool,
 }
 
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::invalid_log_levels;
+
+    #[test]
+    fn flags_syslog_level_typo() {
+        // "notice" is a syslog severity, not a tracing level; EnvFilter
+        // would treat it as a target and go dark.
+        assert_eq!(invalid_log_levels("notice"), vec!["notice"]);
+    }
+
+    #[test]
+    fn accepts_valid_levels() {
+        for level in ["error", "warn", "info", "debug", "trace", "off"] {
+            assert!(
+                invalid_log_levels(level).is_empty(),
+                "{level} should be a valid level"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_levels_case_insensitively() {
+        assert!(invalid_log_levels("INFO").is_empty());
+    }
+
+    #[test]
+    fn ignores_target_level_directives() {
+        // `target=level` forms are deliberate, never flagged.
+        assert!(invalid_log_levels("hypershunt=info").is_empty());
+        assert!(invalid_log_levels("hypershunt::oidc=debug").is_empty());
+    }
+
+    #[test]
+    fn flags_only_the_bad_directive_in_a_list() {
+        assert_eq!(
+            invalid_log_levels("hypershunt=info,verbose"),
+            vec!["verbose"]
+        );
+    }
+
+    #[test]
+    fn ignores_empty_and_whitespace_directives() {
+        assert!(invalid_log_levels("").is_empty());
+        assert!(invalid_log_levels("info, ,").is_empty());
+    }
+}

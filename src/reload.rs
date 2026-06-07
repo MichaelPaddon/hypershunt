@@ -590,6 +590,7 @@ mod tests {
             auto_alt_svc: None,
             alpn: None,
             quic_transport: None,
+            line: 0,
         }
     }
 

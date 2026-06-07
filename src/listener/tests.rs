@@ -59,6 +59,7 @@
             auto_alt_svc: None,
             alpn: None,
             quic_transport: None,
+            line: 0,
         };
         let mut inh = InheritedSockets::empty();
         match super::bind_socket(&cfg, &mut inh).unwrap() {
@@ -98,6 +99,7 @@
             auto_alt_svc: None,
             alpn: None,
             quic_transport: None,
+            line: 0,
         };
         let mut inh = InheritedSockets::empty();
         match super::bind_socket(&cfg, &mut inh).unwrap() {
@@ -2645,6 +2647,7 @@ index-file "index.html";
             auto_alt_svc: None,
             alpn: None,
             quic_transport: None,
+            line: 0,
         };
 
         // 3. bind_socket must adopt the inherited fd (same fd number)
