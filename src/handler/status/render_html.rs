@@ -17,12 +17,35 @@ pub(super) const LOGO_PNG: &[u8] =
     include_bytes!("../../../docs/hypershunt-logo.png");
 pub(super) const LOGO_FILE: &str = "hypershunt-logo.png";
 
+// SVG favicon, embedded at compile time and served from a sub-path so
+// the browser caches it independently of the page HTML.
+pub(super) const FAVICON_SVG: &[u8] =
+    include_bytes!("../../../docs/hypershunt-favicon.svg");
+pub(super) const FAVICON_FILE: &str = "hypershunt-favicon.svg";
+
 /// Serve the PNG logo with a 24-hour cache and ETag support.
 /// Returns 304 Not Modified when the client's ETag matches.
 pub(super) fn serve_logo(
     headers: &hyper::HeaderMap,
 ) -> HttpResponse {
-    let etag = format!("\"{}\"", LOGO_PNG.len());
+    serve_cached_asset(LOGO_PNG, "image/png", headers)
+}
+
+/// Serve the SVG favicon with the same cache/ETag handling as the logo.
+pub(super) fn serve_favicon(
+    headers: &hyper::HeaderMap,
+) -> HttpResponse {
+    serve_cached_asset(FAVICON_SVG, "image/svg+xml", headers)
+}
+
+/// Serve an embedded, immutable byte asset with a 24-hour cache and a
+/// length-derived ETag.  Returns 304 when the client's ETag matches.
+fn serve_cached_asset(
+    bytes: &'static [u8],
+    content_type: &str,
+    headers: &hyper::HeaderMap,
+) -> HttpResponse {
+    let etag = format!("\"{}\"", bytes.len());
     let already_cached = headers
         .get("if-none-match")
         .and_then(|v| v.to_str().ok())
@@ -37,11 +60,11 @@ pub(super) fn serve_logo(
     }
     Response::builder()
         .status(StatusCode::OK)
-        .header("Content-Type", "image/png")
+        .header("Content-Type", content_type)
         .header("Cache-Control", "public, max-age=86400")
-        .header("Content-Length", LOGO_PNG.len().to_string())
+        .header("Content-Length", bytes.len().to_string())
         .header("ETag", &etag)
-        .body(bytes_body(Bytes::from_static(LOGO_PNG)))
+        .body(bytes_body(Bytes::from_static(bytes)))
         .expect("known-valid response")
 }
 
@@ -585,6 +608,11 @@ pub(super) fn render_html(
         matched_prefix.trim_end_matches('/'),
         LOGO_FILE
     );
+    let favicon_src = format!(
+        "{}/{}",
+        matched_prefix.trim_end_matches('/'),
+        FAVICON_FILE
+    );
     let resource_sec = resource_section(s.memory_kb, s.cpu_percent);
     let certs_sec = certs_section(certs);
     let listeners_sec = listeners_section(&sum.listeners);
@@ -660,6 +688,7 @@ pub(super) fn render_html(
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>hypershunt — Status</title>
+<link rel="icon" type="image/svg+xml" href="{favicon_src}">
 <style>{css}</style>
 </head>
 <body>
@@ -866,6 +895,7 @@ pub(super) fn render_html(
 </html>"##,
         css = CSS,
         logo_src = logo_src,
+        favicon_src = favicon_src,
         version = sum.version,
         mem_nav = mem_nav,
         auth_nav = auth_nav,
