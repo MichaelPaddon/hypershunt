@@ -313,16 +313,17 @@ impl Handler for StatusHandler {
         matched_prefix: &str,
         _ctx: &RequestContext<'_>,
     ) -> HttpResponse {
-        // Logo requests are intercepted before content-negotiation so
-        // the browser can cache the PNG asset independently of the page.
-        if req
-            .uri()
-            .path()
-            .rsplit('/')
-            .next()
-            == Some(render_html::LOGO_FILE)
-        {
-            return render_html::serve_logo(req.headers());
+        // Logo and favicon requests are intercepted before content-
+        // negotiation so the browser caches these assets independently
+        // of the page HTML.
+        match req.uri().path().rsplit('/').next() {
+            Some(f) if f == render_html::LOGO_FILE => {
+                return render_html::serve_logo(req.headers());
+            }
+            Some(f) if f == render_html::FAVICON_FILE => {
+                return render_html::serve_favicon(req.headers());
+            }
+            _ => {}
         }
         let period = query_period(req.uri());
         let snap = self.metrics.snapshot();
@@ -1346,10 +1347,30 @@ mod tests {
             ),
             "img src must use the matched prefix",
         );
-        // Favicon must not be present.
+        // Favicon link must be present and use the matched prefix.
         assert!(
-            !html.contains("rel=\"icon\""),
-            "favicon must be absent",
+            html.contains(
+                "rel=\"icon\" type=\"image/svg+xml\" \
+                 href=\"/status/hypershunt-favicon.svg\""
+            ),
+            "favicon link must use the matched prefix: {html}",
         );
+    }
+
+    #[tokio::test]
+    async fn serve_favicon_returns_svg() {
+        use http_body_util::BodyExt;
+        use hyper::HeaderMap;
+        let resp = render_html::serve_favicon(&HeaderMap::new());
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/svg+xml"),
+        );
+        let bytes =
+            resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(!bytes.is_empty(), "favicon body must be non-empty");
     }
 }
