@@ -1,0 +1,15 @@
+# Keep the OCI build context small and free of artifacts that must
+# never land in the image.  The Containerfile uses explicit `COPY`
+# paths, so this mainly (a) shrinks the context shipped to the build
+# engine and (b) stops `COPY docs/` from sweeping in design sources.
+
+# Build artifacts and VCS metadata.
+target/
+.git/
+.gitignore
+
+# GIMP design sources -- only the rendered PNGs are served.
+**/*.xcf
+
+# Editor scratch files.
+*.swp
