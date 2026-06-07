@@ -1,0 +1,17 @@
+# Keep the build context free of artifacts that must never land in an
+# image.  The packaging Containerfile uses explicit `COPY` paths, so
+# this mainly stops `COPY docs/` from sweeping in design sources.
+#
+# Do NOT exclude target/: tests/integration/Containerfile copies the
+# prebuilt binary and examples from target/release/ (repo-root build
+# context), and a root .containerignore applies to every build here.
+
+# VCS metadata.
+.git/
+.gitignore
+
+# GIMP design sources -- only the rendered PNGs are served.
+**/*.xcf
+
+# Editor scratch files.
+*.swp

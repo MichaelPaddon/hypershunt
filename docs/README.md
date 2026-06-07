@@ -1,4 +1,4 @@
-# hypershunt
+<h1><img src="hypershunt-title.png" alt="hypershunt" width="440"></h1>
 
 HTTP and reverse-proxy server with TLS, virtual hosts, static
 files, reverse proxying, HTTP/3, JWT / OIDC, mTLS, rate
