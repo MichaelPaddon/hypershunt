@@ -49,8 +49,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libpam0g \
     && rm -rf /var/lib/apt/lists/* \
-    && addgroup --system hypershunt \
-    && adduser --system --ingroup hypershunt \
+    # Fixed UID/GID 1000 (identical for user and group) so the account
+    # is stable and documentable: operators can align host file
+    # ownership with `podman --userns=keep-id:uid=1000,gid=1000`.  This
+    # number is part of the image's contract -- do not change it.
+    # 1000 is a normal-user UID, so we create a regular (not --system)
+    # account: --system would warn that 1000 exceeds SYS_UID_MAX 999.
+    # --disabled-password + nologin + no home keep it non-interactive,
+    # matching the locked service account --system would have produced.
+    && addgroup --gid 1000 hypershunt \
+    && adduser --uid 1000 --ingroup hypershunt --disabled-password \
                --no-create-home --home /nonexistent \
                --shell /usr/sbin/nologin \
                --gecos "hypershunt HTTP server" hypershunt \
