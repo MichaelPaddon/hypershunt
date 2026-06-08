@@ -7,12 +7,15 @@ use crate::config::*;
 // -- QUIC / HTTP/3 listener config ---------------------------------
 
 #[test]
-fn udp_prefix_selects_quic_transport() {
+fn udp_tls_selects_http3() {
+    // On a udp:// listener a `tls` block IS the HTTP/3 cert source --
+    // QUIC's encryption layer is TLS 1.3, so the same node serves both
+    // byte-stream HTTPS and datagram HTTP/3.
     let cfg = Config::parse(
         r#"
         listener "tcp://[::]:443" { tls "self-signed"
 }
-        listener "udp://[::]:443" { quic { tls "self-signed" }
+        listener "udp://[::]:443" { tls "self-signed"
 }
         vhost h { location "/" { static root="." } }
         "#,
@@ -20,13 +23,13 @@ fn udp_prefix_selects_quic_transport() {
     .unwrap();
     assert_eq!(cfg.listeners[0].bind.kind, SocketKind::TcpStream);
     assert_eq!(cfg.listeners[1].bind.kind, SocketKind::UdpDgram);
-    assert!(cfg.listeners[1].quic.is_some());
+    assert!(cfg.listeners[1].tls.is_some());
 }
 
 #[test]
 fn udp_listener_without_handler_is_rejected() {
-    // A datagram-stream listener with no quic{} (HTTP/3) and no
-    // proxy{} (raw L4 forward) has no handler.
+    // A datagram-stream listener with no tls (HTTP/3) and no proxy{}
+    // (raw L4 forward) has no handler -- there is no plaintext HTTP/3.
     let err = Config::parse(
         r#"
         listener "udp://[::]:443"
@@ -42,15 +45,38 @@ fn udp_listener_without_handler_is_rejected() {
 }
 
 #[test]
-fn udp_listener_rejects_top_level_tls_block() {
-    // `udp:// + tls-self-signed` used to mean HTTP/3.  The new
-    // syntax requires wrapping it in `quic { ... }`.  Parser must
-    // call this out clearly rather than silently accepting it.
+fn udp_tls_with_proxy_is_rejected() {
+    // On udp:// `tls` means HTTP/3, so pairing it with a `proxy` block
+    // is a layer violation.
     let err = format!(
         "{:#}",
         Config::parse(
             r#"
             listener "udp://[::]:443" {
+                tls "self-signed"
+                proxy "udp://127.0.0.1:5353"
+}
+            vhost h { location "/" { static root="." }
+}
+            "#,
+        )
+        .unwrap_err()
+    );
+    assert!(
+        err.contains("HTTP/3"),
+        "expected HTTP/3 layer-violation error, got: {err}"
+    );
+}
+
+#[test]
+fn unix_dgram_tls_is_rejected() {
+    // QUIC is UDP-only, so `tls` (= HTTP/3) is meaningless on a
+    // unix-dgram: listener -- only a `proxy` block is valid there.
+    let err = format!(
+        "{:#}",
+        Config::parse(
+            r#"
+            listener "unix-dgram:/tmp/h.sock" {
                 tls "self-signed"
 }
             vhost h { location "/" { static root="." }
@@ -60,25 +86,25 @@ fn udp_listener_rejects_top_level_tls_block() {
         .unwrap_err()
     );
     assert!(
-        err.contains("quic"),
-        "expected error to mention quic, got: {err}"
+        err.contains("udp://"),
+        "expected udp-only error, got: {err}"
     );
 }
 
 #[test]
-fn quic_block_carries_cert_source() {
+fn udp_tls_carries_cert_source() {
     let cfg = Config::parse(
         r#"
         listener "udp://[::]:443" {
-            quic { tls "self-signed" }
+            tls "self-signed"
 }
         vhost h { location "/" { static root="." }
 }
         "#,
     )
     .unwrap();
-    let q = cfg.listeners[0].quic.as_ref().unwrap();
-    assert!(matches!(q.tls.cert, TlsConfig::SelfSigned));
+    let tls = cfg.listeners[0].tls.as_ref().unwrap();
+    assert!(matches!(tls.cert, TlsConfig::SelfSigned));
 }
 
 #[test]
@@ -131,7 +157,7 @@ fn auto_alt_svc_populated_on_matching_tcp_listener() {
         r#"
         listener "tcp://[::]:443" { tls "self-signed"
 }
-        listener "udp://[::]:443" { quic { tls "self-signed" }
+        listener "udp://[::]:443" { tls "self-signed"
 }
         vhost h { location "/" { static root="." } }
         "#,
@@ -157,7 +183,7 @@ fn auto_alt_svc_only_when_ports_match() {
         r#"
         listener "tcp://[::]:443" { tls "self-signed"
 }
-        listener "udp://[::]:8443" { quic { tls "self-signed" }
+        listener "udp://[::]:8443" { tls "self-signed"
 }
         vhost h { location "/" { static root="." } }
         "#,
@@ -175,7 +201,7 @@ fn auto_alt_svc_skips_plain_http_listeners() {
     let cfg = Config::parse(
         r#"
         listener "tcp://[::]:80"
-        listener "udp://[::]:80" { quic { tls "self-signed" }
+        listener "udp://[::]:80" { tls "self-signed"
 }
         vhost h { location "/" { static root="." }
 }
@@ -859,7 +885,7 @@ fn quic_transport_block_parses() {
     let cfg = Config::parse(
         r#"
         listener "udp://[::]:443" {
-            quic { tls "self-signed" }
+            tls "self-signed"
             quic-transport max-concurrent-bidi-streams=256 max-idle-timeout=60 keep-alive-interval=10 zero-rtt=#true retry-tokens=#false retry-token-lifetime=30
 }
         vhost h { location "/" { static root="." }
@@ -886,7 +912,7 @@ fn quic_transport_defaults() {
     let cfg = Config::parse(
         r#"
         listener "udp://[::]:443" {
-            quic { tls "self-signed" }
+            tls "self-signed"
             quic-transport
 }
         vhost h { location "/" { static root="." }

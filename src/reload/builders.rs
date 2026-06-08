@@ -260,14 +260,12 @@ pub async fn build_quic_listener_future(
     socket: crate::listener::BoundSocket,
 ) -> anyhow::Result<ListenerFuture> {
     use anyhow::Context;
-    // QUIC server termination always lives inside the `quic { }`
-    // block on the listener; the listener-level `tls` field is None
-    // on udp:// listeners.
-    let tls_cfg = &cfg
-        .quic
+    // On a udp:// listener the `tls` field carries the QUIC server
+    // termination (QUIC's encryption layer IS TLS 1.3, RFC 9001).
+    let tls_cfg = cfg
+        .tls
         .as_ref()
-        .expect("build_quic_listener_future requires cfg.quic")
-        .tls;
+        .expect("build_quic_listener_future requires cfg.tls");
     let (cert_source, inline_acme_handle) = crate::build_cert_source(
         tls_cfg,
         &deps.tls_defaults,

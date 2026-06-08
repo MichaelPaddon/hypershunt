@@ -971,7 +971,6 @@ mod tests {
             bind: BoundAddr::parse(&format!("udp://{listener_addr}"))
                 .unwrap(),
             tls: None,
-            quic: None,
             dtls: None,
             proxy: Some(ProxyConfig {
                 upstream: BoundAddr::parse(&format!(
@@ -1066,7 +1065,6 @@ mod tests {
             ))
             .unwrap(),
             tls: None,
-            quic: None,
             dtls: None,
             proxy: Some(ProxyConfig {
                 upstream: BoundAddr::parse(&format!(
@@ -1155,7 +1153,6 @@ mod tests {
             bind: BoundAddr::parse(&format!("udp://{listener_addr}"))
                 .unwrap(),
             tls: None,
-            quic: None,
             dtls: None,
             proxy: Some(ProxyConfig {
                 upstream: BoundAddr::parse(&format!(
@@ -1283,7 +1280,6 @@ mod tests {
             ))
             .unwrap(),
             tls: None,
-            quic: None,
             dtls: None,
             proxy: Some(ProxyConfig {
                 upstream: BoundAddr::parse(&format!(

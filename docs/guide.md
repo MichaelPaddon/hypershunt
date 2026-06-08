@@ -519,11 +519,11 @@ certificate "edge" {
 }
 
 listener "tcp://[::]:443" { tls "ref" name="edge" }
-listener "udp://[::]:443" { quic { tls "ref" name="edge" } }
+listener "udp://[::]:443" { tls "ref" name="edge" }
 ```
 
-That second listener also turns on HTTP/3 -- see the next
-chapter.
+That second listener also turns on HTTP/3 -- on a `udp://`
+listener a `tls` block selects HTTP/3 (see the next chapter).
 
 ### OCSP stapling
 
@@ -585,9 +585,10 @@ defaults like minimum protocol version.
 ## HTTP/3
 
 HTTP/3 runs over QUIC on a UDP listener.  The shape mirrors
-TCP/TLS exactly -- a [`quic`](reference.md#quic) block on the
-listener wraps the certificate source.  Because QUIC's encryption
-*is* TLS 1.3 (RFC 9001), the cert plumbing is identical:
+TCP/TLS exactly -- a [`tls`](reference.md#tls-on-udp-http3) block
+on a `udp://` listener *is* the HTTP/3 cert source.  Because
+QUIC's encryption *is* TLS 1.3 (RFC 9001), the cert plumbing is
+identical to HTTPS; the only difference is the socket scheme:
 
 ```kdl
 server state-dir="/var/lib/hypershunt"
@@ -597,7 +598,7 @@ certificate "edge" {
 }
 
 listener "tcp://[::]:443" { tls "ref" name="edge" }
-listener "udp://[::]:443" { quic { tls "ref" name="edge" } }
+listener "udp://[::]:443" { tls "ref" name="edge" }
 ```
 
 ### Alt-Svc auto-advertisement
@@ -618,7 +619,7 @@ Defaults are quinn's; tune via
 
 ```kdl
 listener "udp://[::]:443" {
-    quic { tls "ref" name="edge" }
+    tls "ref" name="edge"
     quic-transport \
         max-concurrent-bidi-streams=100 \
         max-idle-timeout=30 \
@@ -630,7 +631,7 @@ listener "udp://[::]:443" {
 data -- carries replay risk, only safe when every handler in the
 listener's vhosts is idempotent.
 
-**See also**: [Reference -- quic](reference.md#quic),
+**See also**: [Reference -- tls on udp:// (HTTP/3)](reference.md#tls-on-udp-http3),
 [`quic-transport`](reference.md#quic-transport).
 
 ## Reverse proxy

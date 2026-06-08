@@ -3,7 +3,7 @@ use super::{
     BasicAuthConfig, BoundAddr, DtlsListenerConfig, ErrorPageDef,
     GeoIpConfig, HeaderOpConfig, HealthConfig, ListenerConfig,
     LocationConfig, ProxyConfig, ProxyProtocolVersion,
-    QuicListenerConfig, ServerConfig, SocketKind, Timeouts,
+    ServerConfig, SocketKind, Timeouts,
     UpstreamDtlsConfig, UpstreamTlsConfig, VHostConfig, VHostName,
 };
 use ::kdl::{KdlDocument, KdlNode};
@@ -394,37 +394,13 @@ pub(super) fn parse_listener(
     let children = node.children().map(|d| d.nodes()).unwrap_or_default();
     // Encryption layer.  The block name maps to the listener's
     // socket shape:
-    //   tls "<kind>"  ->  byte-stream listeners only
-    //   quic { tls .. } -> udp:// only          (implies HTTP/3)
-    //   dtls { tls .. } -> udp:// only          (reserved)
-    let mut tls: Option<crate::config::TlsListenerConfig> = None;
-    let mut quic: Option<QuicListenerConfig> = None;
+    //   tls "<kind>"   -> byte-stream listeners (HTTPS) or udp:// (HTTP/3);
+    //                     QUIC's encryption IS TLS 1.3, so the same node
+    //                     serves both.  Cross-checked in validate().
+    //   dtls { tls .. } -> udp:// only                          (reserved)
+    let tls = parse_listener_tls(children.iter(), src, name)?;
     let mut dtls: Option<DtlsListenerConfig> = None;
     if bind.kind == SocketKind::UdpDgram {
-        if let Some(bad) =
-            children.iter().find(|n| n.name().value() == "tls")
-        {
-            let ln = node_line(src, bad);
-            bail!(
-                "{name}:{ln}: 'tls' is only valid on byte-stream \
-                 listeners; udp:// listeners use `quic {{ tls ... }}` \
-                 (HTTP/3) or `dtls {{ tls ... }}` (reserved)"
-            );
-        }
-        if let Some(qn) =
-            children.iter().find(|n| n.name().value() == "quic")
-        {
-            let body = qn.children().map(|d| d.nodes()).unwrap_or_default();
-            let inner = parse_listener_tls(body.iter(), src, name)?
-                .ok_or_else(|| {
-                    let ln = node_line(src, qn);
-                    anyhow!(
-                        "{name}:{ln}: `quic` block requires a `tls` \
-                         child"
-                    )
-                })?;
-            quic = Some(QuicListenerConfig { tls: inner });
-        }
         if let Some(dn) =
             children.iter().find(|n| n.name().value() == "dtls")
         {
@@ -439,20 +415,15 @@ pub(super) fn parse_listener(
                 })?;
             dtls = Some(DtlsListenerConfig { tls: inner });
         }
-    } else {
-        for sibling in &["quic", "dtls"] {
-            if let Some(bad) =
-                children.iter().find(|n| n.name().value() == *sibling)
-            {
-                let ln = node_line(src, bad);
-                bail!(
-                    "{name}:{ln}: '{sibling}' is only valid on udp:// \
-                     listeners"
-                );
-            }
-        }
-        tls = parse_listener_tls(children.iter(), src, name)?;
+    } else if let Some(bad) =
+        children.iter().find(|n| n.name().value() == "dtls")
+    {
+        let ln = node_line(src, bad);
+        bail!("{name}:{ln}: 'dtls' is only valid on udp:// listeners");
     }
+    // Whether `tls` is legal on this socket family is left to
+    // validate(): byte-stream -> HTTPS, udp:// -> HTTP/3, every other
+    // datagram kind -> rejected.
     // Optional repeated `alpn "h2"; alpn "http/1.1"` children override
     // the listener's default ALPN list.  An empty list (no children)
     // means "use defaults"; an `alpn` child with no positional value
@@ -587,7 +558,6 @@ pub(super) fn parse_listener(
             ListenerConfig {
                 bind,
                 tls,
-                quic,
                 dtls,
                 proxy: proxy_cfg,
                 accept_proxy_protocol,
@@ -639,7 +609,6 @@ pub(super) fn parse_listener(
         ListenerConfig {
             bind,
             tls,
-            quic,
             dtls,
             proxy: None,
             accept_proxy_protocol,

@@ -1,5 +1,5 @@
 // TLS-side config parsing: the single `tls "<kind>" key=... { ... }`
-// node used on listeners, inside `quic`/`dtls` blocks, and inside a
+// node used on listeners, inside a `dtls` block, and inside a
 // top-level `certificate` body.  OCSP, mTLS, ACME challenge selection,
 // and DNS-01 providers all live here too.
 
@@ -24,7 +24,7 @@ fn prop_i64(node: &KdlNode, key: &str) -> Option<i64> {
 }
 
 /// Listener-side TLS.  Looks for at most one `tls` child of the
-/// listener block (or of `quic`/`dtls`), reads its positional kind,
+/// listener block (or of a `dtls` block), reads its positional kind,
 /// and dispatches to the kind-specific parser.
 pub(crate) fn parse_listener_tls<'a, I: IntoIterator<Item = &'a KdlNode>>(
     children: I,
@@ -117,9 +117,8 @@ fn parse_tls_node(
             if !allow_ref {
                 bail!(
                     "{name}:{line}: tls \"ref\" is only valid on a \
-                     listener (or quic/dtls block); inside a \
-                     'certificate' body use \"files\", \"acme\", or \
-                     \"self-signed\""
+                     listener (or dtls block); inside a 'certificate' \
+                     body use \"files\", \"acme\", or \"self-signed\""
                 );
             }
             let ref_name = prop_str(node, "name").ok_or_else(|| {

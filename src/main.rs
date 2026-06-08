@@ -389,22 +389,20 @@ async fn main() -> anyhow::Result<()> {
     for (cfg, socket) in bound {
         let kind = cfg.bind.kind;
         let has_tls = cfg.tls.is_some();
-        let has_quic = cfg.quic.is_some();
         let has_proxy = cfg.proxy.is_some();
         // Validate accepts only six concrete combinations; every
         // other arm is unreachable here (the parser rejected the
-        // input upstream).
-        match (kind.is_byte_stream(), has_tls, has_quic, has_proxy) {
-            (true, false, false, false) => plain_http.push((cfg, socket)),
-            (true, true, false, false) => tls_http.push((cfg, socket)),
-            (true, false, false, true) => plain_stream.push((cfg, socket)),
-            (true, true, false, true) => tls_stream.push((cfg, socket)),
-            (false, false, true, false) => quic_http.push((cfg, socket)),
-            (false, false, false, true) => dgram_proxy.push((cfg, socket)),
+        // input upstream).  On a datagram listener `tls` means HTTP/3.
+        match (kind.is_byte_stream(), has_tls, has_proxy) {
+            (true, false, false) => plain_http.push((cfg, socket)),
+            (true, true, false) => tls_http.push((cfg, socket)),
+            (true, false, true) => plain_stream.push((cfg, socket)),
+            (true, true, true) => tls_stream.push((cfg, socket)),
+            (false, true, false) => quic_http.push((cfg, socket)),
+            (false, false, true) => dgram_proxy.push((cfg, socket)),
             _ => unreachable!(
                 "validate() rejects this listener-layer combo: \
-                 byte_stream={}, tls={has_tls}, quic={has_quic}, \
-                 proxy={has_proxy}",
+                 byte_stream={}, tls={has_tls}, proxy={has_proxy}",
                 kind.is_byte_stream()
             ),
         }

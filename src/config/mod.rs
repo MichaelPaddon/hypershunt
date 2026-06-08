@@ -293,21 +293,11 @@ pub struct UpstreamDtlsConfig {
     pub skip_verify: bool,
 }
 
-/// QUIC server-side termination block on a UDP listener.  Aliases
-/// the existing `TlsListenerConfig` because QUIC's encryption layer
-/// IS TLS 1.3 (RFC 9001): the same cert source / OCSP / ALPN
-/// children apply unchanged.  When present on a `udp://` listener
-/// the handler is implicitly HTTP/3.
-#[derive(Debug, Clone)]
-pub struct QuicListenerConfig {
-    pub tls: TlsListenerConfig,
-}
-
 /// DTLS server-side termination block on a UDP listener.  Reserved
 /// for future use; presence here causes validate() to bail.
 #[derive(Debug, Clone)]
 pub struct DtlsListenerConfig {
-    #[allow(dead_code)] // reserved -- mirrors QuicListenerConfig
+    #[allow(dead_code)] // reserved -- the cert source for a future DTLS layer
     pub tls: TlsListenerConfig,
 }
 
@@ -316,14 +306,13 @@ pub struct ListenerConfig {
     /// Bind address in strict URL form (tcp://, udp://,
     /// unix-stream:, unix-dgram:, unix-seqpacket:).
     pub bind: BoundAddr,
-    /// TLS termination block.  Valid only on byte-stream listeners
-    /// (`tcp://`, `unix-stream:`).  Rejected by validate() on every
-    /// datagram-stream kind.
+    /// TLS termination block.  On byte-stream listeners (`tcp://`,
+    /// `unix-stream:`) it selects HTTPS; on `udp://` it selects HTTP/3
+    /// (QUIC's encryption layer *is* TLS 1.3, RFC 9001, so the same
+    /// cert source / OCSP / ALPN children apply unchanged).  Rejected
+    /// by validate() on `unix-dgram:` / `unix-seqpacket:` (QUIC is
+    /// UDP-only).
     pub tls: Option<TlsListenerConfig>,
-    /// QUIC server-side termination block.  Valid only on `udp://`
-    /// listeners.  Presence implies the HTTP/3 handler (the only
-    /// handler QUIC supports here).
-    pub quic: Option<QuicListenerConfig>,
     /// DTLS termination block.  Reserved -- parser accepts on
     /// `udp://` listeners; validate() bails with "not yet
     /// implemented".
@@ -885,12 +874,13 @@ impl Config {
         // port, multi-endpoint advertisements) is handled by the existing
         // `headers { response { set "Alt-Svc" "..." } }` mechanism.
         // Auto Alt-Svc only points at QUIC HTTP/3 listeners (udp://
-        // with a quic{} block), not raw UDP L4 proxies.
+        // with a `tls` block), not raw UDP L4 proxies (which carry a
+        // `proxy` block and no `tls`).
         let udp_ports: std::collections::HashSet<u16> = config
             .listeners
             .iter()
             .filter(|l| {
-                l.bind.kind == SocketKind::UdpDgram && l.quic.is_some()
+                l.bind.kind == SocketKind::UdpDgram && l.tls.is_some()
             })
             .filter_map(|l| l.bind.as_inet().map(|sa| sa.port()))
             .collect();
@@ -935,32 +925,33 @@ impl Config {
         //
         //   socket --> optional encryption --> handler
         //
-        // The encryption layer is named by family:
-        //   tls{}  -> byte-stream listeners (tcp://, unix-stream:)
-        //   quic{} -> udp:// only           (implies HTTP/3)
+        // The encryption layer is the `tls` block; its meaning is set
+        // by the socket family:
+        //   tls on tcp:// / unix-stream:  -> HTTPS
+        //   tls on udp://                 -> HTTP/3 (QUIC; encryption
+        //                                    IS TLS 1.3, RFC 9001)
         //   dtls{} -> udp:// only           (reserved; not yet impl.)
         for l in self.listeners.iter() {
             let at = loc(name, l.line);
             let kind = l.bind.kind;
             let has_tls = l.tls.is_some();
-            let has_quic = l.quic.is_some();
             let has_dtls = l.dtls.is_some();
             let has_proxy = l.proxy.is_some();
 
-            // Encryption-block / socket-family checks.
-            if has_tls && !kind.is_byte_stream() {
+            // Encryption-block / socket-family checks.  `tls` is valid
+            // on byte-stream (HTTPS) and udp:// (HTTP/3) listeners, but
+            // not on the remaining datagram families -- QUIC is
+            // UDP-only, so there is no HTTP path for unix-dgram: /
+            // unix-seqpacket:.
+            if has_tls
+                && !kind.is_byte_stream()
+                && kind != SocketKind::UdpDgram
+            {
                 bail!(
-                    "{at}listener ({}) carries a `tls {{ }}` block; \
-                     TLS termination is only valid on byte-stream \
-                     listeners (tcp://, unix-stream:).  Use `quic {{ }}` \
-                     for HTTP/3 on udp://.",
-                    l.bind.to_url()
-                );
-            }
-            if has_quic && kind != SocketKind::UdpDgram {
-                bail!(
-                    "{at}listener ({}) carries a `quic {{ }}` block; \
-                     QUIC termination is only valid on udp:// listeners.",
+                    "{at}listener ({}) carries a `tls {{ }}` block; on a \
+                     datagram listener TLS means HTTP/3 (QUIC), which is \
+                     udp:// only.  unix-dgram: / unix-seqpacket: support \
+                     only a `proxy {{ }}` block.",
                     l.bind.to_url()
                 );
             }
@@ -971,9 +962,9 @@ impl Config {
                     l.bind.to_url()
                 );
             }
-            if has_quic && has_dtls {
+            if has_tls && has_dtls {
                 bail!(
-                    "{at}listener ({}) carries both `quic {{ }}` and \
+                    "{at}listener ({}) carries both `tls {{ }}` and \
                      `dtls {{ }}`; pick at most one encryption layer.",
                     l.bind.to_url()
                 );
@@ -987,30 +978,32 @@ impl Config {
                     l.bind.to_url()
                 );
             }
-            // QUIC must be HTTP/3; combining quic{} with a proxy is
-            // a layer violation.
-            if has_quic && has_proxy {
+            // On udp://, `tls` means HTTP/3; combining it with a proxy
+            // is a layer violation.  (On byte-stream listeners `tls` +
+            // `proxy` is the legitimate TLS-terminating stream proxy,
+            // so this only fires for datagram listeners.)
+            if has_tls && has_proxy && kind.is_datagram_stream() {
                 bail!(
-                    "{at}listener ({}) carries both `quic {{ }}` and \
-                     `proxy {{ }}`; QUIC must be HTTP/3.  Use a plain \
-                     udp:// listener with `proxy {{ }}` for raw \
-                     datagram forwarding.",
+                    "{at}listener ({}) carries both `tls {{ }}` and \
+                     `proxy {{ }}` on a udp:// listener; TLS there means \
+                     HTTP/3.  Use a plain udp:// listener with \
+                     `proxy {{ }}` for raw datagram forwarding.",
                     l.bind.to_url()
                 );
             }
-            // Datagram listeners with no encryption need a proxy
-            // (there is no HTTP path for raw UDP / unix-dgram /
-            // unix-seqpacket).
+            // Datagram listeners need an explicit handler: `tls` for
+            // HTTP/3 or `proxy` for raw forwarding.  There is no
+            // plaintext HTTP/3, so a bare datagram listener is an error.
             if kind.is_datagram_stream()
-                && !has_quic
+                && !has_tls
                 && !has_dtls
                 && !has_proxy
             {
                 bail!(
                     "{at}listener ({}) has no handler: a datagram-\
-                     stream listener requires either a `quic {{ }}` \
-                     block (HTTP/3) or a `proxy {{ }}` block (raw \
-                     datagram forward).",
+                     stream listener requires either a `tls {{ }}` \
+                     block (HTTP/3 on udp://) or a `proxy {{ }}` block \
+                     (raw datagram forward).",
                     l.bind.to_url()
                 );
             }
