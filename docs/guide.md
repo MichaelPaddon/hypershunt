@@ -1847,8 +1847,22 @@ HAProxy header so the back-end sees the original client IP.
 
 ### DTLS (reserved)
 
-`dtls { ... }` is parsed but not yet implemented; the syntax
-slot is reserved so future configs don't break.
+A DTLS-terminating datagram proxy is spelled by adding a `tls`
+cert block to a `udp://` proxy listener -- the presence of `proxy`
+distinguishes it from plain HTTP/3 (`tls` alone):
+
+```kdl
+listener "udp://[::]:5684" {
+    tls "self-signed"
+    proxy "udp://10.0.0.5:5684"
+}
+```
+
+DTLS is **not yet implemented** (no DTLS-capable crate exists in the
+stack today), so this combination is reserved and startup fails with
+"not yet implemented".  To DTLS-encrypt the *upstream* leg instead,
+see the reserved [`dtls`](reference.md#dtls-upstream) child of
+`proxy`.
 
 **See also**: [Reference -- L4 proxy](reference.md#proxy-listener),
 [PROXY protocol on receive](#proxy-protocol-on-the-receive-side).

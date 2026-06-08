@@ -45,9 +45,10 @@ fn udp_listener_without_handler_is_rejected() {
 }
 
 #[test]
-fn udp_tls_with_proxy_is_rejected() {
-    // On udp:// `tls` means HTTP/3, so pairing it with a `proxy` block
-    // is a layer violation.
+fn udp_tls_with_proxy_is_reserved_dtls() {
+    // On udp:// `tls` + `proxy` selects a DTLS-terminating datagram
+    // proxy.  DTLS isn't implemented yet, so the combination is
+    // reserved and must bail clearly.
     let err = format!(
         "{:#}",
         Config::parse(
@@ -63,8 +64,8 @@ fn udp_tls_with_proxy_is_rejected() {
         .unwrap_err()
     );
     assert!(
-        err.contains("HTTP/3"),
-        "expected HTTP/3 layer-violation error, got: {err}"
+        err.contains("DTLS") && err.contains("not yet implemented"),
+        "expected reserved-DTLS error, got: {err}"
     );
 }
 
@@ -105,27 +106,6 @@ fn udp_tls_carries_cert_source() {
     .unwrap();
     let tls = cfg.listeners[0].tls.as_ref().unwrap();
     assert!(matches!(tls.cert, TlsConfig::SelfSigned));
-}
-
-#[test]
-fn dtls_block_is_reserved() {
-    let err = format!(
-        "{:#}",
-        Config::parse(
-            r#"
-            listener "udp://[::]:443" {
-                dtls { tls "self-signed" }
-}
-            vhost h { location "/" { static root="." }
-}
-            "#,
-        )
-        .unwrap_err()
-    );
-    assert!(
-        err.contains("not yet implemented"),
-        "expected reservation error, got: {err}"
-    );
 }
 
 #[test]

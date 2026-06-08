@@ -574,7 +574,6 @@ mod tests {
         ListenerConfig {
             bind: BoundAddr::parse(bind).expect("valid bind"),
             tls: None,
-            dtls: None,
             proxy: None,
             accept_proxy_protocol: None,
             trusted_proxies: Vec::new(),
