@@ -90,7 +90,7 @@ podman run --rm -p 8443:443 \
 Open <https://localhost:8443>.  Your browser will warn about the
 self-signed certificate -- that's expected.  Self-signed is for
 local development only; for a real deployment use [Let's Encrypt
-via ACME](guide.md#https-tls-termination).
+via ACME](guide.md#https--tls-termination).
 
 ## Production-shaped HTTPS
 
