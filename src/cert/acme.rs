@@ -240,6 +240,26 @@ impl AcmeManager {
             .join(self.config.cert_name())
     }
 
+    // Verify the state directory is writable *before* any rate-limited
+    // ACME network call.  A read-only / mis-owned state dir is our
+    // fault, not the CA's; discovering it only after issuance would
+    // waste a rate-limited request.  Probes both the cert directory's
+    // parent ({state_dir}/certs, where cert.pem/key.pem land) and the
+    // state dir itself (where acme_account.json is written).
+    async fn preflight_state_writable(&self) -> anyhow::Result<()> {
+        let certs_dir = self.config.state_dir.join("certs");
+        // create_dir_all is a no-op on an existing dir, so it can't
+        // prove writability on its own -- follow it with a real probe
+        // write that would catch an existing-but-read-only directory.
+        tokio::fs::create_dir_all(&certs_dir).await.with_context(|| {
+            format!("creating ACME cert directory {}", certs_dir.display())
+        })?;
+        probe_writable(&certs_dir, self.config.cert_name()).await?;
+        probe_writable(&self.config.state_dir, self.config.cert_name())
+            .await?;
+        Ok(())
+    }
+
     // Ensure a valid cert exists; acquire if missing or near expiry.
     pub async fn ensure_valid_cert(&self) -> anyhow::Result<TlsAcceptor> {
         if self.cert_needs_renewal() {
@@ -457,6 +477,19 @@ impl AcmeManager {
 
     // Acquire a certificate via the provisioner and persist it.
     async fn acquire_cert(&self) -> anyhow::Result<()> {
+        // Fail before contacting the CA if we can't persist the result
+        // -- issuance is rate-limited, so don't spend a request we are
+        // unable to keep.
+        if let Err(e) = self.preflight_state_writable().await {
+            tracing::error!(target: TARGET,
+                cert = self.config.cert_name(),
+                state_dir = %self.config.state_dir.display(),
+                "ACME aborted before contacting the CA: state directory \
+                 is not writable: {e:#}"
+            );
+            return Err(e).context("ACME state-directory pre-flight");
+        }
+
         let (cert_pem, key_pem) = self
             .provisioner
             .provision(&self.config.domains, &self.challenges)
@@ -479,6 +512,22 @@ impl AcmeManager {
 
         Ok(())
     }
+}
+
+// Confirm `dir` accepts writes by creating then removing a probe file.
+// The cert name disambiguates concurrent managers (one per named cert)
+// so their probes never collide.
+async fn probe_writable(
+    dir: &std::path::Path,
+    cert_name: &str,
+) -> anyhow::Result<()> {
+    let probe = dir.join(format!(".hypershunt-acme-probe.{cert_name}"));
+    tokio::fs::write(&probe, b"").await.with_context(|| {
+        format!("state directory {} is not writable", dir.display())
+    })?;
+    // Best-effort cleanup; a leftover empty probe file is harmless.
+    tokio::fs::remove_file(&probe).await.ok();
+    Ok(())
 }
 
 // -- Atomic cert directory writer ----------------------------------
@@ -1173,6 +1222,74 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "key.pem mode should be 0o600");
         }
+    }
+
+    // -- State-dir pre-flight -------------------------------------
+
+    // A provisioner that records how many times it was invoked, so a
+    // test can prove the pre-flight aborted before any network call.
+    struct CountingProvisioner {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingProvisioner {
+        fn new() -> Self {
+            Self { calls: std::sync::atomic::AtomicUsize::new(0) }
+        }
+    }
+
+    #[async_trait]
+    impl Provisioner for CountingProvisioner {
+        async fn provision(
+            &self,
+            domains: &[String],
+            _challenges: &ChallengeMap,
+        ) -> anyhow::Result<(String, String)> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(make_cert_pem(domains, 90))
+        }
+    }
+
+    // A non-writable state dir must fail the pre-flight *before* the
+    // rate-limited provisioner is ever called.  Rooting state_dir under
+    // a regular file makes create_dir_all fail deterministically
+    // regardless of UID -- a root test runner would simply ignore a
+    // chmod 0o500.
+    #[tokio::test]
+    async fn preflight_aborts_before_provisioning() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state_dir = file.path().join("sub");
+
+        let provisioner = Arc::new(CountingProvisioner::new());
+        let mgr = test_manager(&state_dir, provisioner.clone());
+
+        let err = mgr.acquire_cert().await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cert directory") || msg.contains("not writable"),
+            "expected a writability error, got: {msg}"
+        );
+        assert_eq!(
+            provisioner.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "provisioner must not run when the state dir is unwritable"
+        );
+    }
+
+    // A writable state dir issues as normal and leaves no probe file
+    // behind once the pre-flight completes.
+    #[tokio::test]
+    async fn preflight_passes_and_leaves_no_probe_file() {
+        install_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let mgr =
+            test_manager(dir.path(), Arc::new(MockProvisioner::new()));
+
+        mgr.ensure_valid_cert().await.unwrap();
+
+        let probe = ".hypershunt-acme-probe.example.com";
+        assert!(!dir.path().join(probe).exists());
+        assert!(!dir.path().join("certs").join(probe).exists());
     }
 
     #[cfg(unix)]
