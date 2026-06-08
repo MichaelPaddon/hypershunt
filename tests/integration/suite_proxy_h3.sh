@@ -18,7 +18,7 @@ listener "tcp://127.0.0.1:${port}" {
     tls "self-signed"
 }
 listener "udp://127.0.0.1:${port}" {
-    quic { tls "self-signed" }
+    tls "self-signed"
 }
 vhost localhost {
     location "/" {
@@ -139,7 +139,7 @@ suite_proxy_h3_altsvc_expires() {
     cat >"$TMPDIR/upstream_ttl.kdl" <<'EOF'
 listener "tcp://127.0.0.1:18447" { tls "self-signed"
 }
-listener "udp://127.0.0.1:18447" { quic { tls "self-signed" }
+listener "udp://127.0.0.1:18447" { tls "self-signed"
 }
 vhost localhost {
     location "/" {

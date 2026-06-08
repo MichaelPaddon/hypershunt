@@ -163,12 +163,12 @@ fn listener_protocol(
 ) -> (String, Vec<String>) {
     let kind = l.bind.kind;
     let has_proxy = l.proxy.is_some();
-    // Datagram-stream listeners.  quic{} -> HTTP/3; otherwise raw
-    // dgram-proxy.  DTLS termination would slot in here but is
-    // currently reserved (validate rejects).
+    // Datagram-stream listeners.  On udp:// a `tls` block -> HTTP/3;
+    // otherwise raw dgram-proxy.  DTLS termination would slot in here
+    // but is currently reserved (validate rejects).
     if kind.is_datagram_stream() {
-        return match (&l.quic, has_proxy) {
-            (Some(q), false) => tls_protocol_name(&q.tls, "HTTP/3", config),
+        return match (&l.tls, has_proxy) {
+            (Some(tls), false) => tls_protocol_name(tls, "HTTP/3", config),
             (None, true) => ("dgram-proxy".into(), Vec::new()),
             _ => ("HTTP/3".into(), Vec::new()),
         };

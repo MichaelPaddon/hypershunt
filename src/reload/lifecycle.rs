@@ -277,6 +277,36 @@ pub fn signal_upgrade_ready() {
     tracing::info!(target: crate::reload::TARGET, "upgrade: signalled parent that child is ready");
 }
 
+/// Spawn a task that listens for SIGHUP and calls `reload()` for
+/// each one.  Returns the JoinHandle so the caller can keep it
+/// alongside the shutdown plumbing.
+///
+/// On non-Unix platforms this returns a never-completing task.
+#[cfg(unix)]
+pub fn spawn_sighup_listener(
+    reload_state: Arc<ReloadState>,
+) -> tokio::task::JoinHandle<()> {
+    crate::task::spawn_supervised("signal.sighup", async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sig = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(target: crate::reload::TARGET, "installing SIGHUP handler failed: {e}");
+                return;
+            }
+        };
+        tracing::info!(target: crate::reload::TARGET, "SIGHUP listener installed");
+        while sig.recv().await.is_some() {
+            tracing::info!(target: crate::reload::TARGET, "SIGHUP received; reloading config");
+            // reload() is async to accommodate ACME cert build
+            // (network I/O); future signals queue up at tokio's
+            // SignalKind dedup window and only fire after this
+            // await returns, so we don't race ourselves here.
+            let _ = super::reload(&reload_state).await;
+        }
+    })
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
@@ -354,34 +384,4 @@ mod tests {
         signal_upgrade_ready();
         assert!(std::env::var(UPGRADE_READY_FD_ENV).is_err());
     }
-}
-
-/// Spawn a task that listens for SIGHUP and calls `reload()` for
-/// each one.  Returns the JoinHandle so the caller can keep it
-/// alongside the shutdown plumbing.
-///
-/// On non-Unix platforms this returns a never-completing task.
-#[cfg(unix)]
-pub fn spawn_sighup_listener(
-    reload_state: Arc<ReloadState>,
-) -> tokio::task::JoinHandle<()> {
-    crate::task::spawn_supervised("signal.sighup", async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sig = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(target: crate::reload::TARGET, "installing SIGHUP handler failed: {e}");
-                return;
-            }
-        };
-        tracing::info!(target: crate::reload::TARGET, "SIGHUP listener installed");
-        while sig.recv().await.is_some() {
-            tracing::info!(target: crate::reload::TARGET, "SIGHUP received; reloading config");
-            // reload() is async to accommodate ACME cert build
-            // (network I/O); future signals queue up at tokio's
-            // SignalKind dedup window and only fire after this
-            // await returns, so we don't race ourselves here.
-            let _ = super::reload(&reload_state).await;
-        }
-    })
 }

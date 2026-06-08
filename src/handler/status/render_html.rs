@@ -590,6 +590,11 @@ timer=setInterval(poll,POLL_MS);
 })();
 </script>"#;
 
+// Mirrors `render_json`'s parameter list so `respond()` can dispatch
+// to either with one identical call.  The HTML view renders the
+// sparkline / top-paths / period client-side via JS polling, so those
+// three are unused here -- kept for the shared calling convention.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_html(
     s: &Snapshot,
     _sp: &SparklineData,

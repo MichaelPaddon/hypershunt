@@ -331,7 +331,6 @@ Prefixed children for repeating values of the wrapped backend:
 
 - `"trusted-proxies"` [`<string>`](#string)
 - [`<tls-node>`](#tls-node)
-- [`<quic-block>`](#quic-block)
 - [`<dtls-block>`](#dtls-block)
 - `"alpn"` [`<string>`](#string)
 - [`<quic-transport-block>`](#quic-transport-block)
@@ -348,6 +347,11 @@ children (rule 4).
 `"tls"` [`<tls-kind>`](#tls-kind)
 [`<tls-kind-property>`](#tls-kind-property)* ( `{`
 [`<tls-option>`](#tls-option)* `}` )?
+
+On a byte-stream listener (`tcp://`, `unix-stream:`) a `tls` node
+selects HTTPS; on a `udp://` listener it selects HTTP/3 (QUIC's
+encryption layer *is* TLS 1.3, RFC 9001, so the same node serves
+both).  `tls` is rejected on `unix-dgram:` / `unix-seqpacket:`.
 
 ### `tls-kind`
 
@@ -371,12 +375,6 @@ The properties valid on a `tls` node depend on the kind.
 Additionally for `"acme"` the body may contain repeating
 `"domain"` [`<string>`](#string) children (rule 4) and at most one
 [`<dns-provider-block>`](#dns-provider-block).
-
-### `quic-block`
-
-`"quic"` `{` [`<tls-node>`](#tls-node) `}`
-
-The inner `tls` may not use kind `"ref"` from a quic block today.
 
 ### `dtls-block`
 

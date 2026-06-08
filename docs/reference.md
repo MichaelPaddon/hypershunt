@@ -1148,7 +1148,7 @@ certificate "edge" {
     }
 }
 listener "tcp://[::]:443" { tls "ref" name="edge" }
-listener "udp://[::]:443" { quic { tls "ref" name="edge" } }
+listener "udp://[::]:443" { tls "ref" name="edge" }   # HTTP/3
 ```
 
 ### tls (certificate)
@@ -1178,7 +1178,7 @@ Mixing them produces a parse-time error.
 ```kdl
 listener "tcp://[::]:80" { }                          # plain HTTP/1.1+h2
 listener "tcp://[::]:443" { tls "self-signed" }       # HTTPS
-listener "udp://[::]:443" { quic { tls "self-signed" } } # HTTP/3
+listener "udp://[::]:443" { tls "self-signed" }       # HTTP/3
 listener "tcp://[::]:5432" { proxy "tcp://10.0.0.5:5432" } # L4 TCP proxy
 ```
 
@@ -1209,9 +1209,10 @@ listener "udp://[::]:443"
 listener "unix-stream:/run/hypershunt.sock"
 ```
 
-The bind URL also determines which encryption layer is legal:
-[`tls`](#tls-listener) requires a byte-stream socket;
-[`quic`](#quic) and [`dtls`](#dtls) require `udp://`.
+The bind URL also determines what the encryption layer means:
+[`tls`](#tls-listener) selects HTTPS on a byte-stream socket and
+HTTP/3 on `udp://`; [`dtls`](#dtls) requires `udp://`.  `tls` is
+rejected on `unix-dgram:` / `unix-seqpacket:` (QUIC is UDP-only).
 
 ### accept-proxy-protocol
 
@@ -1296,11 +1297,15 @@ vhost "example.com" {
 ### tls (listener)
 
 **Child** of [`listener`](#listener).  Optional, at most one.
-Byte-stream listeners only.
+Byte-stream (`tcp://`, `unix-stream:`) or `udp://` listeners.
 
-Enables TLS termination on a byte-stream listener.  The positional
-argument names the cert source kind; the rest of the surface
-depends on the kind.  All four kinds inherit
+Enables TLS termination.  On a byte-stream listener it serves
+HTTPS; on a `udp://` listener the very same block serves HTTP/3
+(QUIC's encryption layer *is* TLS 1.3) -- see
+[tls on udp:// (HTTP/3)](#tls-on-udp-http3).  It is rejected on
+`unix-dgram:` / `unix-seqpacket:` (QUIC is UDP-only).  The
+positional argument names the cert source kind; the rest of the
+surface depends on the kind.  All four kinds inherit
 [`tls-options`](#tls-options) settings (min-version, ciphers,
 OCSP knobs, mTLS) from the server-level block and accept
 listener-level overrides.
@@ -1486,23 +1491,23 @@ certificate "edge" {
 listener "tcp://[::]:443" { tls "ref" name="edge" }
 ```
 
-### quic
+### tls on udp:// (HTTP/3)
 
-**Child** of [`listener`](#listener).  Optional, at most one.
-`udp://` listeners only.
+On a `udp://` listener a [`tls`](#tls-listener) block selects
+HTTP/3 termination.  QUIC encryption *is* TLS 1.3 (RFC 9001), so
+the same cert sources (`"files"`, `"acme"`, `"self-signed"`,
+`"ref"`) and the same plumbing apply, exactly mirroring TCP/TLS.
+There is no plaintext HTTP/3, so a `udp://` listener with no `tls`
+(and no `proxy`) is a config error.
 
-Selects HTTP/3 termination on a UDP listener.  The block body
-carries exactly one [`tls`](#tls-listener) node naming the
-certificate source.  QUIC encryption *is* TLS 1.3 (RFC 9001), so
-the same cert-source plumbing is used end-to-end.
-
-A `quic` listener is mutually exclusive with a
-[`proxy`](#proxy-listener) child -- QUIC must be HTTP/3, not raw
-L4 forwarding.
+On `udp://`, `tls` is mutually exclusive with a
+[`proxy`](#proxy-listener) child -- TLS there means HTTP/3, not raw
+L4 forwarding.  (On byte-stream listeners `tls` + `proxy` is the
+legitimate TLS-terminating stream proxy.)
 
 ```kdl
 listener "udp://[::]:443" {
-    quic { tls "ref" name="edge" }
+    tls "ref" name="edge"
 }
 ```
 
@@ -1554,7 +1559,7 @@ unset knobs use quinn's defaults.
 
 ```kdl
 listener "udp://[::]:443" {
-    quic { tls "ref" name="edge" }
+    tls "ref" name="edge"
     quic-transport max-idle-timeout=30 keep-alive-interval=10
 }
 ```

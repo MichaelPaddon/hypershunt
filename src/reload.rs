@@ -470,15 +470,11 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
             let kind_label;
             let kind = cfg.bind.kind;
             let has_tls = cfg.tls.is_some();
-            let has_quic = cfg.quic.is_some();
             let has_proxy = cfg.proxy.is_some();
-            let fut = match (
-                kind.is_byte_stream(),
-                has_tls,
-                has_quic,
-                has_proxy,
-            ) {
-                (true, _, false, true) => {
+            // On a datagram listener `tls` means HTTP/3 (QUIC); on a
+            // byte-stream listener it means HTTPS.
+            let fut = match (kind.is_byte_stream(), has_tls, has_proxy) {
+                (true, _, true) => {
                     kind_label = "stream-proxy";
                     build_stream_listener_future(
                         &spawn_deps,
@@ -488,7 +484,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
                     )
                     .await
                 }
-                (true, true, false, false) => {
+                (true, true, false) => {
                     kind_label = "TLS";
                     build_tls_listener_future(
                         &spawn_deps,
@@ -498,7 +494,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
                     )
                     .await
                 }
-                (true, false, false, false) => {
+                (true, false, false) => {
                     kind_label = "plain";
                     Ok(build_plain_listener_future(
                         &spawn_deps,
@@ -507,7 +503,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
                         socket,
                     ))
                 }
-                (false, false, true, false) => {
+                (false, true, false) => {
                     kind_label = "QUIC";
                     build_quic_listener_future(
                         &spawn_deps,
@@ -517,7 +513,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
                     )
                     .await
                 }
-                (false, false, false, true) => {
+                (false, false, true) => {
                     kind_label = "dgram-proxy";
                     build_dgram_proxy_future(
                         &spawn_deps,
@@ -578,7 +574,6 @@ mod tests {
         ListenerConfig {
             bind: BoundAddr::parse(bind).expect("valid bind"),
             tls: None,
-            quic: None,
             dtls: None,
             proxy: None,
             accept_proxy_protocol: None,

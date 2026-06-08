@@ -47,7 +47,6 @@
         let cfg = ListenerConfig {
             bind: crate::config::BoundAddr::parse("udp://127.0.0.1:0").unwrap(),
             tls: None,
-            quic: None,
             dtls: None,
             proxy: None,
             accept_proxy_protocol: None,
@@ -87,7 +86,6 @@
             ))
             .unwrap(),
             tls: None,
-            quic: None,
             dtls: None,
             proxy: None,
             accept_proxy_protocol: None,
@@ -1419,7 +1417,7 @@ index-file "index.html";
         // deterministic response to assert against.
         let config = Config::parse(
             r#"
-            listener "udp://127.0.0.1:0" { quic { tls "self-signed" }
+            listener "udp://127.0.0.1:0" { tls "self-signed"
 }
             vhost "localhost" {
                 location "/" {
@@ -1600,7 +1598,7 @@ index-file "index.html";
 
         let config = Config::parse(
             r#"
-            listener "udp://127.0.0.1:0" { quic { tls "self-signed" }
+            listener "udp://127.0.0.1:0" { tls "self-signed"
 }
             vhost "localhost" {
                 location "/" {
@@ -1797,7 +1795,7 @@ index-file "index.html";
 
         let config = Config::parse(
             r#"
-            listener "udp://127.0.0.1:0" { quic { tls "self-signed" }
+            listener "udp://127.0.0.1:0" { tls "self-signed"
 }
             vhost "localhost" {
                 location "/" {
@@ -1953,7 +1951,7 @@ index-file "index.html";
         let config = Config::parse(
             r#"
             listener "udp://127.0.0.1:0" max-request-body=1024 {
-                quic { tls "self-signed" }
+                tls "self-signed"
 }
             vhost "localhost" {
                 location "/" {
@@ -2091,7 +2089,7 @@ index-file "index.html";
 
         let config = Config::parse(
             r#"
-            listener "udp://127.0.0.1:0" { quic { tls "self-signed" }
+            listener "udp://127.0.0.1:0" { tls "self-signed"
 }
             vhost "localhost" {
                 location "/" {
@@ -2635,7 +2633,6 @@ index-file "index.html";
             ))
             .unwrap(),
             tls: None,
-            quic: None,
             dtls: None,
             proxy: None,
             accept_proxy_protocol: None,

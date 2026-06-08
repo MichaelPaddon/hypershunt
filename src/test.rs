@@ -143,7 +143,6 @@ impl TestServer {
         let cfg = ListenerConfig {
             bind: BoundAddr::parse(&format!("tcp://{addr}")).unwrap(),
             tls: None,
-            quic: None,
             dtls: None,
             proxy: None,
             accept_proxy_protocol: None,

@@ -9,7 +9,7 @@ suite_http3_basic() {
     echo "=== HTTP/3 basic GET ==="
     cat >"$TMPDIR/h3.kdl" <<'EOF'
 listener "udp://127.0.0.1:18443" {
-    quic { tls "self-signed" }
+    tls "self-signed"
 }
 vhost localhost {
     location "/" {
@@ -46,7 +46,7 @@ suite_http3_middleware() {
     # silently break observability rewrites.
     cat >"$TMPDIR/h3_mid.kdl" <<'EOF'
 listener "udp://127.0.0.1:18445" {
-    quic { tls "self-signed" }
+    tls "self-signed"
 }
 vhost localhost {
     location "/open" {
@@ -100,7 +100,7 @@ suite_http3_alt_svc() {
     cat >"$TMPDIR/h3_altsvc.kdl" <<'EOF'
 listener "tcp://127.0.0.1:18444" { tls "self-signed"
 }
-listener "udp://127.0.0.1:18444" { quic { tls "self-signed" }
+listener "udp://127.0.0.1:18444" { tls "self-signed"
 }
 vhost localhost {
     location "/" {
