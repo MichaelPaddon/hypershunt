@@ -1210,9 +1210,11 @@ listener "unix-stream:/run/hypershunt.sock"
 ```
 
 The bind URL also determines what the encryption layer means:
-[`tls`](#tls-listener) selects HTTPS on a byte-stream socket and
-HTTP/3 on `udp://`; [`dtls`](#dtls) requires `udp://`.  `tls` is
-rejected on `unix-dgram:` / `unix-seqpacket:` (QUIC is UDP-only).
+[`tls`](#tls-listener) selects HTTPS on a byte-stream socket, HTTP/3
+on `udp://`, and -- when paired with a `proxy` child -- a
+DTLS-terminating datagram proxy on `udp://` (reserved).  `tls` is
+rejected on `unix-dgram:` / `unix-seqpacket:` (QUIC/DTLS are
+UDP-only).
 
 ### accept-proxy-protocol
 
@@ -1500,11 +1502,6 @@ the same cert sources (`"files"`, `"acme"`, `"self-signed"`,
 There is no plaintext HTTP/3, so a `udp://` listener with no `tls`
 (and no `proxy`) is a config error.
 
-On `udp://`, `tls` is mutually exclusive with a
-[`proxy`](#proxy-listener) child -- TLS there means HTTP/3, not raw
-L4 forwarding.  (On byte-stream listeners `tls` + `proxy` is the
-legitimate TLS-terminating stream proxy.)
-
 ```kdl
 listener "udp://[::]:443" {
     tls "ref" name="edge"
@@ -1514,14 +1511,26 @@ listener "udp://[::]:443" {
 **See also:** [Alt-Svc auto-advertisement](guide.md#http3),
 [`quic-transport`](#quic-transport).
 
-### dtls
+### tls + proxy on udp:// (DTLS, reserved)
 
-**Child** of [`listener`](#listener).  Reserved.  `udp://`
-listeners only.
+On a `udp://` listener a [`tls`](#tls-listener) block *together with*
+a [`proxy`](#proxy-listener) child selects a DTLS-terminating
+datagram proxy: the `tls` block supplies the server cert source, the
+`proxy` the datagram backend.  The presence of `proxy` is what
+distinguishes this from plain HTTP/3 (`tls` alone).
 
-Syntactic placeholder for DTLS termination.  Parsing succeeds but
-startup fails with "not yet implemented".  The syntax is reserved
-so future config files don't break.
+DTLS termination is **not yet implemented** -- no DTLS-capable crate
+exists in the stack today -- so this combination is reserved and
+startup fails with "not yet implemented".  (On byte-stream listeners
+`tls` + `proxy` is the unrelated, fully-supported TLS-terminating
+stream proxy.)
+
+```kdl
+listener "udp://[::]:5684" {
+    tls "self-signed"            # DTLS cert source (reserved)
+    proxy "udp://10.0.0.5:5684"
+}
+```
 
 ### alpn
 

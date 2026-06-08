@@ -47,7 +47,6 @@
         let cfg = ListenerConfig {
             bind: crate::config::BoundAddr::parse("udp://127.0.0.1:0").unwrap(),
             tls: None,
-            dtls: None,
             proxy: None,
             accept_proxy_protocol: None,
             trusted_proxies: Vec::new(),
@@ -86,7 +85,6 @@
             ))
             .unwrap(),
             tls: None,
-            dtls: None,
             proxy: None,
             accept_proxy_protocol: None,
             trusted_proxies: Vec::new(),
@@ -2633,7 +2631,6 @@ index-file "index.html";
             ))
             .unwrap(),
             tls: None,
-            dtls: None,
             proxy: None,
             accept_proxy_protocol: None,
             trusted_proxies: Vec::new(),
