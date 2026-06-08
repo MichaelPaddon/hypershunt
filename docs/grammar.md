@@ -345,7 +345,7 @@ children (rule 4).
 
 `"tls"` [`<tls-kind>`](#tls-kind)
 [`<tls-kind-property>`](#tls-kind-property)* ( `{`
-[`<tls-option>`](#tls-option)* `}` )?
+[`<tls-option-child>`](#tls-option-child)* `}` )?
 
 On a byte-stream listener (`tcp://`, `unix-stream:`) a `tls` node
 selects HTTPS; on a `udp://` listener it selects HTTP/3 (QUIC's
