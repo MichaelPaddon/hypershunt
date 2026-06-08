@@ -1380,8 +1380,19 @@ explicitly to share an on-disk slot between configurations.
 
 When `#true`, talk to Let's Encrypt's staging server
 (`acme-staging-v02.api.letsencrypt.org/directory`) instead of
-production.  Useful while testing; staging certificates are not
-publicly trusted.
+production.  Staging has far looser
+[rate limits](https://letsencrypt.org/docs/rate-limits/), so test
+new configs against it first; staging certificates are not publicly
+trusted.  Can also be forced without editing the config via the
+[`HYPERSHUNT_ACME_STAGING`](#hypershunt_acme_staging) environment
+variable.  An explicit [`server=`](#server-acme) takes precedence
+over both.
+
+When switching from staging to production, delete the cached
+staging certificate under [`state-dir`](#state-dir) first: the two
+share the same on-disk slot and hypershunt only re-issues when the
+stored cert nears expiry, so a valid staging cert would otherwise
+suppress the production issuance.
 
 **Default:** `#false`.
 
@@ -1393,6 +1404,14 @@ ACME directory URL to use in place of Let's Encrypt.  Useful with
 private CAs that speak ACME (e.g. step-ca, smallstep).
 
 **Default:** `https://acme-v02.api.letsencrypt.org/directory`.
+
+##### HYPERSHUNT_ACME_STAGING
+
+**Environment variable.**  When set to any value, forces every
+`tls "acme"` certificate to issue from Let's Encrypt's staging CA,
+exactly as if [`staging=#true`](#staging) were set on each.  Useful
+for containers and CI where you'd rather not edit the config.  An
+explicit [`server=`](#server-acme) still takes precedence.
 
 ##### retry-interval
 

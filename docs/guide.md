@@ -455,9 +455,25 @@ A few things to know:
   [`retry-interval`](reference.md#retry-interval) seconds (1 hour
   by default).
 
-Set [`staging=#true`](reference.md#staging) while testing -- Let's
-Encrypt's production rate limits are easy to hit during
-trial-and-error.
+**Test against staging first.**  Let's Encrypt's production CA is
+[rate-limited](https://letsencrypt.org/docs/rate-limits/), and the
+limits are easy to exhaust during trial-and-error (wrong DNS, port
+80 unreachable, typo'd domain).  Set
+[`staging=#true`](reference.md#staging) to issue from the staging
+CA, which has far looser limits and exercises the identical flow;
+its certificates just aren't publicly trusted.  Without editing the
+config you can force staging by setting the
+[`HYPERSHUNT_ACME_STAGING`](reference.md#hypershunt_acme_staging)
+environment variable -- handy in a container or CI.
+
+When the staging issuance succeeds, switch to production: remove
+`staging=#true` (or unset the env var) **and delete the cached
+staging certificate** from `state-dir` first.  Staging and
+production certs share the same on-disk slot, so a still-valid
+staging cert would otherwise suppress the production issuance --
+hypershunt only re-issues when the stored cert nears expiry.  For
+a custom or private ACME CA (step-ca, smallstep), point
+[`server=`](reference.md#server-acme) at its directory URL instead.
 
 ### ACME with DNS-01
 
