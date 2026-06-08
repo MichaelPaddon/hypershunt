@@ -98,7 +98,16 @@ A realistic public-facing deployment needs three things on top
 of the dev shape: ACME issuance, a persistent state directory
 for the issued certificate, and the host's port 80/443 (not
 random high ports) so Let's Encrypt's HTTP-01 challenge can
-reach you:
+reach you.
+
+Issue against Let's Encrypt's **staging** CA first (`staging=#true`
+below).  Production issuance is
+[rate-limited](https://letsencrypt.org/docs/rate-limits/), and the
+limits are easy to exhaust while you're still ironing out DNS,
+firewall, or config mistakes -- staging has far looser limits and
+verifies the whole flow end to end.  Its certificates aren't
+publicly trusted, so browsers will warn until you switch to
+production.
 
 ```sh
 cat > hypershunt.kdl <<'EOF'
@@ -106,7 +115,12 @@ server state-dir="/var/lib/hypershunt" user="hypershunt"
 
 listener "tcp://[::]:80"
 listener "tcp://[::]:443" {
-    tls "acme" email="you@example.com" { domain "example.com" }
+    // Issue from Let's Encrypt's *staging* CA first so config
+    // mistakes don't burn production rate limits.  Drop
+    // `staging=#true` once you've confirmed it works (see below).
+    tls "acme" email="you@example.com" staging=#true {
+        domain "example.com"
+    }
 }
 
 vhost "example.com" {
@@ -132,6 +146,18 @@ A few things changed:
 - `server state-dir=`, `tls "acme"`, and `user=` are required
   for a production-shape config (see the [production
   checklist](guide.md#production-checklist)).
+
+**Going live.**  Once the container starts cleanly and the logs
+show a staging certificate was issued, switch to the production CA:
+remove `staging=#true` from the config **and** clear the cached
+staging certificate so a trusted one is issued in its place (the
+two share the same on-disk slot):
+
+```sh
+podman stop hypershunt && podman rm hypershunt
+podman volume rm hypershunt-state          # drop the staging cert
+# re-run the `podman run …` above with staging=#true removed
+```
 
 Stop and remove with:
 
