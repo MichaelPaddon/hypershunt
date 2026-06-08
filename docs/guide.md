@@ -2111,6 +2111,54 @@ to preserve podman's `--group-add keep-groups` magic:
 server user="hypershunt" inherit-supplementary-groups=#true
 ```
 
+The container's `hypershunt` user and group are a **fixed UID/GID
+1000** -- identical, and stable across releases, so it is safe to
+hardcode in tooling.  To align host file ownership for bind mounts
+(so the container can read/write your mounted directories without a
+`chmod`), map your host user onto it:
+
+```sh
+podman run ... --userns=keep-id:uid=1000,gid=1000 ...
+```
+
+See the [quickstart troubleshooting
+note](quickstart.md#troubleshooting) for the read-permission case.
+
+`--group-add keep-groups` is podman's way of carrying your host
+supplementary groups into the container; pair it with
+[`inherit-supplementary-groups=#true`](reference.md#inherit-supplementary-groups)
+so hypershunt's privilege drop doesn't strip them.
+
+**Privileged ports vs. `--userns=keep-id`.**  Binding ports below
+1024 needs root, and `keep-id` takes it away.  With the *default*
+rootless namespace the process runs as container-root (mapped to
+your host user), binds 80/443, then drops to `hypershunt`.  But
+`--userns=keep-id:uid=1000,gid=1000` starts the process *as* UID
+1000 -- it can no longer bind low ports, and hypershunt fails the
+bind with `EACCES`.  Pick one:
+
+- **Keep the default namespace** when you need 80/443 directly;
+  align file ownership with `--group-add keep-groups` or by
+  `chown`ing your mounted volumes instead of `keep-id`.
+- **Listen high, publish low** -- bind `:8080` inside the container
+  and map it with `-p 80:8080`; nothing inside touches a
+  privileged port.
+- **Hand in a pre-bound socket** with
+  [`--preserve-fds`](#inherited-sockets-and-socket-activation): a
+  privileged socket bound outside the container, adopted by
+  hypershunt with no `bind()` of its own.
+- **Lift the kernel limit** -- `--sysctl
+  net.ipv4.ip_unprivileged_port_start=0` lets UID 1000 bind low
+  ports directly.
+
+**On Docker.**  The model differs: there is no `keep-groups` (pass
+explicit numeric GIDs with `--group-add <gid>`), and `keep-id` is
+podman-only -- Docker remaps users daemon-wide via `userns-remap`
+in `/etc/docker/daemon.json`, or you run as your host identity with
+`--user $(id -u):$(id -g)` (which, like `keep-id`, forfeits
+privileged-port binding -- use a workaround above).  Docker also
+has no `--preserve-fds`, so socket hand-in is unavailable.
+
 ### Capability shortcuts
 
 If you'd rather avoid the root-then-drop dance entirely, grant
@@ -2170,6 +2218,50 @@ and then drains its own connections (capped by
 The child picks up where the parent left off without dropping a
 single connection.  Use SIGUSR2 to upgrade the *binary* (not the
 config) -- replace `/usr/bin/hypershunt`, then signal.
+
+### Inherited sockets and socket activation
+
+Underneath both restart shapes is one mechanism: at startup
+hypershunt scans its already-open file descriptors and, for any
+*listening* socket whose address matches a configured listener,
+adopts that descriptor instead of calling `bind()`.  Descriptors
+no listener claims are closed (and logged).  This is *implicit*
+socket activation -- hypershunt never reads `LISTEN_FDS`; it simply
+uses whatever listening sockets it is handed.
+
+- **Starting** -- with nothing inherited, every listener binds a
+  fresh socket.  When a supervisor hands sockets in -- systemd
+  `ListenStream=`/`ListenDatagram=` socket units, or
+  `podman --preserve-fds` -- the matching listeners adopt them and
+  skip the bind.
+- **Reload (SIGHUP)** -- the same process throughout; unchanged
+  listeners keep their open sockets untouched, so there is nothing
+  to inherit.  Only added listeners bind; only removed ones close.
+- **Upgrade (SIGUSR2)** -- the child inherits the parent's listening
+  sockets across `fork()` + `exec()` and adopts them by address.
+  The socket is never closed, so even connections waiting in the
+  kernel accept queue survive the swap.
+
+Matching is by bound address, so a pre-opened socket must be bound
+to the exact address its listener declares.
+
+**`--preserve-fds` in containers.**  `podman run --preserve-fds=N`
+passes N extra descriptors (starting at fd 3) from the launcher
+into the container.  Use it to hand hypershunt a socket bound
+*outside* the container -- typically a privileged port opened by a
+systemd `.socket` unit -- so an in-container process running as the
+unprivileged UID 1000 can serve 80/443 without ever binding it
+itself (the `keep-id` gotcha from [Container
+twist](#container-twist)).  Declare a listener on the same address
+the socket is bound to and hypershunt adopts it.
+
+Because the SIGUSR2 fork/exec happens *inside* the container and
+images are read-only, an in-place binary swap isn't the usual
+container upgrade -- you roll a new image and a new container
+instead.  `--preserve-fds` socket activation is what keeps the
+listening socket (and its accept queue) alive across that swap.
+Docker has no `--preserve-fds` equivalent and cannot pass listening
+sockets into a container.
 
 ### What survives
 

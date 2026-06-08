@@ -147,6 +147,9 @@ podman stop hypershunt && podman rm hypershunt
   hypershunt accepts, with semantics, defaults, and worked KDL
   examples.
 - [Grammar](grammar.md) -- the formal KDL syntax.
+- Running in production: [unprivileged &
+  containers](guide.md#running-unprivileged) and [reload &
+  zero-downtime upgrade](guide.md#reloading-and-zero-downtime-upgrade).
 
 ## Troubleshooting
 
@@ -160,9 +163,21 @@ Skip the flag on Debian/Ubuntu (or Docker) where SELinux isn't
 enforced.
 
 **Permission denied reading mounted files** -- hypershunt runs as
-the in-container `hypershunt` user (UID 1000 inside rootless podman).
-Make sure your mounted directories are readable by that UID.
-A simple `chmod -R o+rX public` resolves most cases.
+the in-container `hypershunt` user, a fixed **UID/GID 1000**.  Make
+sure your mounted directories are readable by it; a simple
+`chmod -R o+rX public` resolves most cases.  To instead align host
+ownership with the container, map your host user onto UID/GID 1000:
+
+```sh
+podman run ... --userns=keep-id:uid=1000,gid=1000 ...
+```
+
+Caveat: `keep-id` starts the process as UID 1000 (not container-root),
+so it can no longer bind ports below 1024 -- combining it with
+`-p 80:80`/`-p 443:443` fails with `EACCES`.  Keep the default
+namespace for privileged ports, or publish to a high in-container
+port; see [Container
+twist](guide.md#container-twist) for the options.
 
 **ACME issuance fails** -- the `state-dir` volume must be
 writable, and Let's Encrypt must be able to reach your hypershunt on
