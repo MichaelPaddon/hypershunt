@@ -293,14 +293,6 @@ pub struct UpstreamDtlsConfig {
     pub skip_verify: bool,
 }
 
-/// DTLS server-side termination block on a UDP listener.  Reserved
-/// for future use; presence here causes validate() to bail.
-#[derive(Debug, Clone)]
-pub struct DtlsListenerConfig {
-    #[allow(dead_code)] // reserved -- the cert source for a future DTLS layer
-    pub tls: TlsListenerConfig,
-}
-
 #[derive(Debug, Clone)]
 pub struct ListenerConfig {
     /// Bind address in strict URL form (tcp://, udp://,
@@ -311,12 +303,10 @@ pub struct ListenerConfig {
     /// (QUIC's encryption layer *is* TLS 1.3, RFC 9001, so the same
     /// cert source / OCSP / ALPN children apply unchanged).  Rejected
     /// by validate() on `unix-dgram:` / `unix-seqpacket:` (QUIC is
-    /// UDP-only).
+    /// UDP-only).  On `udp://`, `tls` together with `proxy` selects a
+    /// DTLS-terminating datagram proxy (reserved -- validate() bails
+    /// until a DTLS implementation lands).
     pub tls: Option<TlsListenerConfig>,
-    /// DTLS termination block.  Reserved -- parser accepts on
-    /// `udp://` listeners; validate() bails with "not yet
-    /// implemented".
-    pub dtls: Option<DtlsListenerConfig>,
     /// When Some: proxy mode (raw bytes or datagrams forwarded to
     /// upstream).  When None: HTTP routing mode (vhost/location
     /// dispatch on stream listeners; HTTP/3 on message listeners).
@@ -930,75 +920,51 @@ impl Config {
         //   tls on tcp:// / unix-stream:  -> HTTPS
         //   tls on udp://                 -> HTTP/3 (QUIC; encryption
         //                                    IS TLS 1.3, RFC 9001)
-        //   dtls{} -> udp:// only           (reserved; not yet impl.)
+        //   tls + proxy on udp://         -> DTLS-terminating datagram
+        //                                    proxy (reserved; not impl.)
         for l in self.listeners.iter() {
             let at = loc(name, l.line);
             let kind = l.bind.kind;
             let has_tls = l.tls.is_some();
-            let has_dtls = l.dtls.is_some();
             let has_proxy = l.proxy.is_some();
 
             // Encryption-block / socket-family checks.  `tls` is valid
-            // on byte-stream (HTTPS) and udp:// (HTTP/3) listeners, but
-            // not on the remaining datagram families -- QUIC is
-            // UDP-only, so there is no HTTP path for unix-dgram: /
-            // unix-seqpacket:.
+            // on byte-stream (HTTPS) and udp:// (HTTP/3 or DTLS)
+            // listeners, but not on the remaining datagram families --
+            // QUIC and DTLS are both UDP-only, so there is no encrypted
+            // path for unix-dgram: / unix-seqpacket:.
             if has_tls
                 && !kind.is_byte_stream()
                 && kind != SocketKind::UdpDgram
             {
                 bail!(
                     "{at}listener ({}) carries a `tls {{ }}` block; on a \
-                     datagram listener TLS means HTTP/3 (QUIC), which is \
-                     udp:// only.  unix-dgram: / unix-seqpacket: support \
-                     only a `proxy {{ }}` block.",
+                     datagram listener TLS means HTTP/3 or DTLS, both of \
+                     which are udp:// only.  unix-dgram: / \
+                     unix-seqpacket: support only a `proxy {{ }}` block.",
                     l.bind.to_url()
                 );
             }
-            if has_dtls && kind != SocketKind::UdpDgram {
+            // On udp://, `tls` alone is HTTP/3; `tls` together with a
+            // `proxy` selects a DTLS-terminating datagram proxy (the
+            // `tls` block is the server cert source, the `proxy` the
+            // datagram backend).  No DTLS implementation exists yet, so
+            // the combination is reserved.  (On byte-stream listeners
+            // `tls` + `proxy` is the legitimate TLS-terminating stream
+            // proxy, so this only fires for udp://.)
+            if has_tls && has_proxy && kind == SocketKind::UdpDgram {
                 bail!(
-                    "{at}listener ({}) carries a `dtls {{ }}` block; \
-                     DTLS termination is only valid on udp:// listeners.",
-                    l.bind.to_url()
-                );
-            }
-            if has_tls && has_dtls {
-                bail!(
-                    "{at}listener ({}) carries both `tls {{ }}` and \
-                     `dtls {{ }}`; pick at most one encryption layer.",
-                    l.bind.to_url()
-                );
-            }
-            if has_dtls {
-                bail!(
-                    "{at}listener ({}) uses `dtls {{ }}` -- DTLS \
-                     termination is not yet implemented; the config \
-                     slot is reserved.  Remove the dtls block to \
-                     proceed.",
-                    l.bind.to_url()
-                );
-            }
-            // On udp://, `tls` means HTTP/3; combining it with a proxy
-            // is a layer violation.  (On byte-stream listeners `tls` +
-            // `proxy` is the legitimate TLS-terminating stream proxy,
-            // so this only fires for datagram listeners.)
-            if has_tls && has_proxy && kind.is_datagram_stream() {
-                bail!(
-                    "{at}listener ({}) carries both `tls {{ }}` and \
-                     `proxy {{ }}` on a udp:// listener; TLS there means \
-                     HTTP/3.  Use a plain udp:// listener with \
-                     `proxy {{ }}` for raw datagram forwarding.",
+                    "{at}listener ({}) requests a DTLS-terminating \
+                     datagram proxy (`tls` + `proxy` on udp://) -- DTLS \
+                     is not yet implemented; the config slot is \
+                     reserved.",
                     l.bind.to_url()
                 );
             }
             // Datagram listeners need an explicit handler: `tls` for
             // HTTP/3 or `proxy` for raw forwarding.  There is no
             // plaintext HTTP/3, so a bare datagram listener is an error.
-            if kind.is_datagram_stream()
-                && !has_tls
-                && !has_dtls
-                && !has_proxy
-            {
+            if kind.is_datagram_stream() && !has_tls && !has_proxy {
                 bail!(
                     "{at}listener ({}) has no handler: a datagram-\
                      stream listener requires either a `tls {{ }}` \

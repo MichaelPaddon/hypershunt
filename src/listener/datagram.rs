@@ -971,7 +971,6 @@ mod tests {
             bind: BoundAddr::parse(&format!("udp://{listener_addr}"))
                 .unwrap(),
             tls: None,
-            dtls: None,
             proxy: Some(ProxyConfig {
                 upstream: BoundAddr::parse(&format!(
                     "udp://{backend_addr}"
@@ -1065,7 +1064,6 @@ mod tests {
             ))
             .unwrap(),
             tls: None,
-            dtls: None,
             proxy: Some(ProxyConfig {
                 upstream: BoundAddr::parse(&format!(
                     "unix-dgram:{}",
@@ -1153,7 +1151,6 @@ mod tests {
             bind: BoundAddr::parse(&format!("udp://{listener_addr}"))
                 .unwrap(),
             tls: None,
-            dtls: None,
             proxy: Some(ProxyConfig {
                 upstream: BoundAddr::parse(&format!(
                     "unix-dgram:{}",
@@ -1280,7 +1277,6 @@ mod tests {
             ))
             .unwrap(),
             tls: None,
-            dtls: None,
             proxy: Some(ProxyConfig {
                 upstream: BoundAddr::parse(&format!(
                     "unix-seqpacket:{}",
