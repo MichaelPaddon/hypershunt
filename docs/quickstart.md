@@ -29,11 +29,28 @@ Stop with `Ctrl-C`.
 
 Bind-mount a host directory at `/var/www/hypershunt`:
 
+<!-- tabs:start -->
+
+<!-- tab:podman -->
+
 ```sh
 podman run --rm -p 8080:80 \
     -v "$PWD/public:/var/www/hypershunt:ro,Z" \
     ghcr.io/michaelpaddon/hypershunt:latest
 ```
+
+<!-- tab:docker -->
+
+```sh
+docker run --rm -p 8080:80 \
+    -v "$PWD/public:/var/www/hypershunt:ro" \
+    ghcr.io/michaelpaddon/hypershunt:latest
+```
+
+<!-- tabs:end -->
+
+(podman wants the `:Z` SELinux relabel flag on RHEL/Fedora; docker
+doesn't use it.)
 
 Anything you put in `./public` is now reachable at
 `http://localhost:8080/`.  The container's bundled config

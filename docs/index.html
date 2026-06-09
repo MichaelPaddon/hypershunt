@@ -236,6 +236,16 @@
       background: #18222e;
       color: #c8d2dc;
     }
+    /* Tabbed code blocks (docsify-tabs). */
+    :root[data-theme="dark"] .docsify-tabs__content { background: #18222e; }
+    :root[data-theme="dark"] .docsify-tabs__tab {
+      color: #8b97a3;
+      background: transparent;
+    }
+    :root[data-theme="dark"] .docsify-tabs__tab--active {
+      color: #e7edf3;
+      border-bottom-color: var(--theme-color, #42b983);
+    }
   </style>
 
   <!-- Apply the saved (or OS-preferred) theme before first paint so the
@@ -283,6 +293,11 @@
       toc: {
         tocMaxLevel: 3,
         target: 'h2, h3'
+      },
+      tabs: {
+        persist: true,
+        sync: true,
+        theme: 'classic'
       }
     };
   </script>
@@ -296,6 +311,11 @@
        `> [!TIP]`, `> [!WARNING]`, `> [!IMPORTANT]`, `> [!ATTENTION]`.
        The plugin injects its own styles. -->
   <script src="vendor/docsify-plugin-flexible-alerts.min.js"></script>
+  <!-- Tabbed code blocks for variant commands (podman/docker, etc.).
+       Comment-style tabs (<!-- tab:Label -->) are used so tab labels
+       never become headings that leak into the TOC or search. The
+       plugin injects its own styles. -->
+  <script src="vendor/docsify-tabs.min.js"></script>
 
   <!-- Back-to-top button.  Inline (no dependency): a docsify plugin
        appends one fixed button and reveals it once the reader has
