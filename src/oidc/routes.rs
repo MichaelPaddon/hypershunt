@@ -888,4 +888,109 @@ mod tests {
     fn clear_jwt_cookie_with_tls() {
         assert!(clear_jwt_cookie("j", true).contains("Secure"));
     }
+
+    // -- request handlers ------------------------------------------
+    //
+    // These drive the login/logout handlers end-to-end against the
+    // network-free `provider_for_store` fixture.  The callback and
+    // back-channel handlers require IdP-signed tokens and a live JWKS,
+    // so they stay in the container integration suite.
+
+    use crate::oidc::tests::{
+        provider_for_store, provider_for_store_with_end_session,
+    };
+    use std::time::Duration;
+
+    fn location(resp: &Response<BoxBody>) -> &str {
+        resp.headers()
+            .get(hyper::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+    }
+
+    fn set_cookies(resp: &Response<BoxBody>) -> Vec<String> {
+        resp.headers()
+            .get_all(hyper::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|s| s.to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn handle_oidc_login_redirects_to_idp_with_state_cookie() {
+        let p = provider_for_store(Duration::from_secs(60));
+        let resp = handle_oidc_login(&p, "return=/dashboard", true);
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        // Redirect points at the IdP authorize endpoint.
+        assert!(location(&resp).starts_with("https://idp.example/authorize"));
+        // State cookie is set and carries the Secure flag under TLS.
+        let cookies = set_cookies(&resp);
+        assert!(
+            cookies.iter().any(|c| c.contains("Secure")),
+            "expected a Secure state cookie under TLS"
+        );
+    }
+
+    #[test]
+    fn handle_oidc_login_rejects_malformed_hint() {
+        let p = provider_for_store(Duration::from_secs(60));
+        // An over-long login_hint fails coarse validation -> 400.
+        let long = "a".repeat(600);
+        let resp =
+            handle_oidc_login(&p, &format!("login_hint={long}"), false);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn handle_oidc_logout_clears_cookies_without_session() {
+        let p = provider_for_store(Duration::from_secs(60));
+        let resp =
+            handle_oidc_logout(&p, None, &hyper::HeaderMap::new(), false);
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        // No end_session_endpoint configured -> local post-logout uri.
+        assert_eq!(location(&resp), "/");
+        // Refresh + stale-state cookies are cleared.
+        let cookies = set_cookies(&resp);
+        assert!(cookies.iter().any(|c| c.contains("Max-Age=0")));
+    }
+
+    // Popping a session fires a best-effort RFC 7009 revocation, which
+    // spawns a task -- so this case needs a live runtime.
+    #[tokio::test]
+    async fn handle_oidc_logout_pops_session_and_bounces_through_idp() {
+        let end_session =
+            url::Url::parse("https://idp.example/end-session").unwrap();
+        let p = provider_for_store_with_end_session(
+            Duration::from_secs(60),
+            end_session,
+        );
+        // Seed a server-side refresh session the logout must tear down.
+        p.refreshes.lock().unwrap().insert(
+            "sid".into(),
+            crate::oidc::RefreshEntry {
+                refresh_token: openidconnect::RefreshToken::new("rt".into()),
+                expires_at: std::time::Instant::now()
+                    + Duration::from_secs(60),
+                id_token: "the-id-token".into(),
+                subject: "alice".into(),
+                idp_sid: None,
+            },
+        );
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::COOKIE,
+            "__hypershunt_oidc_refresh=sid".parse().unwrap(),
+        );
+
+        let resp = handle_oidc_logout(&p, None, &headers, true);
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        // Bounced through the IdP end-session endpoint, carrying the
+        // stored id_token as id_token_hint.
+        let loc = location(&resp);
+        assert!(loc.starts_with("https://idp.example/end-session"));
+        assert!(loc.contains("id_token_hint=the-id-token"));
+        // Session was popped (pop semantics: gone after logout).
+        assert_eq!(p.refresh_count(), 0);
+    }
 }
