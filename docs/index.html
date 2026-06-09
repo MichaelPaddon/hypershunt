@@ -122,8 +122,8 @@
        mirrored in the opposite corner from back-to-top. */
     #theme-toggle {
       position: fixed;
-      left: 1.2rem;
-      bottom: 1.2rem;
+      right: 1.2rem;
+      top: 1.2rem;
       z-index: 30;
       padding: 0.4rem 0.7rem;
       font: 600 12px/1 sans-serif;
@@ -234,7 +234,6 @@
   <script>
     window.$docsify = {
       name: 'hypershunt',
-      repo: 'https://github.com/MichaelPaddon/hypershunt',
       logo: 'hypershunt-logo.png',
       loadSidebar: true,
       subMaxLevel: 3,
@@ -273,9 +272,9 @@
        The plugin injects its own styles. -->
   <script src="vendor/docsify-plugin-flexible-alerts.min.js"></script>
   <!-- Tabbed code blocks for variant commands (podman/docker, etc.).
-       Comment-style tabs (<!-- tab:Label -->) are used so tab labels
-       never become headings that leak into search. The plugin injects
-       its own styles. -->
+       Comment-style "tab:Label" markers are used so tab labels never
+       become headings that leak into search. The plugin injects its
+       own styles. -->
   <script src="vendor/docsify-tabs.min.js"></script>
 
   <!-- Back-to-top button.  Inline (no dependency): a docsify plugin
@@ -342,7 +341,9 @@
       hook.afterEach(function (html, next) {
         var file = vm.route.file;
         if (!file || file === 'manual.md') { next(html); return; }
-        var url = window.$docsify.repo + '/blob/main/docs/' + file;
+        var url =
+          'https://github.com/MichaelPaddon/hypershunt/blob/main/docs/' +
+          file;
         next(
           html +
           '<p class="edit-page"><a href="' + url +
