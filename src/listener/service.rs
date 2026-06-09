@@ -1252,4 +1252,115 @@ mod tests {
         assert_eq!(m.compress_skipped_total.load(Ordering::Relaxed), 1);
         assert_eq!(m.compress_responses_total.load(Ordering::Relaxed), 0);
     }
+
+    // -- access policy + rate-limit dispatch (end-to-end) ----------
+    //
+    // These drive the request pipeline in `call()` through the
+    // in-process TestServer so the access-policy and rate-limit
+    // early-return branches are exercised against a real HTTP round
+    // trip rather than mocked in isolation.
+    use crate::test::TestServer;
+
+    #[tokio::test]
+    async fn policy_unconditional_deny_returns_configured_code() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "h" {
+                location "/" {
+                    policy { deny code=403 }
+                    static root="/tmp"
+                }
+            }
+            "#,
+        )
+        .await;
+        let (status, _h, _b) = srv.get("h", "/").await;
+        assert_eq!(status, hyper::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn policy_redirect_sends_302_with_location() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "h" {
+                location "/" {
+                    policy { redirect to="/login" code=302 }
+                    static root="/tmp"
+                }
+            }
+            "#,
+        )
+        .await;
+        let (status, headers, _b) = srv.get("h", "/").await;
+        assert_eq!(status, hyper::StatusCode::FOUND);
+        assert_eq!(headers.get("location").unwrap(), "/login");
+    }
+
+    #[tokio::test]
+    async fn policy_challenge_returns_401_for_anonymous() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "h" {
+                location "/" {
+                    policy { allow authenticated }
+                    static root="/tmp"
+                }
+            }
+            "#,
+        )
+        .await;
+        let (status, headers, _b) = srv.get("h", "/").await;
+        assert_eq!(status, hyper::StatusCode::UNAUTHORIZED);
+        // No valid creds and no OIDC -> Basic challenge.
+        assert!(headers.contains_key("www-authenticate"));
+    }
+
+    #[tokio::test]
+    async fn policy_denied_with_credentials_still_401() {
+        // Presenting (rejected) credentials drives the auth-failure
+        // arm of the 401 branch rather than the benign-challenge arm.
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "h" {
+                location "/" {
+                    policy { allow authenticated }
+                    static root="/tmp"
+                }
+            }
+            "#,
+        )
+        .await;
+        let (status, _h, _b) = srv
+            .get_h("h", "/", &[("authorization", "Basic Zm9vOmJhcg==")])
+            .await;
+        assert_eq!(status, hyper::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_second_request_gets_429() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "h" {
+                location "/" {
+                    rate-limit rate=1 per="second" burst=1 {
+                        key "client-ip"
+                    }
+                    static root="/tmp"
+                }
+            }
+            "#,
+        )
+        .await;
+        // First request consumes the single token; the second, from the
+        // same client-ip within the window, is rejected with 429.
+        let _first = srv.get("h", "/").await.0;
+        let (second, headers, _b) = srv.get("h", "/").await;
+        assert_eq!(second, hyper::StatusCode::TOO_MANY_REQUESTS);
+        assert!(headers.contains_key("retry-after"));
+    }
 }

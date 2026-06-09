@@ -1716,3 +1716,244 @@ fn class_row(name: &str, c: &crate::metrics::ClassSnapshot) -> String {
         s5 = fmt_num(c.s5xx),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    // The section helpers are exercised end-to-end by status.rs's
+    // render_html tests, but only with an all-zero Snapshot -- so every
+    // "shown when active" body sat uncovered.  These tests drive the
+    // helpers directly with populated inputs to cover the active
+    // branches, the per-state class selection, and the formatters.
+    use super::*;
+    use crate::handler::status::LocationSummary;
+    use crate::metrics::{
+        AcmeSnap, BackendSnap, ClassSnapshot, CompressionSnap, GeoipSnap,
+        HttpConnSnap, OcspSnap, OidcSnap, RateLimitSnap, Snapshot, StaticSnap,
+        TlsSnap,
+    };
+
+    fn now_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[test]
+    fn fmt_duration_secs_covers_each_unit() {
+        assert_eq!(fmt_duration_secs(0), "0s");
+        assert_eq!(fmt_duration_secs(45), "45s");
+        assert_eq!(fmt_duration_secs(90), "1m 30s");
+        assert_eq!(fmt_duration_secs(3700), "1h 1m");
+        assert_eq!(fmt_duration_secs(90_000), "1d 1h");
+    }
+
+    #[test]
+    fn network_section_empty_when_idle_populated_when_active() {
+        assert!(network_section(&Snapshot::default()).is_empty());
+        let s = Snapshot {
+            tls: TlsSnap { handshakes: 5, failures: 1, timeouts: 0 },
+            http_conns: HttpConnSnap { active: 2, total: 10 },
+            ocsp: OcspSnap { refreshes: 1, refresh_failures: 0 },
+            acme: AcmeSnap { issuances: 2, ..Default::default() },
+            ..Default::default()
+        };
+        let html = network_section(&s);
+        assert!(html.contains("Network"));
+        assert!(html.contains("val-tls-hs"));
+        assert!(html.contains("val-acme-iss"));
+    }
+
+    #[test]
+    fn security_extra_section_renders_each_active_card() {
+        assert!(security_extra_section(&Snapshot::default()).is_empty());
+        let s = Snapshot {
+            oidc: OidcSnap { discoveries: 1, ..Default::default() },
+            rate_limit: RateLimitSnap { triggers: 3, active_keys: 2 },
+            geoip: GeoipSnap { lookups: 7, misses: 1 },
+            ..Default::default()
+        };
+        let html = security_extra_section(&s);
+        assert!(html.contains("OIDC / OAuth"));
+        assert!(html.contains("Rate Limiting"));
+        assert!(html.contains("GeoIP"));
+    }
+
+    #[test]
+    fn compression_section_computes_saved_ratio() {
+        assert!(compression_section(&Snapshot::default()).is_empty());
+        // bytes_in > 0 takes the percentage branch.
+        let s = Snapshot {
+            compression: CompressionSnap {
+                responses: 4,
+                bytes_in: 1000,
+                bytes_out: 400,
+                gzip: 3,
+                brotli: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let html = compression_section(&s);
+        assert!(html.contains("Compression"));
+        assert!(html.contains("60.0%"), "1 - 400/1000 = 60%");
+
+        // responses>0 but no bytes yet -> em-dash saved branch.
+        let s2 = Snapshot {
+            compression: CompressionSnap {
+                responses: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(compression_section(&s2).contains("Compression"));
+    }
+
+    #[test]
+    fn backends_section_shown_when_any_backend_active() {
+        assert!(backends_section(&Snapshot::default()).is_empty());
+        let s = Snapshot {
+            fcgi: BackendSnap { requests: 2, errors: 1, in_flight: 0 },
+            static_files: StaticSnap {
+                bytes_served: 4096,
+                not_modified: 1,
+                range: 1,
+            },
+            ..Default::default()
+        };
+        let html = backends_section(&s);
+        assert!(html.contains("Backends"));
+        assert!(html.contains("FastCGI"));
+        assert!(html.contains("Static Files"));
+    }
+
+    #[test]
+    fn breakdown_section_renders_handler_and_vhost_rows() {
+        assert!(breakdown_section(&Snapshot::default()).is_empty());
+        let cls = ClassSnapshot {
+            total: 5,
+            s2xx: 4,
+            s3xx: 0,
+            s4xx: 1,
+            s5xx: 0,
+        };
+        let s = Snapshot {
+            by_handler: vec![("static", cls)],
+            by_vhost: vec![("example.com".to_string(), cls)],
+            ..Default::default()
+        };
+        let html = breakdown_section(&s);
+        assert!(html.contains("Traffic Breakdown"));
+        assert!(html.contains("static"));
+        assert!(html.contains("example.com"));
+    }
+
+    #[test]
+    fn auth_section_none_is_empty() {
+        assert!(auth_section(None).is_empty());
+    }
+
+    #[test]
+    fn auth_section_jwt_session_row() {
+        let a = AuthDesc {
+            kind: "PAM",
+            detail: "login".into(),
+            has_jwt_session: true,
+            jwt_validity_secs: Some(3600),
+        };
+        let html = auth_section(Some(&a));
+        assert!(html.contains("Session"));
+        assert!(html.contains("JWT (ES256, 1h 0m)"));
+    }
+
+    #[test]
+    fn auth_section_standalone_token_validity_row() {
+        let a = AuthDesc {
+            kind: "JWT",
+            detail: "bearer".into(),
+            has_jwt_session: false,
+            jwt_validity_secs: Some(300),
+        };
+        let html = auth_section(Some(&a));
+        assert!(html.contains("Token validity"));
+        assert!(html.contains("5m 0s"));
+    }
+
+    #[test]
+    fn certs_section_picks_class_by_expiry_window() {
+        assert!(certs_section(&[]).contains("display:none"));
+        let now = now_secs();
+        let certs = vec![
+            CertState {
+                domains: vec!["crit.example".into()],
+                expiry_ts: now + 86400, // < 7d -> critical
+                next_renewal_ts: now,
+            },
+            CertState {
+                domains: vec!["warn.example".into()],
+                expiry_ts: now + 14 * 86400, // < 30d -> warn
+                next_renewal_ts: now,
+            },
+            CertState {
+                domains: vec!["ok.example".into()],
+                expiry_ts: now + 90 * 86400, // > 30d -> ok
+                next_renewal_ts: now,
+            },
+        ];
+        let html = certs_section(&certs);
+        assert!(html.contains("cert-crit") && html.contains("Critical"));
+        assert!(html.contains("cert-warn") && html.contains("Expiring soon"));
+        assert!(html.contains("cert-ok"));
+    }
+
+    #[test]
+    fn upstream_row_html_reflects_state() {
+        let row = |healthy, ejected| UpstreamRow {
+            label: "api".into(),
+            url: "http://up:80".into(),
+            weight: 1,
+            in_flight: 0,
+            healthy,
+            ejected,
+        };
+        assert!(upstream_row_html(&row(true, false)).contains("Healthy"));
+        // Ejected wins over a stale healthy flag.
+        assert!(upstream_row_html(&row(true, true)).contains("Ejected"));
+        assert!(upstream_row_html(&row(false, false)).contains("Unhealthy"));
+    }
+
+    #[test]
+    fn upstream_health_table_hidden_when_empty() {
+        assert!(upstream_health_table(&[]).contains("display:none"));
+    }
+
+    #[test]
+    fn listeners_section_formats_optional_columns() {
+        assert!(listeners_section(&[]).is_empty());
+        let ls = vec![ListenerSummary {
+            address: "0.0.0.0:443".into(),
+            protocol: "HTTPS".into(),
+            acme_domains: vec!["a.example".into(), "b.example".into()],
+            max_connections: Some(1024),
+            handler_timeout_secs: Some(30),
+        }];
+        let html = listeners_section(&ls);
+        assert!(html.contains("a.example, b.example"));
+        assert!(html.contains("30 s"));
+    }
+
+    #[test]
+    fn vhosts_section_lists_aliases_and_locations() {
+        assert!(vhosts_section(&[]).is_empty());
+        let vs = vec![VHostSummary {
+            name: "example.com".into(),
+            aliases: vec!["www.example.com".into()],
+            locations: vec![LocationSummary {
+                path: "/".into(),
+                handler: "static".into(),
+            }],
+        }];
+        let html = vhosts_section(&vs);
+        assert!(html.contains("example.com"));
+    }
+}
