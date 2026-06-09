@@ -512,3 +512,192 @@ pub struct ListenerSpawnDeps {
     >,
 }
 
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::auth::AnonymousAuthenticator;
+    use crate::config::{Config, ListenerConfig};
+    use crate::error::ErrorPages;
+    use crate::handler::status::ServerSummary;
+    use crate::listener::{AppState, BoundSocket, SharedAppState};
+    use crate::metrics::Metrics;
+    use crate::router::Router;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    // Test wiring kept alive together: dropping the shutdown sender
+    // would close every listener's shutdown_rx, and dropping the
+    // helper-task maps would abort the background tasks the builders
+    // spawn -- so the harness owns them for the duration of the test.
+    struct Harness {
+        deps: ListenerSpawnDeps,
+        state: SharedAppState,
+        router: Arc<Router>,
+        _shutdown_tx: tokio::sync::watch::Sender<bool>,
+    }
+
+    // Build a self-contained set of spawn dependencies plus a live
+    // AppState/Router from a minimal, always-valid HTTP config.  The
+    // builders take the listener cfg + socket separately, so this
+    // base config need not match the listener under test.
+    fn harness() -> Harness {
+        let cfg = Config::parse(
+            r#"
+            listener "tcp://127.0.0.1:0"
+            vhost x { location "/" { static root="/tmp" } }
+            "#,
+        )
+        .unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let summary = Arc::new(ServerSummary::from_config(&cfg));
+        let cert_state = crate::cert::state::new_shared();
+        let router = Arc::new(
+            Router::new(&cfg, &metrics, &summary, Some(&cert_state)).unwrap(),
+        );
+        let app_state = Arc::new(AppState {
+            router: router.clone(),
+            acme_challenges: Default::default(),
+            authenticator: Arc::new(AnonymousAuthenticator),
+            metrics: metrics.clone(),
+            geoip: None,
+            health_enabled: cfg.server.health.enabled,
+            error_pages: Arc::new(ErrorPages::new(HashMap::new())),
+            jwt_manager: None,
+            oidc: None,
+            access_log: Arc::new(
+                crate::access_log::AccessLogger::tracing_default(),
+            ),
+        });
+        let state = Arc::new(ArcSwap::from(app_state));
+        let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+        let deps = ListenerSpawnDeps {
+            tls_defaults: Default::default(),
+            state_dir: None,
+            challenges: Default::default(),
+            cert_state,
+            cert_registry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            cert_source_fingerprints: Arc::new(ArcSwap::from_pointee(
+                HashMap::new(),
+            )),
+            cert_key_mode: 0o600,
+            vhost_alpn_overrides: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            metrics,
+            tcp_geoip: None,
+            stop_accept_txs: Arc::new(Mutex::new(HashMap::new())),
+            shutdown_rx: sd_rx,
+            listener_helpers: Arc::new(Mutex::new(HashMap::new())),
+            cert_helpers: Arc::new(Mutex::new(HashMap::new())),
+        };
+        Harness { deps, state, router, _shutdown_tx: sd_tx }
+    }
+
+    // Parse a config and bind its first listener to a real ephemeral
+    // socket, returning both for handing to a builder.
+    fn bind_first(cfg_src: &str) -> (ListenerConfig, BoundSocket) {
+        let cfg = Config::parse(cfg_src).unwrap();
+        let lcfg = cfg.listeners[0].clone();
+        let mut inherited = crate::inherit::InheritedSockets::scan();
+        let sock = crate::listener::bind_socket(&lcfg, &mut inherited).unwrap();
+        (lcfg, sock)
+    }
+
+    fn registered(deps: &ListenerSpawnDeps, key: &str) -> bool {
+        deps.stop_accept_txs.lock().unwrap().contains_key(key)
+    }
+
+    #[tokio::test]
+    async fn plain_listener_registers_stop_channel() {
+        let h = harness();
+        let (lcfg, sock) = bind_first(
+            r#"
+            listener "tcp://127.0.0.1:0"
+            vhost x { location "/" { static root="/tmp" } }
+            "#,
+        );
+        let key = lcfg.local_name();
+        // The returned accept-loop future is intentionally dropped
+        // unpolled: we assert only the synchronous registration the
+        // builder performs before returning it.
+        let _fut =
+            build_plain_listener_future(&h.deps, h.state.clone(), lcfg, sock);
+        assert!(registered(&h.deps, &key));
+    }
+
+    #[tokio::test]
+    async fn tls_listener_registers_channel_and_cert_watcher() {
+        let h = harness();
+        let (lcfg, sock) = bind_first(
+            r#"
+            listener "tcp://127.0.0.1:0" { tls "self-signed"
+            }
+            vhost x { location "/" { static root="/tmp" } }
+            "#,
+        );
+        let key = lcfg.local_name();
+        let _fut =
+            build_tls_listener_future(&h.deps, h.state.clone(), lcfg, sock)
+                .await
+                .unwrap();
+        assert!(registered(&h.deps, &key));
+        // Every TLS listener spawns at least the cert-renewal watcher,
+        // tracked under its bind so SIGHUP removal can abort it.
+        let helpers = h.deps.listener_helpers.lock().unwrap();
+        assert!(
+            helpers.get(&key).is_some_and(|v| !v.is_empty()),
+            "TLS listener should register a helper task"
+        );
+    }
+
+    #[tokio::test]
+    async fn quic_listener_registers_stop_channel() {
+        let h = harness();
+        let (lcfg, sock) = bind_first(
+            r#"
+            listener "udp://127.0.0.1:0" { tls "self-signed"
+            }
+            vhost x { location "/" { static root="/tmp" } }
+            "#,
+        );
+        let key = lcfg.local_name();
+        let _fut =
+            build_quic_listener_future(&h.deps, h.state.clone(), lcfg, sock)
+                .await
+                .unwrap();
+        assert!(registered(&h.deps, &key));
+    }
+
+    #[tokio::test]
+    async fn stream_proxy_listener_registers_stop_channel() {
+        let h = harness();
+        // L4 stream proxy: no vhost, no TLS -- exercises the plain
+        // branch of build_stream_listener_future.
+        let (lcfg, sock) = bind_first(
+            r#"
+            listener "tcp://127.0.0.1:0" { proxy "tcp://127.0.0.1:9002" }
+            "#,
+        );
+        let key = lcfg.local_name();
+        let _fut =
+            build_stream_listener_future(&h.deps, &h.router, lcfg, sock)
+                .await
+                .unwrap();
+        assert!(registered(&h.deps, &key));
+    }
+
+    #[tokio::test]
+    async fn dgram_proxy_listener_registers_stop_channel() {
+        let h = harness();
+        let (lcfg, sock) = bind_first(
+            r#"
+            listener "udp://127.0.0.1:0" { proxy "udp://127.0.0.1:9100" }
+            "#,
+        );
+        let key = lcfg.local_name();
+        let _fut =
+            build_dgram_proxy_future(&h.deps, &h.router, lcfg, sock)
+                .await
+                .unwrap();
+        assert!(registered(&h.deps, &key));
+    }
+}
+
