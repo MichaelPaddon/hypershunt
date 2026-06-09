@@ -47,6 +47,49 @@
     .token.boolean, .token.number { color: #8e44ad; }
     .token.comment { color: #7f8c8d; font-style: italic; }
     .token.punctuation { color: #34495e; }
+
+    /* On-page table of contents (docsify-plugin-toc).  The plugin
+       inserts <aside class="toc-nav"> immediately before .content and
+       fills it with a .page_toc tree.  Only shown on wide viewports:
+       below the breakpoint there isn't room beside the centered
+       content column, so it is hidden and readers fall back to the
+       in-page headings docsify nests under the active sidebar item. */
+    .toc-nav { display: none; }
+    @media screen and (min-width: 1200px) {
+      .toc-nav {
+        display: block;
+        position: fixed;
+        top: 0; right: 0; bottom: 0;
+        width: 17rem;
+        box-sizing: border-box;
+        padding: 70px 1.2rem 2rem 1.2rem;
+        overflow-y: auto;
+        font-size: 13px;
+        border-left: 1px solid #eee;
+      }
+      /* Pull the content column in so the TOC strip doesn't overlap it.
+         When the page has no headings the plugin tags the aside
+         `.nothing`; reclaim the space then (home/cover pages). */
+      .toc-nav + .content { right: 17rem; }
+      .toc-nav.nothing { display: none; }
+      .toc-nav.nothing + .content { right: 0; }
+    }
+    .toc-nav .page_toc { margin: 0; }
+    .toc-nav .lv2 { padding-left: 0; }
+    .toc-nav .lv3 { padding-left: 0.9rem; font-size: 12.5px; }
+    .toc-nav a {
+      display: block;
+      padding: 2px 0;
+      color: #7f8c8d;
+      text-decoration: none;
+      line-height: 1.35;
+    }
+    .toc-nav a:hover { color: var(--theme-color, #42b983); }
+    .toc-nav .active > a,
+    .toc-nav a.active {
+      color: var(--theme-color, #42b983);
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
@@ -76,7 +119,11 @@
         successText: 'Copied'
       },
       executeScript: false,
-      noEmoji: true
+      noEmoji: true,
+      toc: {
+        tocMaxLevel: 3,
+        target: 'h2, h3'
+      }
     };
   </script>
 
@@ -84,6 +131,7 @@
   <script src="vendor/docsify.min.js"></script>
   <script src="vendor/search.min.js"></script>
   <script src="vendor/docsify-copy-code.min.js"></script>
+  <script src="vendor/docsify-plugin-toc.min.js"></script>
 
   <!-- Prism core + bundled languages -->
   <script src="vendor/prism.min.js"></script>
