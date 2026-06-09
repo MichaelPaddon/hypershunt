@@ -20,6 +20,14 @@ jobs:
       # pandoc: build.rs regenerates docs/manual.md from docs/hypershunt.1.
       run: sudo apt-get install -y libpam0g-dev pandoc
 
+    # Cache the compiled dependency graph (heavy: aws-lc-rs/cmake, quinn,
+    # rustls, …).  On a warm cache the deps are restored instead of
+    # recompiled, which is where almost all the build time goes.
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: build          # debug-profile cache, stable across branches
+
     - name: Build
       run: cargo build --verbose
 
@@ -44,6 +52,14 @@ jobs:
 
     - name: Install system dependencies
       run: sudo apt-get install -y libpam0g-dev podman
+
+    # Distinct key from the build job: smoke.sh compiles in the release
+    # profile (lto=thin, opt-level=3), so its dep artifacts differ and
+    # must not clobber the debug cache.
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: integration    # release-profile cache
 
     # smoke.sh builds the release binary + the h3get / h2c_connect_echo
     # example helpers, builds the test container, and runs the suite.

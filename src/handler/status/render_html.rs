@@ -96,7 +96,7 @@ a{color:var(--accent)}
   border-right:1px solid var(--border);position:sticky;top:0;
   height:100vh;overflow-y:auto;display:flex;flex-direction:column}
 .sidebar-brand{padding:.9rem 1rem .75rem;border-bottom:1px solid var(--border)}
-.sidebar-brand img{width:140px;display:block}
+.sidebar-brand img{width:140px;display:block;margin:0 auto}
 .sidebar-live{display:flex;align-items:center;gap:.4rem;
   padding:.45rem 1rem;font-size:.78rem;color:var(--muted);
   border-bottom:1px solid var(--border)}
