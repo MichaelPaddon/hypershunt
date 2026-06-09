@@ -36,6 +36,7 @@
 
   - [Grammar](grammar.md)
   - [Glossary](glossary.md)
+  - [Troubleshooting](troubleshooting.md)
   - [Manual (man page)](manual.md)
 
 - [GitHub](https://github.com/MichaelPaddon/hypershunt)
