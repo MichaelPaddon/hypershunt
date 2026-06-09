@@ -246,6 +246,25 @@
       color: #e7edf3;
       border-bottom-color: var(--theme-color, #42b983);
     }
+
+    /* Cover page: a fixed theme-coloured gradient (so it doesn't depend
+       on docsify's per-hash random gradient) with white text and white-
+       outlined buttons; the last button is filled in the theme colour.
+       Identical in light and dark — the cover is always dark-on-green. */
+    section.cover {
+      background: linear-gradient(135deg, #0f1620 0%, #1b3a2e 55%, #42b983 100%) !important;
+    }
+    section.cover .cover-main,
+    section.cover .cover-main a { color: #eafff5; }
+    section.cover .cover-main blockquote p { color: #d7e7df; }
+    section.cover .cover-main > p:last-child a {
+      border-color: #fff;
+      color: #fff;
+    }
+    section.cover .cover-main > p:last-child a:last-child {
+      background: var(--theme-color, #42b983);
+      border-color: var(--theme-color, #42b983);
+    }
   </style>
 
   <!-- Apply the saved (or OS-preferred) theme before first paint so the
@@ -271,6 +290,7 @@
       repo: 'https://github.com/MichaelPaddon/hypershunt',
       logo: 'hypershunt-logo.png',
       loadSidebar: true,
+      coverpage: true,
       subMaxLevel: 3,
       auto2top: true,
       relativePath: true,
