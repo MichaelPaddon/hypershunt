@@ -4,6 +4,8 @@ hypershunt is a standard Cargo project. Building the binary needs a Rust
 toolchain plus a few system libraries; packaging and the container image
 need a couple of extra tools.
 
+To cut a release, see [`RELEASING.md`](RELEASING.md).
+
 ## Prerequisites
 
 - **Rust** — a recent stable toolchain. The crate's MSRV is **1.87**
