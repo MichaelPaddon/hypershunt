@@ -75,49 +75,6 @@
     .token.comment { color: var(--hs-kdl-comment); font-style: italic; }
     .token.punctuation { color: var(--hs-kdl-punct); }
 
-    /* On-page table of contents (docsify-plugin-toc).  The plugin
-       inserts <aside class="toc-nav"> immediately before .content and
-       fills it with a .page_toc tree.  Only shown on wide viewports:
-       below the breakpoint there isn't room beside the centered
-       content column, so it is hidden and readers fall back to the
-       in-page headings docsify nests under the active sidebar item. */
-    .toc-nav { display: none; }
-    @media screen and (min-width: 1200px) {
-      .toc-nav {
-        display: block;
-        position: fixed;
-        top: 0; right: 0; bottom: 0;
-        width: 17rem;
-        box-sizing: border-box;
-        padding: 70px 1.2rem 2rem 1.2rem;
-        overflow-y: auto;
-        font-size: 13px;
-        border-left: 1px solid #eee;
-      }
-      /* Pull the content column in so the TOC strip doesn't overlap it.
-         When the page has no headings the plugin tags the aside
-         `.nothing`; reclaim the space then (home/cover pages). */
-      .toc-nav + .content { right: 17rem; }
-      .toc-nav.nothing { display: none; }
-      .toc-nav.nothing + .content { right: 0; }
-    }
-    .toc-nav .page_toc { margin: 0; }
-    .toc-nav .lv2 { padding-left: 0; }
-    .toc-nav .lv3 { padding-left: 0.9rem; font-size: 12.5px; }
-    .toc-nav a {
-      display: block;
-      padding: 2px 0;
-      color: #7f8c8d;
-      text-decoration: none;
-      line-height: 1.35;
-    }
-    .toc-nav a:hover { color: var(--theme-color, #42b983); }
-    .toc-nav .active > a,
-    .toc-nav a.active {
-      color: var(--theme-color, #42b983);
-      font-weight: 600;
-    }
-
     /* Hover "#" permalink cue on headings.  docsify already wraps each
        heading's text in <a class="anchor"><span>…</span></a>, so the
        heading is a link; this only surfaces a visual affordance. */
@@ -228,9 +185,6 @@
     :root[data-theme="dark"] .search .results-panel { border-color: #243140; }
     :root[data-theme="dark"] .search .matching-post { border-bottom: 1px solid #243140; }
     :root[data-theme="dark"] .search p { color: #aab7c4; }
-    /* On-page TOC */
-    :root[data-theme="dark"] .toc-nav { border-left-color: #243140; }
-    :root[data-theme="dark"] .toc-nav a { color: #8b97a3; }
     /* Admonitions: keep the plugin's coloured accent, darken the fill. */
     :root[data-theme="dark"] .alert {
       background: #18222e;
@@ -245,25 +199,6 @@
     :root[data-theme="dark"] .docsify-tabs__tab--active {
       color: #e7edf3;
       border-bottom-color: var(--theme-color, #42b983);
-    }
-
-    /* Cover page: a fixed theme-coloured gradient (so it doesn't depend
-       on docsify's per-hash random gradient) with white text and white-
-       outlined buttons; the last button is filled in the theme colour.
-       Identical in light and dark — the cover is always dark-on-green. */
-    section.cover {
-      background: linear-gradient(135deg, #0f1620 0%, #1b3a2e 55%, #42b983 100%) !important;
-    }
-    section.cover .cover-main,
-    section.cover .cover-main a { color: #eafff5; }
-    section.cover .cover-main blockquote p { color: #d7e7df; }
-    section.cover .cover-main > p:last-child a {
-      border-color: #fff;
-      color: #fff;
-    }
-    section.cover .cover-main > p:last-child a:last-child {
-      background: var(--theme-color, #42b983);
-      border-color: var(--theme-color, #42b983);
     }
 
     /* "Edit this page" footer link, appended by the inline plugin. */
@@ -302,7 +237,6 @@
       repo: 'https://github.com/MichaelPaddon/hypershunt',
       logo: 'hypershunt-logo.png',
       loadSidebar: true,
-      coverpage: true,
       subMaxLevel: 3,
       auto2top: true,
       relativePath: true,
@@ -322,10 +256,6 @@
       },
       executeScript: false,
       noEmoji: true,
-      toc: {
-        tocMaxLevel: 3,
-        target: 'h2, h3'
-      },
       tabs: {
         persist: true,
         sync: true,
@@ -338,15 +268,14 @@
   <script src="vendor/docsify.min.js"></script>
   <script src="vendor/search.min.js"></script>
   <script src="vendor/docsify-copy-code.min.js"></script>
-  <script src="vendor/docsify-plugin-toc.min.js"></script>
   <!-- Admonition/callout blocks: authors write `> [!NOTE]`,
        `> [!TIP]`, `> [!WARNING]`, `> [!IMPORTANT]`, `> [!ATTENTION]`.
        The plugin injects its own styles. -->
   <script src="vendor/docsify-plugin-flexible-alerts.min.js"></script>
   <!-- Tabbed code blocks for variant commands (podman/docker, etc.).
        Comment-style tabs (<!-- tab:Label -->) are used so tab labels
-       never become headings that leak into the TOC or search. The
-       plugin injects its own styles. -->
+       never become headings that leak into search. The plugin injects
+       its own styles. -->
   <script src="vendor/docsify-tabs.min.js"></script>
 
   <!-- Back-to-top button.  Inline (no dependency): a docsify plugin
