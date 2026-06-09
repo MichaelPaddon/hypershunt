@@ -590,6 +590,8 @@ Per-subrequest timeout (seconds).
 
 #### auth "jwt"
 
+**Guide:** [JWT sessions](guide.md#jwt-sessions).
+
 **Variant** of [`auth`](#auth) selected by the positional kind
 `"jwt"`.
 
@@ -658,6 +660,8 @@ auth "jwt" backend="oidc" oidc-issuer="https://accounts.example.com" \
 ```
 
 #### auth "oidc"
+
+**Guide:** [OIDC single sign-on](guide.md#oidc-single-sign-on).
 
 **Inner variant** of [`auth "jwt"`](#auth-jwt) selected by
 `backend="oidc"`.
@@ -1298,6 +1302,8 @@ vhost "example.com" {
 
 ### tls (listener)
 
+**Guide:** [HTTPS / TLS termination](guide.md#https--tls-termination).
+
 **Child** of [`listener`](#listener).  Optional, at most one.
 Byte-stream (`tcp://`, `unix-stream:`) or `udp://` listeners.
 
@@ -1514,6 +1520,8 @@ listener "tcp://[::]:443" { tls "ref" name="edge" }
 
 ### tls on udp:// (HTTP/3)
 
+**Guide:** [HTTP/3](guide.md#http3).
+
 On a `udp://` listener a [`tls`](#tls-listener) block selects
 HTTP/3 termination.  QUIC encryption *is* TLS 1.3 (RFC 9001), so
 the same cert sources (`"files"`, `"acme"`, `"self-signed"`,
@@ -1662,6 +1670,8 @@ listener "tcp://0.0.0.0:8080" accept-proxy-protocol="v2" {
 [`accept-proxy-protocol`](#accept-proxy-protocol).
 
 ### proxy (listener)
+
+**Guide:** [Layer-4 proxy](guide.md#layer-4-proxy).
 
 **Child** of [`listener`](#listener).  Optional, at most one.
 Activates **L4 proxy mode**.
@@ -1869,6 +1879,8 @@ routing.
 
 #### policy (location)
 
+**Guide:** [Access policies](guide.md#access-policies).
+
 **Child** of [`location`](#location).  Optional.
 
 Access-control rules evaluated before the handler runs.
@@ -1942,6 +1954,8 @@ return `401` for anonymous users -- no explicit `deny code=401`
 needed.  Wrapping them in `not` suppresses the auto-challenge.
 
 #### basic-auth
+
+**Guide:** [HTTP Basic auth](guide.md#http-basic-auth----htpasswd-file).
 
 **Child** of [`location`](#location).  Optional.
 
@@ -2034,6 +2048,8 @@ response-headers {
 ```
 
 #### rate-limit
+
+**Guide:** [Rate limiting](guide.md#rate-limiting).
 
 **Child** of [`location`](#location).  Optional, repeatable.
 
@@ -2195,6 +2211,8 @@ back-references.  Undefined captures expand to the empty string.
 
 #### static
 
+**Guide:** [Serving static files](guide.md#serving-static-files).
+
 **Handler** child of [`location`](#location).  Serves static files.
 
 Either [`root=`](#root-static) (filesystem mode) or
@@ -2334,6 +2352,9 @@ static root="/var/www/hypershunt" fallback-redirect="/docs/" {
 **Default:** unset (no fallback; `404` as usual).
 
 #### proxy (handler)
+
+**Guide:** [Reverse proxy](guide.md#reverse-proxy),
+[Load balancing](guide.md#load-balancing).
 
 **Handler** child of [`location`](#location).  Reverse-proxies the
 request to one or more HTTP(S) upstreams.
@@ -2619,6 +2640,8 @@ HTTP status code.
 **Default:** `301`.
 
 #### fastcgi
+
+**Guide:** [CGI, FastCGI, SCGI](guide.md#cgi-fastcgi-scgi).
 
 **Handler** child of [`location`](#location).  Forwards to a
 FastCGI back-end.  Speaks the binary FastCGI protocol over a

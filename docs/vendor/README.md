@@ -17,6 +17,9 @@ copyright notices below are reproduced as MIT requires.
 | `vue.css`                     | [docsify](https://github.com/docsifyjs/docsify)            | 4.13.1   | MIT     |
 | `search.min.js`               | [docsify](https://github.com/docsifyjs/docsify) (plugin)   | 4.13.1   | MIT     |
 | `docsify-copy-code.min.js`    | [docsify-copy-code](https://github.com/jperasmus/docsify-copy-code) | 3.0.0    | MIT     |
+| `docsify-plugin-toc.min.js`   | [docsify-plugin-toc](https://github.com/justintien/docsify-plugin-toc) | 1.3.1    | MIT     |
+| `docsify-plugin-flexible-alerts.min.js` | [docsify-plugin-flexible-alerts](https://github.com/fzankl/docsify-plugin-flexible-alerts) | 1.3.0 | MIT |
+| `docsify-tabs.min.js`         | [docsify-tabs](https://github.com/jhildenbiddle/docsify-tabs) | 1.6.3    | MIT     |
 | `prism.min.js`                | [PrismJS](https://github.com/PrismJS/prism)                | 1.29.0   | MIT     |
 | `prism-bash.min.js`           | [PrismJS](https://github.com/PrismJS/prism) (component)    | 1.29.0   | MIT     |
 | `prism-json.min.js`           | [PrismJS](https://github.com/PrismJS/prism) (component)    | 1.29.0   | MIT     |
@@ -60,6 +63,84 @@ SOFTWARE.
 MIT License
 
 Copyright (c) 2017-2023 JP Erasmus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### docsify-plugin-toc
+
+```
+MIT License
+
+Copyright (c) 2019 Justin Tien (Yi-Ming Tien)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### docsify-plugin-flexible-alerts
+
+```
+MIT License
+
+Copyright (c) 2019 Fabian Zankl
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### docsify-tabs
+
+```
+MIT License
+
+Copyright (c) 2018 John Hildenbiddle
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
