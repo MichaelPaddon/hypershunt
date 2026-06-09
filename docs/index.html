@@ -7,6 +7,33 @@
   <link rel="icon" type="image/svg+xml" href="hypershunt-favicon.svg">
   <link rel="stylesheet" href="vendor/vue.css">
   <style>
+    /* Theme variables.  vue.css hardcodes its colours (it exposes only
+       --theme-color), so dark mode can't be a variable swap of the
+       theme itself; instead we drive our *own* custom surfaces (cards,
+       KDL palette) from these vars and override docsify's chrome
+       explicitly in the [data-theme="dark"] block further down. */
+    :root {
+      --hs-card-bg: #fafdff;
+      --hs-card-shadow: rgba(0, 0, 0, 0.07);
+      --hs-kdl-keyword: #c0392b;
+      --hs-kdl-property: #2980b9;
+      --hs-kdl-string: #16a085;
+      --hs-kdl-litnum: #8e44ad;
+      --hs-kdl-comment: #7f8c8d;
+      --hs-kdl-punct: #34495e;
+    }
+    :root[data-theme="dark"] {
+      --hs-card-bg: #1b2733;
+      --hs-card-shadow: rgba(0, 0, 0, 0.5);
+      /* Same hues as light, lifted in lightness for a dark ground. */
+      --hs-kdl-keyword: #e74c3c;
+      --hs-kdl-property: #5dade2;
+      --hs-kdl-string: #48c9b0;
+      --hs-kdl-litnum: #bb8fce;
+      --hs-kdl-comment: #95a5a6;
+      --hs-kdl-punct: #aab7c4;
+    }
+
     /* Slightly tighter sidebar font + better code blocks. */
     .sidebar { font-size: 14.5px; }
     pre[data-lang] { position: relative; }
@@ -25,12 +52,12 @@
       padding: 1.1rem 1.2rem;
       border: 1px solid var(--theme-color, #42b983);
       border-radius: 8px;
-      background: #fafdff;
+      background: var(--hs-card-bg);
       transition: transform 0.12s ease, box-shadow 0.12s ease;
     }
     .markdown-section .cards p:hover {
       transform: translateY(-2px);
-      box-shadow: 0 4px 16px rgba(0,0,0,0.07);
+      box-shadow: 0 4px 16px var(--hs-card-shadow);
     }
     .markdown-section .cards p a {
       font-weight: 700;
@@ -40,13 +67,13 @@
     }
     .markdown-section .cards p a:hover { text-decoration: underline; }
 
-    /* KDL syntax-highlight palette (matches the vue theme). */
-    .token.keyword { color: #c0392b; font-weight: 600; }
-    .token.property, .token.attr-name { color: #2980b9; }
-    .token.string { color: #16a085; }
-    .token.boolean, .token.number { color: #8e44ad; }
-    .token.comment { color: #7f8c8d; font-style: italic; }
-    .token.punctuation { color: #34495e; }
+    /* KDL syntax-highlight palette (driven by the theme vars above). */
+    .token.keyword { color: var(--hs-kdl-keyword); font-weight: 600; }
+    .token.property, .token.attr-name { color: var(--hs-kdl-property); }
+    .token.string { color: var(--hs-kdl-string); }
+    .token.boolean, .token.number { color: var(--hs-kdl-litnum); }
+    .token.comment { color: var(--hs-kdl-comment); font-style: italic; }
+    .token.punctuation { color: var(--hs-kdl-punct); }
 
     /* On-page table of contents (docsify-plugin-toc).  The plugin
        inserts <aside class="toc-nav"> immediately before .content and
@@ -133,7 +160,97 @@
     }
     #scroll-top:hover { opacity: 1; }
     #scroll-top.show { display: block; }
+
+    /* Theme toggle button (injected by the inline plugin below),
+       mirrored in the opposite corner from back-to-top. */
+    #theme-toggle {
+      position: fixed;
+      left: 1.2rem;
+      bottom: 1.2rem;
+      z-index: 30;
+      padding: 0.4rem 0.7rem;
+      font: 600 12px/1 sans-serif;
+      color: #fff;
+      background: var(--theme-color, #42b983);
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      opacity: 0.85;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+    }
+    #theme-toggle:hover { opacity: 1; }
+
+    /* ---- Dark theme ---------------------------------------------------
+       vue.css hardcodes its colours, so dark mode is a set of explicit
+       overrides scoped under :root[data-theme="dark"].  These rules are
+       more specific than the plugin/theme defaults, so source order
+       doesn't matter (e.g. flexible-alerts injects its <style> at run
+       time, after this block, but our scoped selector still wins). */
+    :root[data-theme="dark"] body,
+    :root[data-theme="dark"] .sidebar,
+    :root[data-theme="dark"] .content { background: #0f1620; }
+    :root[data-theme="dark"] body { color: #c8d2dc; }
+    :root[data-theme="dark"] .sidebar {
+      color: #c8d2dc;
+      border-right: 1px solid #243140;
+    }
+    :root[data-theme="dark"] .sidebar a,
+    :root[data-theme="dark"] .sidebar .sidebar-nav li > a { color: #c8d2dc; }
+    :root[data-theme="dark"] .app-name-link { color: #fff; }
+    :root[data-theme="dark"] .markdown-section { color: #c8d2dc; }
+    :root[data-theme="dark"] .markdown-section a { color: #5dade2; }
+    :root[data-theme="dark"] .markdown-section h1,
+    :root[data-theme="dark"] .markdown-section h2,
+    :root[data-theme="dark"] .markdown-section h3,
+    :root[data-theme="dark"] .markdown-section h4 { color: #e7edf3; }
+    :root[data-theme="dark"] .markdown-section code,
+    :root[data-theme="dark"] .markdown-section pre {
+      background: #18222e;
+      color: #d6dee7;
+    }
+    :root[data-theme="dark"] .markdown-section pre > code { background: transparent; }
+    :root[data-theme="dark"] .markdown-section blockquote {
+      color: #aab7c4;
+      border-left-color: #3a4b5c;
+    }
+    :root[data-theme="dark"] .markdown-section tr { background: #0f1620; }
+    :root[data-theme="dark"] .markdown-section tr:nth-child(2n) { background: #131c26; }
+    :root[data-theme="dark"] .markdown-section td,
+    :root[data-theme="dark"] .markdown-section th { border-color: #243140; }
+    :root[data-theme="dark"] .markdown-section hr { border-bottom-color: #243140; }
+    /* Search box + results */
+    :root[data-theme="dark"] .search input {
+      background: #18222e;
+      color: #c8d2dc;
+      border-color: #243140;
+    }
+    :root[data-theme="dark"] .search,
+    :root[data-theme="dark"] .search .results-panel { border-color: #243140; }
+    :root[data-theme="dark"] .search .matching-post { border-bottom: 1px solid #243140; }
+    :root[data-theme="dark"] .search p { color: #aab7c4; }
+    /* On-page TOC */
+    :root[data-theme="dark"] .toc-nav { border-left-color: #243140; }
+    :root[data-theme="dark"] .toc-nav a { color: #8b97a3; }
+    /* Admonitions: keep the plugin's coloured accent, darken the fill. */
+    :root[data-theme="dark"] .alert {
+      background: #18222e;
+      color: #c8d2dc;
+    }
   </style>
+
+  <!-- Apply the saved (or OS-preferred) theme before first paint so the
+       page never flashes light then dark. -->
+  <script>
+    (function () {
+      var saved = null;
+      try { saved = localStorage.getItem('hs-theme'); } catch (e) {}
+      var dark = saved
+        ? saved === 'dark'
+        : window.matchMedia &&
+          window.matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    })();
+  </script>
 </head>
 <body>
   <div id="app">Loading documentation&hellip;</div>
@@ -200,6 +317,36 @@
           btn.classList.toggle('show', window.scrollY > 400);
         };
         document.addEventListener('scroll', sync, { passive: true });
+        sync();
+      });
+    }, window.$docsify.plugins || []);
+  </script>
+
+  <!-- Dark/light theme toggle.  Inline (no dependency): flips the
+       data-theme attribute the head script seeds and persists the
+       choice. Plain-text label, no emoji. -->
+  <script>
+    window.$docsify.plugins = [].concat(function (hook) {
+      hook.mounted(function () {
+        var root = document.documentElement;
+        var btn = document.createElement('button');
+        btn.id = 'theme-toggle';
+        btn.type = 'button';
+        var sync = function () {
+          var dark = root.dataset.theme === 'dark';
+          btn.textContent = dark ? 'Light' : 'Dark';
+          btn.setAttribute(
+            'aria-label',
+            dark ? 'Switch to light theme' : 'Switch to dark theme'
+          );
+        };
+        btn.addEventListener('click', function () {
+          var next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+          root.dataset.theme = next;
+          try { localStorage.setItem('hs-theme', next); } catch (e) {}
+          sync();
+        });
+        document.body.appendChild(btn);
         sync();
       });
     }, window.$docsify.plugins || []);
