@@ -1,6 +1,7 @@
 - Getting started
 
   - [Quick start](quickstart.md)
+  - [Recipes](recipes.md)
 
 - Configuration guide
 
