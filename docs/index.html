@@ -265,6 +265,18 @@
       background: var(--theme-color, #42b983);
       border-color: var(--theme-color, #42b983);
     }
+
+    /* "Edit this page" footer link, appended by the inline plugin. */
+    .edit-page {
+      margin-top: 3rem;
+      padding-top: 1rem;
+      border-top: 1px solid #eee;
+      font-size: 13px;
+      text-align: right;
+    }
+    .edit-page a { color: #7f8c8d; }
+    :root[data-theme="dark"] .edit-page { border-top-color: #243140; }
+    :root[data-theme="dark"] .edit-page a { color: #8b97a3; }
   </style>
 
   <!-- Apply the saved (or OS-preferred) theme before first paint so the
@@ -388,6 +400,25 @@
         });
         document.body.appendChild(btn);
         sync();
+      });
+    }, window.$docsify.plugins || []);
+  </script>
+
+  <!-- "Edit this page on GitHub" link.  Inline (no dependency): an
+       afterEach hook appends a footer link built from the configured
+       repo and the current file. Skipped for the generated man page
+       and for routes with no backing file (cover/home root). -->
+  <script>
+    window.$docsify.plugins = [].concat(function (hook, vm) {
+      hook.afterEach(function (html, next) {
+        var file = vm.route.file;
+        if (!file || file === 'manual.md') { next(html); return; }
+        var url = window.$docsify.repo + '/blob/main/docs/' + file;
+        next(
+          html +
+          '<p class="edit-page"><a href="' + url +
+          '" target="_blank" rel="noopener">Edit this page on GitHub</a></p>'
+        );
       });
     }, window.$docsify.plugins || []);
   </script>
