@@ -1,9 +1,11 @@
 # Troubleshooting
 
 Common symptoms, their usual cause, and the fix.  Each entry links to
-the chapter that covers the feature in depth.  Always start by
-validating the config (below) — most "it won't start" reports are a
-parse or validation error.
+the chapter that covers the feature in depth.
+
+> [!TIP]
+> Most "it won't start" reports are a config parse or validation error.
+> Run `--check-config` (below) before anything else.
 
 ## Validate the config first
 
@@ -57,9 +59,12 @@ retries hourly — check the logs for the ACME error text.  See
 
 ### Hitting Let's Encrypt rate limits while testing
 
-Production Let's Encrypt has strict per-domain issuance limits.  Point
-the ACME directory at the **staging** CA while iterating; staging certs
-aren't publicly trusted but exercise the same flow.
+> [!WARNING]
+> Production Let's Encrypt has strict per-domain issuance limits, and a
+> retry loop can burn through them fast.
+
+Point the ACME directory at the **staging** CA while iterating; staging
+certs aren't publicly trusted but exercise the same flow.
 
 ### Browser shows "not secure" / self-signed warning
 
