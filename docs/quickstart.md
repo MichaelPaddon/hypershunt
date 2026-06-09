@@ -179,6 +179,9 @@ podman stop hypershunt && podman rm hypershunt
 
 ## Troubleshooting
 
+A few common snags are below; the [Troubleshooting](troubleshooting.md)
+page covers more, including reverse-proxy, auth, and rate-limit issues.
+
 **`bind: address already in use`** -- another process is on
 that port.  Either stop the conflicting service or change the
 host port (`-p 8080:80`).
