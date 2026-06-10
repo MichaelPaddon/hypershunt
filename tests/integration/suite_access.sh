@@ -4,8 +4,8 @@
 suite_ip_access() {
     echo "=== IP access control ==="
     cat >"$TMPDIR/access.kdl" <<'EOF'
-listener "tcp://127.0.0.1:8082" default-vhost="allow-site"
-listener "tcp://127.0.0.1:8089" default-vhost="deny-site"
+listener "tcp://127.0.0.1:8082" { vhost "allow-site" }
+listener "tcp://127.0.0.1:8089" { vhost "deny-site" }
 vhost "allow-site" {
     location "/" {
         static root="/tmp/www" {

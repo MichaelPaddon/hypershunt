@@ -63,7 +63,7 @@ EOF
 suite_regex_vhost() {
     echo "=== Regex vhost ==="
     cat >"$TMPDIR/regex.kdl" <<'EOF'
-listener "tcp://127.0.0.1:8095" default-vhost=#null
+listener "tcp://127.0.0.1:8095" reject-unknown-host=#true
 vhost "static.local" {
     location "/" {
         redirect to="/static" code=301
@@ -84,7 +84,7 @@ EOF
     # Regex match for a subdomain pattern.
     assert_header "regex_vhost/regex" "Location" "/regex" \
         "http://127.0.0.1:8095/" -H "Host: api.regex.local" --no-location
-    # Unmatched host with null default → 404.
+    # Unmatched host on a reject-unknown-host listener → 404.
     assert_status "regex_vhost/no_match" 404 \
         "http://127.0.0.1:8095/" -H "Host: other.local"
 

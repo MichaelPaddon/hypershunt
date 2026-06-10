@@ -64,7 +64,7 @@
     fn routes_by_host() {
         let config = make_config(
             r#"
-            listener "tcp://0.0.0.0:80" default-vhost="a.com"
+            listener "tcp://0.0.0.0:80"
             vhost "a.com" {
                 location "/" {
                     static root="/var/www/a"
@@ -91,9 +91,10 @@
 
     #[test]
     fn falls_back_to_default_vhost() {
+        // First declared vhost is the implicit default fallback.
         let config = make_config(
             r#"
-            listener "tcp://0.0.0.0:80" default-vhost="a.com"
+            listener "tcp://0.0.0.0:80"
             vhost "a.com" {
                 location "/" {
                     static root="/var/www/a"
@@ -137,7 +138,7 @@
     fn regex_vhost_does_not_match_unrelated_host() {
         let config = make_config(
             r#"
-            listener "tcp://0.0.0.0:80" default-vhost=#null
+            listener "tcp://0.0.0.0:80" reject-unknown-host=#true
             vhost ".+\\.example\\.com" regex=#true {
                 location "/" {
                     static root="/var/www/example"
@@ -184,7 +185,7 @@
     fn regex_patterns_checked_in_config_order() {
         let config = make_config(
             r#"
-            listener "tcp://0.0.0.0:80" default-vhost=#null
+            listener "tcp://0.0.0.0:80" reject-unknown-host=#true
             vhost ".*\\.com" regex=#true {
                 location "/first/" {
                     static root="/first"
@@ -208,7 +209,7 @@
     fn regex_alias_matches() {
         let config = make_config(
             r#"
-            listener "tcp://0.0.0.0:80" default-vhost=#null
+            listener "tcp://0.0.0.0:80" reject-unknown-host=#true
             vhost "example.com" {
                 alias ".+\\.example\\.com" regex=#true
                 location "/" {
@@ -253,15 +254,16 @@
 
     #[test]
     fn regex_vhost_as_explicit_default() {
+        // A named regex vhost listed first becomes the listener default.
         let config = make_config(
             r#"
-            listener "tcp://0.0.0.0:80" default-vhost=".+\\.example\\.com"
+            listener "tcp://0.0.0.0:80" { vhost "wild" "exact.com" }
             vhost "exact.com" {
                 location "/exact/" {
                     static root="/exact"
                 }
             }
-            vhost ".+\\.example\\.com" regex=#true {
+            vhost ".+\\.example\\.com" regex=#true name="wild" {
                 location "/wild/" {
                     static root="/wild"
                 }
@@ -345,7 +347,7 @@
     fn absent_host_header_uses_default_vhost() {
         let config = make_config(
             r#"
-            listener "tcp://0.0.0.0:80" default-vhost="fallback.com"
+            listener "tcp://0.0.0.0:80"
             vhost "fallback.com" {
                 location "/" {
                     static root="/var/www/fallback"
@@ -1224,4 +1226,160 @@
             .body(())
             .unwrap();
         assert!(router.route(&mut req, "tcp://0.0.0.0:80").is_none());
+    }
+
+    // -- per-listener vhost scoping --------------------------------
+
+    // Resolve a host on a listener and return the matched vhost's
+    // config name (its primary host pattern), or None.
+    fn resolved_name(
+        router: &Router,
+        host: &str,
+        bind: &str,
+    ) -> Option<String> {
+        router
+            .resolve_vhost(Some(strip_port(host)), bind)
+            .map(|v| v.name.to_string())
+    }
+
+    #[test]
+    fn explicit_lists_give_per_listener_subsets() {
+        // Each listener serves exactly its listed vhost; an unknown
+        // host on a reject-unknown-host listener gets no route.
+        let config = make_config(
+            r#"
+            listener "tcp://0.0.0.0:80"  reject-unknown-host=#true { vhost "a.com" }
+            listener "tcp://0.0.0.0:443" reject-unknown-host=#true { vhost "b.com" }
+            vhost "a.com" { location "/" { static root="/a" } }
+            vhost "b.com" { location "/" { static root="/b" } }
+            "#,
+        );
+        let router = make_router(&config);
+        assert_eq!(
+            resolved_name(&router, "a.com", "tcp://0.0.0.0:80").as_deref(),
+            Some("a.com")
+        );
+        // b.com is not in :80's set -> excluded -> no route.
+        assert_eq!(resolved_name(&router, "b.com", "tcp://0.0.0.0:80"), None);
+        assert_eq!(
+            resolved_name(&router, "b.com", "tcp://0.0.0.0:443").as_deref(),
+            Some("b.com")
+        );
+        assert_eq!(resolved_name(&router, "a.com", "tcp://0.0.0.0:443"), None);
+    }
+
+    #[test]
+    fn same_name_different_content_per_listener() {
+        // Two vhosts share the host "example.com" but carry distinct
+        // handles; each listener selects a different one.
+        let config = make_config(
+            r#"
+            listener "tcp://0.0.0.0:80"  { vhost "lan" }
+            listener "tcp://0.0.0.0:443" { vhost "pub" }
+            vhost "example.com" name="lan" { location "/lan/" { static root="/lan" } }
+            vhost "example.com" name="pub" { location "/pub/" { static root="/pub" } }
+            "#,
+        );
+        let router = make_router(&config);
+        // :80 serves the "lan" content for example.com ...
+        assert_eq!(
+            route_str(&router, "example.com", "/lan/x", "tcp://0.0.0.0:80"),
+            Some("/lan/".into())
+        );
+        assert_eq!(
+            route_str(&router, "example.com", "/pub/x", "tcp://0.0.0.0:80"),
+            None
+        );
+        // ... while :443 serves the "pub" content for the same host.
+        assert_eq!(
+            route_str(&router, "example.com", "/pub/x", "tcp://0.0.0.0:443"),
+            Some("/pub/".into())
+        );
+    }
+
+    #[test]
+    fn explicit_only_excluded_from_implicit_set() {
+        let config = make_config(
+            r#"
+            listener "tcp://0.0.0.0:80"  reject-unknown-host=#true
+            listener "tcp://0.0.0.0:443" { vhost "site" "admin" }
+            vhost "site.com" name="site" { location "/" { static root="/s" } }
+            vhost "admin.internal" name="admin" explicit-only=#true {
+                location "/" { static root="/a" }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        // Implicit listener serves site.com but not the explicit-only admin.
+        assert_eq!(
+            resolved_name(&router, "site.com", "tcp://0.0.0.0:80").as_deref(),
+            Some("site.com")
+        );
+        assert_eq!(
+            resolved_name(&router, "admin.internal", "tcp://0.0.0.0:80"),
+            None
+        );
+        // The listener that names admin reaches it.
+        assert_eq!(
+            resolved_name(&router, "admin.internal", "tcp://0.0.0.0:443")
+                .as_deref(),
+            Some("admin.internal")
+        );
+    }
+
+    #[test]
+    fn reject_unknown_host_has_no_default() {
+        let config = make_config(
+            r#"
+            listener "tcp://0.0.0.0:80" reject-unknown-host=#true
+            vhost "known.com" { location "/" { static root="." } }
+            "#,
+        );
+        let router = make_router(&config);
+        assert!(
+            router
+                .resolve_vhost(Some("nope.com"), "tcp://0.0.0.0:80")
+                .is_none()
+        );
+        assert!(
+            router.resolve_vhost(None, "tcp://0.0.0.0:80").is_none()
+        );
+    }
+
+    #[test]
+    fn vhost_handle_defaults_to_host_pattern() {
+        // No name= -> referenced by its host pattern.
+        let config = make_config(
+            r#"
+            listener "tcp://0.0.0.0:80" { vhost "example.com" }
+            vhost "example.com" { location "/" { static root="." } }
+            "#,
+        );
+        let router = make_router(&config);
+        assert_eq!(
+            route_str(&router, "example.com", "/", "tcp://0.0.0.0:80"),
+            Some("/".into())
+        );
+    }
+
+    #[test]
+    fn shared_vhost_served_on_every_listener() {
+        // Regression: with no scoping, every listener serves every vhost
+        // exactly as before.
+        let config = make_config(
+            r#"
+            listener "tcp://0.0.0.0:80"
+            listener "tcp://0.0.0.0:443"
+            vhost "a.com" { location "/" { static root="/a" } }
+            "#,
+        );
+        let router = make_router(&config);
+        assert_eq!(
+            route_str(&router, "a.com", "/", "tcp://0.0.0.0:80"),
+            Some("/".into())
+        );
+        assert_eq!(
+            route_str(&router, "a.com", "/", "tcp://0.0.0.0:443"),
+            Some("/".into())
+        );
     }

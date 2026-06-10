@@ -65,6 +65,46 @@ EOF
     rm -rf /tmp/reload-a /tmp/reload-b
 }
 
+# Changing a listener's per-vhost scoping via SIGHUP must take effect:
+# the router is rebuilt and the per-listener vhost table swapped in.
+# Start with the implicit set (both hosts served), then restrict the
+# listener to one vhost with reject-unknown-host and confirm the other
+# host now 404s while the kept one still serves.
+suite_reload_vhost_scoping() {
+    echo "=== SIGHUP: per-listener vhost scoping change ==="
+    cat >"$TMPDIR/reload.kdl" <<'EOF'
+listener "tcp://127.0.0.1:18307"
+vhost "a.local" { location "/" { redirect to="/a" code=301 } }
+vhost "b.local" { location "/" { redirect to="/b" code=301 } }
+EOF
+    start_server "$TMPDIR/reload.kdl" 18307 \
+        || { fail "reload/scoping/start"; return; }
+
+    # Implicit set: both hosts are reachable.
+    assert_header "reload/scoping/before_a" "Location" "/a" \
+        "http://127.0.0.1:18307/" -H "Host: a.local" --no-location
+    assert_header "reload/scoping/before_b" "Location" "/b" \
+        "http://127.0.0.1:18307/" -H "Host: b.local" --no-location
+
+    # Restrict the listener to a.local and reject unknown hosts.
+    cat >"$TMPDIR/reload.kdl" <<'EOF'
+listener "tcp://127.0.0.1:18307" reject-unknown-host=#true {
+    vhost "a.local"
+}
+vhost "a.local" { location "/" { redirect to="/a" code=301 } }
+vhost "b.local" { location "/" { redirect to="/b" code=301 } }
+EOF
+    reload_via_sighup "$TMPDIR/reload.kdl"
+
+    # a.local still served; b.local is now out of the listener's set.
+    assert_header "reload/scoping/after_a" "Location" "/a" \
+        "http://127.0.0.1:18307/" -H "Host: a.local" --no-location
+    assert_status "reload/scoping/after_b" 404 \
+        "http://127.0.0.1:18307/" -H "Host: b.local"
+
+    stop_server
+}
+
 # A slow download started before SIGHUP must complete from the *old*
 # vhost root; the post-reload request sees the new root.  Verifies
 # the per-connection AppState snapshot semantics.

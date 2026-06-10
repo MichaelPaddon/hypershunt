@@ -28,8 +28,8 @@ EOF
 server {
     auth "file" path="$TMPDIR/htpasswd"
 }
-listener "tcp://127.0.0.1:8193"
-listener "tcp://127.0.0.1:8194" default-vhost="groups-only"
+listener "tcp://127.0.0.1:8193" { vhost "localhost" }
+listener "tcp://127.0.0.1:8194" { vhost "groups-only" }
 vhost localhost {
     location "/" {
         static root="/tmp/www" {

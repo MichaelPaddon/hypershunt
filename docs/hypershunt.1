@@ -81,6 +81,11 @@ child (self-signed, PEM file, or ACME/Let\(aqs Encrypt)
 and a
 .B timeouts
 child.
+By default a listener serves every defined virtual host.
+Add one or more
+.B vhost
+reference children to serve only a chosen subset (different sets of
+virtual hosts on different ports).
 .TP
 .B vhost
 Maps one or more hostnames to URL routing rules.

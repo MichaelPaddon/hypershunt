@@ -124,6 +124,17 @@ block instead of the FastCGI binary record protocol.
 letting one server serve many domains.  hypershunt matches literal
 hostnames first, then regex patterns; see
 [Virtual hosts](guide.md#virtual-hosts) and [`vhost`](reference.md#vhost).
+By default every listener serves every vhost; a listener can instead
+serve a chosen subset — see
+[Per-listener vhost scoping](guide.md#per-listener-vhost-scoping).
+
+## explicit-only vhost
+
+A vhost marked [`explicit-only=#true`](reference.md#explicit-only) is
+left out of a listener's implicit (all-vhosts) set, so only listeners
+that name it in their [`vhost`](reference.md#vhost-listener-child) list
+can reach it.  Used for admin or internal sites that shouldn't be
+exposed by a listener that didn't ask for them.
 
 ## location
 

@@ -35,8 +35,8 @@ Read top to bottom:
 - `vhost "example.com"` claims the HTTP `Host: example.com`
   header.  Vhosts are matched literally first, then by regex
   (when [`regex=#true`](reference.md#regex) is set), then by the
-  listener's [`default-vhost`](reference.md#default-vhost)
-  fallback.
+  listener's default (its first vhost) -- see
+  [Per-listener vhost scoping](#per-listener-vhost-scoping).
 - `location "/"` matches every request path inside the vhost.
   Multiple locations are matched by **longest prefix**, so a
   more specific `/api/` would win over the `/` catch-all.
@@ -216,10 +216,12 @@ handler](reference.md#static) for every knob.
 ## Virtual hosts
 
 A [`vhost`](reference.md#vhost) claims one or more `Host:` header
-values.  Matching order per request: every exact literal name
-(O(1) hash lookup), then every regex pattern in declaration
-order, then the listener's
-[`default-vhost`](reference.md#default-vhost).
+values.  Matching order per request, **within the listener's vhost
+set**: every exact literal name (O(1) hash lookup), then every
+regex pattern in list order, then the listener's default (its first
+vhost).  By default every listener serves every vhost; see
+[Per-listener vhost scoping](#per-listener-vhost-scoping) to serve
+different sets per port.
 
 ```kdl
 vhost "example.com" {
@@ -260,14 +262,16 @@ to add the anchors yourself.  Regex vhosts cost more per request
 than literal ones -- list literals first and use regex as a
 fallback or for genuinely variable subdomains.
 
-### Default-vhost fallback
+### Per-listener vhost scoping
 
-A literal that catches everything the others miss:
+Vhosts are defined once at the top level.  By default **every
+listener serves every vhost**, and the first vhost declared is the
+fallback served when a request `Host` matches nothing:
 
 ```kdl
-listener "tcp://[::]:80" default-vhost="example.com"
+listener "tcp://[::]:80"
 
-vhost "example.com" {
+vhost "example.com" {            # first declared -> the default
     location "/" { static root="/var/www/example" }
 }
 vhost "api.example.com" {
@@ -275,9 +279,39 @@ vhost "api.example.com" {
 }
 ```
 
-Without `default-vhost=` the first vhost defined in the file
-wins.  Set [`default-vhost=#null`](reference.md#default-vhost) to
-return `404` for unrecognised hosts instead.
+To serve a **different set of vhosts per port**, give a listener a
+[`vhost`](reference.md#vhost-listener-child) reference list.  A
+listener with a list serves exactly those vhosts, in order, and its
+first entry is the default:
+
+```kdl
+vhost "public.example.com"  name="public"  { location "/" { static root="/srv/pub" } }
+vhost "admin.example.com"   name="admin" explicit-only=#true {
+    location "/" { proxy { upstream "http://127.0.0.1:9000" } }
+}
+
+listener "tcp://[::]:80"   { vhost "public" }            # public only
+listener "tcp://[::]:8443" { tls "self-signed"; vhost "public" "admin" }
+```
+
+Two vhosts may even share a `Host` and serve **different content per
+port** -- give them distinct [`name`](reference.md#name-vhost) handles and
+list a different one on each listener:
+
+```kdl
+vhost "example.com" name="lan" { location "/" { static root="/srv/lan" } }
+vhost "example.com" name="pub" { location "/" { static root="/srv/pub" } }
+
+listener "tcp://[::]:80"  { vhost "lan" }
+listener "tcp://[::]:443" { tls "self-signed"; vhost "pub" }
+```
+
+Mark a vhost [`explicit-only=#true`](reference.md#explicit-only) to
+keep it out of the implicit all-vhosts set, so only listeners that
+name it can reach it.  Set
+[`reject-unknown-host=#true`](reference.md#reject-unknown-host) on a
+listener to drop the default fallback and return `404` for
+unrecognised hosts instead.
 
 ### Per-vhost ALPN
 
@@ -301,7 +335,7 @@ the right config from the SNI in the ClientHello).  Regex vhosts
 and QUIC listeners fall back to the listener default.
 
 **See also**: [Reference -- vhost](reference.md#vhost),
-[`default-vhost`](reference.md#default-vhost),
+[listener `vhost` list](reference.md#vhost-listener-child),
 [ALPN on a listener](reference.md#alpn).
 
 ## Locations and routing

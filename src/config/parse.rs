@@ -102,6 +102,12 @@ pub(super) fn check_misnesting(
         let parent = node.name().value();
         for child in children.nodes() {
             let cn = child.name().value();
+            // A `vhost` inside a `listener` is a legal reference list
+            // (selecting which top-level vhosts the listener serves),
+            // not a misnested definition -- so exempt that one pairing.
+            if parent == "listener" && cn == "vhost" {
+                continue;
+            }
             if TOP_LEVEL_ONLY.contains(&cn) {
                 let line = node_line(src, child);
                 let parent_line = node_line(src, node);
@@ -133,19 +139,6 @@ pub(super) fn prop_bool(node: &KdlNode, key: &str) -> Option<bool> {
 }
 pub(super) fn prop_i64(node: &KdlNode, key: &str) -> Option<i64> {
     node.get(key).and_then(|e| e.as_integer()).map(|n| n as i64)
-}
-
-// Three-way: property absent, property = #null, or property = string.
-pub(super) fn prop_null_or_str(
-    node: &KdlNode,
-    key: &str,
-) -> Option<Option<String>> {
-    let v = node.get(key)?;
-    Some(if v.is_null() {
-        None
-    } else {
-        v.as_string().map(String::from)
-    })
 }
 
 // Collect every value of a repeating single-arg child by name.
@@ -376,15 +369,14 @@ fn parse_geoip(
     Ok(GeoIpConfig { db })
 }
 
-// Returns (config, raw_default_vhost) where raw_default_vhost is:
-//   None          - child node absent; resolved to first vhost
-//   Some(None)    - explicitly set to null
-//   Some(Some(s)) - explicitly set to a hostname string
+// Parse a `listener` node.  The listener's effective vhost set is
+// resolved later by the router (implicit = all non-explicit-only
+// vhosts; explicit = the `vhost` reference list, first entry default).
 pub(super) fn parse_listener(
     node: &KdlNode,
     src: &str,
     name: &str,
-) -> anyhow::Result<(ListenerConfig, Option<Option<String>>)> {
+) -> anyhow::Result<ListenerConfig> {
     let line = node_line(src, node);
     let bind_str = req_arg_str(node, 0).with_context(|| {
         format!("{name}:{line}: listener requires a bind URL")
@@ -464,12 +456,19 @@ pub(super) fn parse_listener(
     let proxy_node = children.iter().find(|n| n.name().value() == "proxy");
     if let Some(proxy) = proxy_node {
         let proxy_line = node_line(src, proxy);
-        // HTTP-only options are invalid in L4-proxy mode.
-        if node.get("default-vhost").is_some() {
+        // HTTP-only options are invalid in L4-proxy mode: an L4 proxy
+        // forwards bytes/datagrams and never routes by virtual host.
+        if children.iter().any(|n| n.name().value() == "vhost") {
             bail!(
-                "{name}:{proxy_line}: 'default-vhost' is only valid in \
-                 HTTP listeners; L4 proxy listeners do not route by \
-                 virtual host"
+                "{name}:{proxy_line}: 'vhost' is only valid in HTTP \
+                 listeners; L4 proxy listeners do not route by virtual \
+                 host"
+            );
+        }
+        if node.get("reject-unknown-host").is_some() {
+            bail!(
+                "{name}:{proxy_line}: 'reject-unknown-host' is only \
+                 valid in HTTP listeners"
             );
         }
         if children.iter().any(|n| n.name().value() == "timeouts") {
@@ -532,25 +531,22 @@ pub(super) fn parse_listener(
         }
         let max_connections =
             prop_i64(node, "max-connections").map(|n| n as u32);
-        return Ok((
-            ListenerConfig {
-                bind,
-                tls,
-                proxy: proxy_cfg,
-                accept_proxy_protocol,
-                trusted_proxies,
-                default_vhost: None,
-                timeouts: Timeouts::default(),
-                max_connections,
-                max_request_body: None,
-                auto_alt_svc: None,
-                alpn: alpn.clone(),
-                quic_transport: quic_transport.clone(),
-                line,
-            },
-            // No raw default-vhost for proxy listeners.
-            Some(None),
-        ));
+        return Ok(ListenerConfig {
+            bind,
+            tls,
+            proxy: proxy_cfg,
+            accept_proxy_protocol,
+            trusted_proxies,
+            vhosts: Vec::new(),
+            reject_unknown_host: false,
+            timeouts: Timeouts::default(),
+            max_connections,
+            max_request_body: None,
+            auto_alt_svc: None,
+            alpn: alpn.clone(),
+            quic_transport: quic_transport.clone(),
+            line,
+        });
     }
 
     // HTTP mode.
@@ -561,7 +557,31 @@ pub(super) fn parse_listener(
              for stream listeners; put 'policy' inside a 'location' block"
         );
     }
-    let raw_default_vhost = prop_null_or_str(node, "default-vhost");
+    // Vhost reference list.  Each `vhost` child contributes its
+    // positional args (e.g. `vhost "lan" "admin"`); multiple children
+    // concatenate, preserving order.  A `vhost` child is a *reference*,
+    // not a definition: it carries no block and at least one name.
+    let mut vhosts: Vec<String> = Vec::new();
+    for c in children.iter().filter(|n| n.name().value() == "vhost") {
+        let cl = node_line(src, c);
+        if c.children().is_some() {
+            bail!(
+                "{name}:{cl}: a 'vhost' inside a listener is a reference \
+                 to a top-level vhost and cannot have a block; define \
+                 the vhost at top level and list its name here"
+            );
+        }
+        let refs = arg_strs(c);
+        if refs.is_empty() {
+            bail!(
+                "{name}:{cl}: 'vhost' requires at least one vhost name \
+                 (e.g. `vhost \"example.com\"`)"
+            );
+        }
+        vhosts.extend(refs);
+    }
+    let reject_unknown_host =
+        prop_bool(node, "reject-unknown-host").unwrap_or(false);
     let timeouts = children
         .iter()
         .find(|n| n.name().value() == "timeouts")
@@ -581,25 +601,22 @@ pub(super) fn parse_listener(
         prop_i64(node, "max-connections").map(|n| n as u32);
     let max_request_body =
         prop_i64(node, "max-request-body").map(|n| n as u64);
-    // default_vhost is resolved later in Config::parse.
-    Ok((
-        ListenerConfig {
-            bind,
-            tls,
-            proxy: None,
-            accept_proxy_protocol,
-            trusted_proxies,
-            default_vhost: None,
-            timeouts,
-            max_connections,
-            max_request_body,
-            auto_alt_svc: None,
-            alpn: alpn.clone(),
-            quic_transport: quic_transport.clone(),
-            line,
-        },
-        raw_default_vhost,
-    ))
+    Ok(ListenerConfig {
+        bind,
+        tls,
+        proxy: None,
+        accept_proxy_protocol,
+        trusted_proxies,
+        vhosts,
+        reject_unknown_host,
+        timeouts,
+        max_connections,
+        max_request_body,
+        auto_alt_svc: None,
+        alpn: alpn.clone(),
+        quic_transport: quic_transport.clone(),
+        line,
+    })
 }
 
 // Parse the listener's repeating `trusted-proxies "<cidr>"` children
@@ -706,10 +723,15 @@ pub(super) fn parse_vhost(
     } else {
         Some(alpn_values)
     };
+    // Optional reference handle and implicit-set opt-out.
+    let ref_name = prop_str(node, "name");
+    let explicit_only = prop_bool(node, "explicit-only").unwrap_or(false);
     Ok(VHostConfig {
         name: vhost_name,
         aliases,
         locations,
+        ref_name,
+        explicit_only,
         alpn,
         line: node_line(src, node),
     })

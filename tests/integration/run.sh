@@ -176,6 +176,7 @@ suite_access_log_common
 suite_access_log_combined
 suite_access_log_json
 suite_reload_routing_hot_swap
+suite_reload_vhost_scoping
 suite_reload_mid_flight_download
 suite_reload_listener_add_and_delete
 suite_reload_tls_listener_add
@@ -188,6 +189,7 @@ suite_upgrade_zero_downtime
 suite_upgrade_slow_download_survives
 suite_upgrade_listener_delete_closes_fd
 suite_upgrade_listener_add
+suite_upgrade_vhost_scoping
 suite_upgrade_drain_timeout_fires
 
 echo ""

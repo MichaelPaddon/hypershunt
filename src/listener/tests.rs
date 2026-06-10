@@ -50,7 +50,8 @@
             proxy: None,
             accept_proxy_protocol: None,
             trusted_proxies: Vec::new(),
-            default_vhost: None,
+            vhosts: Vec::new(),
+            reject_unknown_host: false,
             timeouts: Default::default(),
             max_connections: None,
             max_request_body: None,
@@ -88,7 +89,8 @@
             proxy: None,
             accept_proxy_protocol: None,
             trusted_proxies: Vec::new(),
-            default_vhost: None,
+            vhosts: Vec::new(),
+            reject_unknown_host: false,
             timeouts: Default::default(),
             max_connections: None,
             max_request_body: None,
@@ -793,12 +795,12 @@ index-file "index.html";
 
     // -- Vhost fallback -----------------------------------------------
 
-    /// Unknown host with null default returns 404.
+    /// Unknown host on a reject-unknown-host listener returns 404.
     #[tokio::test]
     async fn unknown_host_returns_404_without_default_vhost() {
         let srv = TestServer::start(
             r#"
-            listener "tcp://{addr}" default-vhost=#null
+            listener "tcp://{addr}" reject-unknown-host=#true
             vhost "example.com" {
                 location "/" {
                     redirect to="/dest" code=301
@@ -2634,7 +2636,8 @@ index-file "index.html";
             proxy: None,
             accept_proxy_protocol: None,
             trusted_proxies: Vec::new(),
-            default_vhost: None,
+            vhosts: Vec::new(),
+            reject_unknown_host: false,
             timeouts: Timeouts::default(),
             max_connections: None,
             max_request_body: None,

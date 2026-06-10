@@ -37,7 +37,7 @@ Configuration is written in KDL. The top-level nodes are:
 > Global settings: privilege drop user/group, state directory for ACME certificates and JWT signing keys, authentication back-end, and global TLS defaults.
 >
 > **listener**  
-> Opens a TCP socket (via **bind** or an inherited file descriptor via **fd**) and begins accepting connections. Each listener optionally has a **tls** child (self-signed, PEM file, or ACME/Let's Encrypt) and a **timeouts** child.
+> Opens a TCP socket (via **bind** or an inherited file descriptor via **fd**) and begins accepting connections. Each listener optionally has a **tls** child (self-signed, PEM file, or ACME/Let's Encrypt) and a **timeouts** child. By default a listener serves every defined virtual host. Add one or more **vhost** reference children to serve only a chosen subset (different sets of virtual hosts on different ports).
 >
 > **vhost**  
 > Maps one or more hostnames to URL routing rules. Names are matched against the **Host** request header; a leading **~** treats the name as a regular expression.
