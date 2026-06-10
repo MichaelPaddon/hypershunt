@@ -1245,21 +1245,65 @@ listener "tcp://127.0.0.1:8080" accept-proxy-protocol="v2" {
 [`proxy-protocol`](#proxy-protocol) (the outbound counterpart on
 the L4 proxy child).
 
-### default-vhost
+### vhost (listener child)
 
-**Property** on [`listener`](#listener).  Optional string or
-`#null`.
+**Child** of [`listener`](#listener).  One or more positional
+strings; repeatable.
 
-Names the [`vhost`](#vhost) used when the request's `Host` header
-matches no literal name and no regex pattern.  Set to `#null` to
-return `404` for unknown hosts instead of routing to a fallback.
+Selects which [`vhost`](#vhost)s this listener serves, by their
+reference handle (a vhost's [`name`](#name-vhost), defaulting to its host
+pattern).  Each `vhost` child contributes one or more names;
+multiple children concatenate, preserving order.  A listener `vhost`
+is a *reference* to a top-level vhost, never a definition, so it
+carries no block.
+
+- **No `vhost` child** -> the listener serves the **implicit set**:
+  every vhost not marked [`explicit-only`](#explicit-only), in
+  declaration order.
+- **One or more `vhost` children** -> the listener serves **exactly**
+  the listed vhosts, in the given order.  This is how you serve
+  different vhost sets on different ports, and how two vhosts that
+  share a host (distinguished by `name`) serve different content per
+  listener.
+
+The **first** vhost in the effective list (or, for the implicit set,
+the first declared vhost) is the listener's **default**: the vhost
+served when the request `Host` matches no literal name and no regex
+pattern.  Use [`reject-unknown-host`](#reject-unknown-host) to drop
+the default and return `404` instead.
 
 ```kdl
-listener "tcp://[::]:80" default-vhost="catchall" { }
-listener "tcp://[::]:80" default-vhost=#null { }
+# Per-port subsets, and a shared host with different content per port:
+vhost "example.com" name="lan" { location "/" { static root="/srv/lan" } }
+vhost "example.com" name="pub" { location "/" { static root="/srv/pub" } }
+vhost "admin" explicit-only=#true {
+    location "/" { proxy { upstream "http://127.0.0.1:9000" } }
+}
+
+listener "tcp://[::]:80"  { vhost "lan" "admin" }   # set [lan, admin]
+listener "tcp://[::]:443" { tls "self-signed"; vhost "pub" }
+listener "tcp://[::]:8080"                           # implicit: all non-explicit-only
 ```
 
-**Default:** the first vhost defined in the file.
+**Default:** none (the listener serves the implicit set).
+**See also:** [`name`](#name-vhost), [`explicit-only`](#explicit-only),
+[`reject-unknown-host`](#reject-unknown-host).
+
+### reject-unknown-host
+
+**Property** on [`listener`](#listener).  Optional boolean.
+
+When `#true`, a request whose `Host` matches no vhost on this
+listener gets a `404` instead of falling back to the listener's
+default (first) vhost.  Use it on a listener that must serve only
+known hosts, so probes with arbitrary `Host` headers don't reach a
+catch-all site.
+
+```kdl
+listener "tcp://[::]:80" reject-unknown-host=#true { vhost "example.com" }
+```
+
+**Default:** `#false` (unknown hosts fall back to the default vhost).
 
 ### max-connections
 
@@ -1802,15 +1846,58 @@ listener "tcp://0.0.0.0:5432" {
 ## vhost
 
 Virtual hosts route requests by `Host` header.  The positional
-argument is the name; setting `regex=#true` turns it into an
-anchored regex.  Matching order per request: exact literal
-(O(1)), then regex patterns in declaration order, then the
-listener's [`default-vhost`](#default-vhost) fallback.
+argument is the host-match pattern; setting `regex=#true` turns it
+into an anchored regex.  Vhosts are defined once at the top level;
+each [`listener`](#listener) then serves either every vhost (the
+default) or an explicit subset via its
+[`vhost`](#vhost-listener-child) child.
+
+Matching order per request, **within the matched listener's set**:
+exact literal `Host` (O(1)), then regex patterns in the listener's
+list order, then the listener's default (its first vhost, unless
+[`reject-unknown-host`](#reject-unknown-host) is set).
 
 ```kdl
 vhost "example.com" { alpn "http/1.1"; location "/" { static root="/var/www" } }
 vhost ".+\.example\.com" regex=#true { location "/" { static root="/var/www" } }
 ```
+
+### name (vhost)
+
+**Property** on [`vhost`](#vhost).  Optional string.
+
+The reference handle a listener [`vhost`](#vhost-listener-child)
+list uses to select this vhost.  It is distinct from the host-match
+pattern, so two vhosts can share a host (e.g. two `example.com`
+served on different listeners) yet be referenced unambiguously.
+Defaults to the positional host pattern, so a vhost needs an
+explicit `name` only when its pattern would otherwise collide or
+when you want a clean handle for a regex vhost.  Handles must be
+unique across all vhosts.
+
+```kdl
+vhost "example.com" name="lan" { location "/" { static root="/srv/lan" } }
+vhost "example.com" name="pub" { location "/" { static root="/srv/pub" } }
+```
+
+**Default:** the positional host pattern.
+
+### explicit-only
+
+**Property** on [`vhost`](#vhost).  Optional boolean.
+
+When `#true`, the vhost is left out of a listener's *implicit* set
+(the all-vhosts default).  It is then reachable only on listeners
+that name it in their [`vhost`](#vhost-listener-child) list.  Use it
+for an admin or internal vhost that should never be exposed by a
+listener that didn't ask for it.
+
+```kdl
+vhost "admin" explicit-only=#true { location "/" { static root="/srv/admin" } }
+listener "tcp://[::]:8443" { tls "self-signed"; vhost "admin" }
+```
+
+**Default:** `#false`.
 
 ### regex
 

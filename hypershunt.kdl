@@ -36,9 +36,11 @@ server user="hypershunt"
 // hypershunt process passing its sockets, it automatically detects and reuses
 // any inherited listening socket whose address matches a bind address.
 //
-// default-vhost chooses the virtual host used when no Host header
-// matches.  Omit it to fall back to the first vhost defined below;
-// set it to #null to return 404 for unrecognised hosts instead.
+// By default every listener serves every vhost defined below, and the
+// first vhost is the fallback used when no Host header matches.  Add a
+// `vhost "name" ...` child to a listener to serve only a chosen subset
+// (its first entry becomes that listener's default), or set
+// `reject-unknown-host=#true` to return 404 for unrecognised hosts.
 
 // Plain HTTP on port 80.
 // Required for ACME / Let's Encrypt HTTP-01 challenges -- Let's Encrypt
@@ -164,12 +166,16 @@ listener "tcp://[::]:443" {
 // Set regex=#true to treat the name as an anchored regular expression.
 //   vhost ".+\.example\.com" regex=#true { ... }
 //
-// Matching order per request:
+// Matching order per request (within the listener's vhost set):
 //   1. Exact literal match (all literal vhosts, O(1)).
-//   2. Regex patterns in config declaration order.
-//   3. Listener default-vhost fallback.
+//   2. Regex patterns in list order.
+//   3. Listener default (its first vhost), unless reject-unknown-host.
 //
 // alias adds extra names (literal or regex) that map to the same vhost.
+//
+// name= gives a vhost a reference handle for a listener `vhost` list
+// (defaults to the host pattern); explicit-only=#true keeps a vhost out
+// of the implicit all-vhosts set.
 
 vhost "localhost" {
     // Built-in status page: current load, request rates, latency

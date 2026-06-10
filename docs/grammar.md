@@ -97,8 +97,19 @@ properties and children.
 
 ### `vhost`
 
-`"vhost"` [`<string>`](#string) ( `regex=`[`<boolean>`](#boolean)
-)? `{` [`<vhost-child>`](#vhost-child)* `}`
+`"vhost"` [`<string>`](#string)
+[`<vhost-prop>`](#vhost-prop)* `{`
+[`<vhost-child>`](#vhost-child)* `}`
+
+### `vhost-prop`
+
+- `regex=`[`<boolean>`](#boolean)
+- `name=`[`<string>`](#string)
+- `explicit-only=`[`<boolean>`](#boolean)
+
+`name` is the reference handle a listener `vhost` list uses; it
+defaults to the host pattern (the positional argument).
+`explicit-only` keeps the vhost out of a listener's implicit set.
 
 ---
 
@@ -323,13 +334,14 @@ Prefixed children for repeating values of the wrapped backend:
 ### `listener-prop`
 
 - `accept-proxy-protocol=`( `"v1"` | `"v2"` )
-- `default-vhost=`( [`<string>`](#string) | `#null` )
+- `reject-unknown-host=`[`<boolean>`](#boolean)
 - `max-connections=`[`<integer>`](#integer)
 - `max-request-body=`[`<integer>`](#integer)
 
 ### `listener-child`
 
 - `"trusted-proxies"` [`<string>`](#string)
+- `"vhost"` [`<string>`](#string)+
 - [`<tls-node>`](#tls-node)
 - `"alpn"` [`<string>`](#string)
 - [`<quic-transport-block>`](#quic-transport-block)
@@ -339,7 +351,13 @@ Prefixed children for repeating values of the wrapped backend:
 - [`<timeouts-block>`](#timeouts-block)
 
 `trusted-proxies` and `alpn` are repeating single-argument
-children (rule 4).
+children (rule 4).  A `vhost` child is a *reference* (one or more
+top-level vhost names) selecting which vhosts this listener serves;
+it carries no block.  Multiple `vhost` children concatenate, in
+order.  With no `vhost` child the listener serves every vhost not
+marked `explicit-only`.  The first listed (or, implicitly, the
+first declared) vhost is the listener's default; `reject-unknown-host`
+suppresses that default so an unmatched Host yields `404`.
 
 ### `tls-node`
 

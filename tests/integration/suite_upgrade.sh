@@ -340,6 +340,47 @@ EOF
     rm -rf /tmp/up-e
 }
 
+# SIGUSR2 across a config that uses per-listener vhost scoping.  The
+# child re-parses the config and rebuilds its routing tables, so the
+# scoping (an explicit vhost list + reject-unknown-host) must hold in
+# the new process exactly as it did before the hand-off.
+suite_upgrade_vhost_scoping() {
+    echo "=== SIGUSR2: per-listener vhost scoping survives upgrade ==="
+    cat >"$TMPDIR/upgrade.kdl" <<'EOF'
+listener "tcp://127.0.0.1:18431" reject-unknown-host=#true {
+    vhost "a.local"
+}
+vhost "a.local" { location "/" { redirect to="/a" code=301 } }
+vhost "b.local" { location "/" { redirect to="/b" code=301 } }
+EOF
+    local parent
+    parent=$(start_upgrade_target "$TMPDIR/upgrade.kdl" 18431) \
+        || { fail "upgrade/scoping/start"; return; }
+
+    # Before the upgrade: a.local served, b.local excluded -> 404.
+    assert_header "upgrade/scoping/before_a" "Location" "/a" \
+        "http://127.0.0.1:18431/" -H "Host: a.local" --no-location
+    assert_status "upgrade/scoping/before_b" 404 \
+        "http://127.0.0.1:18431/" -H "Host: b.local"
+
+    # Re-exec with the same config; the child rebuilds its tables.
+    kill -USR2 "$parent"
+    if wait_for_pid_exit "$parent" 5; then
+        pass "upgrade/scoping/parent_exited"
+    else
+        fail "upgrade/scoping/parent_exited"
+        kill -KILL "$parent" 2>/dev/null || true
+    fi
+
+    # Scoping must hold in the new process.
+    assert_header "upgrade/scoping/after_a" "Location" "/a" \
+        "http://127.0.0.1:18431/" -H "Host: a.local" --no-location
+    assert_status "upgrade/scoping/after_b" 404 \
+        "http://127.0.0.1:18431/" -H "Host: b.local"
+
+    cleanup_hypershunts
+}
+
 suite_upgrade_drain_timeout_fires() {
     echo "=== SIGUSR2: graceful-drain-timeout force-closes stuck conns ==="
     mkdir -p /tmp/up-c

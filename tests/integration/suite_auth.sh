@@ -63,8 +63,8 @@ suite_ldap_auth() {
 server {
     auth "ldap" url="ldap://127.0.0.1:3890" bind-dn="uid={user},ou=people,dc=test,dc=local" base-dn="ou=groups,dc=test,dc=local"
 }
-listener "tcp://127.0.0.1:8090" default-vhost="ldap-auth"
-listener "tcp://127.0.0.1:8091" default-vhost="ldap-group"
+listener "tcp://127.0.0.1:8090" { vhost "ldap-auth" }
+listener "tcp://127.0.0.1:8091" { vhost "ldap-group" }
 vhost "ldap-auth" {
     location "/" {
         static root="/tmp/www" {

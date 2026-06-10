@@ -831,22 +831,9 @@ tls skip-verify=#true
     assert!(ut.skip_verify);
 }
 
-#[test]
-fn listener_proxy_default_vhost_rejected() {
-    let err = Config::parse(
-        r#"
-        listener "tcp://[::]:5432" default-vhost="foo" {
-            proxy "tcp://127.0.0.1:5432"
-}
-        "#,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        err.contains("only valid in HTTP listeners"),
-        "expected error, got: {err}"
-    );
-}
+// (proxy-listener rejection of HTTP-only vhost options is covered by
+// `proxy_listener_rejects_vhost_list` and
+// `proxy_listener_rejects_reject_unknown_host`.)
 
 #[test]
 fn listener_http_policy_rejected() {
@@ -1336,20 +1323,8 @@ fn aliases() {
     );
 }
 
-#[test]
-fn validate_missing_vhost() {
-    let result = Config::parse(
-        r#"
-        listener "tcp://0.0.0.0:80" default-vhost="does-not-exist"
-        vhost example.com {
-            location "/" {
-                static root="."
-            }
-        }
-        "#,
-    );
-    assert!(result.is_err());
-}
+// (a listener referencing an undefined vhost is covered by
+// `listener_vhost_reference_must_resolve`.)
 
 #[test]
 fn redirect_default_code() {
@@ -1395,7 +1370,7 @@ fn validate_rejects_missing_bind() {
     let result = Config::parse(
         r#"
         listener {
-            default-vhost "h"
+            vhost "h"
         }
         vhost "h" {
             location "/" {
@@ -1493,94 +1468,178 @@ fn tls_version_invalid() {
     assert!(result.is_err());
 }
 
-// -- default-vhost resolution -----------------------------------
+// -- per-listener vhost scoping (parsing) -----------------------
 
 #[test]
-fn default_vhost_absent_resolves_to_first_vhost() {
+fn listener_vhost_list_absent_is_implicit() {
+    // No `vhost` child -> empty list (the implicit, all-vhosts set);
+    // unknown hosts fall back to a default (reject flag off).
     let cfg = Config::parse(
         r#"
         listener "tcp://0.0.0.0:80"
-        vhost "first.com" {
-            location "/" {
-                static root="."
-            }
-        }
-        vhost "second.com" {
-            location "/" {
-                static root="."
-            }
-        }
+        vhost "first.com" { location "/" { static root="." } }
+        vhost "second.com" { location "/" { static root="." } }
         "#,
     )
     .unwrap();
-    assert_eq!(
-        cfg.listeners[0].default_vhost.as_deref(),
-        Some("first.com"),
-        "absent default-vhost should resolve to the first vhost"
-    );
+    assert!(cfg.listeners[0].vhosts.is_empty());
+    assert!(!cfg.listeners[0].reject_unknown_host);
 }
 
 #[test]
-fn default_vhost_explicit_null_means_no_default() {
+fn listener_vhost_list_parsed_in_order() {
+    // Multiple `vhost` children concatenate, preserving order.
     let cfg = Config::parse(
         r#"
-        listener "tcp://0.0.0.0:80" default-vhost=#null
-        vhost "h" {
-            location "/" {
-                static root="."
-            }
+        listener "tcp://0.0.0.0:80" {
+            vhost "a.com" "b.com"
+            vhost "c.com"
+        }
+        vhost "a.com" { location "/" { static root="." } }
+        vhost "b.com" { location "/" { static root="." } }
+        vhost "c.com" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(cfg.listeners[0].vhosts, ["a.com", "b.com", "c.com"]);
+}
+
+#[test]
+fn reject_unknown_host_parses() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80" reject-unknown-host=#true
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    assert!(cfg.listeners[0].reject_unknown_host);
+}
+
+#[test]
+fn vhost_name_and_explicit_only_parse() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80" { vhost "lan" "hidden" }
+        vhost "example.com" name="lan" { location "/" { static root="." } }
+        vhost "admin" name="hidden" explicit-only=#true {
+            location "/" { static root="." }
         }
         "#,
     )
     .unwrap();
+    assert_eq!(cfg.vhosts[0].ref_name.as_deref(), Some("lan"));
+    assert!(!cfg.vhosts[0].explicit_only);
+    assert_eq!(cfg.vhosts[1].ref_name.as_deref(), Some("hidden"));
+    assert!(cfg.vhosts[1].explicit_only);
+}
+
+#[test]
+fn vhost_reference_inside_listener_rejects_block() {
+    // A listener `vhost` is a reference, not a definition.
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80" {
+            vhost "x" { location "/" { static root="." } }
+        }
+        vhost "x" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(
-        cfg.listeners[0].default_vhost.is_none(),
-        "default-vhost #null should leave no fallback vhost"
+        err.contains("cannot have a block"),
+        "expected reference-with-block rejection, got: {err}"
     );
 }
 
 #[test]
-fn default_vhost_explicit_name_is_preserved() {
-    let cfg = Config::parse(
+fn listener_vhost_reference_must_resolve() {
+    let err = Config::parse(
         r#"
-        listener "tcp://0.0.0.0:80" default-vhost="second.com"
-        vhost "first.com" {
-            location "/" {
-                static root="."
-            }
-        }
-        vhost "second.com" {
-            location "/" {
-                static root="."
-            }
-        }
+        listener "tcp://0.0.0.0:80" { vhost "nope" }
+        vhost "real.com" { location "/" { static root="." } }
         "#,
     )
-    .unwrap();
-    assert_eq!(
-        cfg.listeners[0].default_vhost.as_deref(),
-        Some("second.com"),
-        "explicit default-vhost name should be preserved"
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("unknown vhost 'nope'"),
+        "expected unknown-vhost error, got: {err}"
     );
 }
 
 #[test]
-fn default_vhost_absent_multiple_listeners() {
-    // Absent -> first vhost; null -> no default.
-    let cfg = Config::parse(
+fn duplicate_vhost_handle_rejected() {
+    // Two vhosts default their handle to the same host pattern.
+    let err = Config::parse(
         r#"
         listener "tcp://0.0.0.0:80"
-        listener "tcp://0.0.0.0:443" default-vhost=#null
-        vhost "h" {
-            location "/" {
-                static root="."
-            }
+        vhost "example.com" { location "/" { static root="." } }
+        vhost "example.com" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("duplicate vhost handle 'example.com'"),
+        "expected duplicate-handle error, got: {err}"
+    );
+}
+
+#[test]
+fn same_host_two_vhosts_on_one_listener_rejected() {
+    // Distinct handles (lan/pub) so the vhosts are legal globally, but
+    // serving the same literal host twice on one listener is ambiguous.
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80" { vhost "lan" "pub" }
+        vhost "example.com" name="lan" { location "/" { static root="." } }
+        vhost "example.com" name="pub" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("served by more than one vhost"),
+        "expected per-listener host collision error, got: {err}"
+    );
+}
+
+#[test]
+fn proxy_listener_rejects_vhost_list() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:5432" {
+            vhost "x"
+            proxy "tcp://127.0.0.1:5432"
+        }
+        vhost "x" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("'vhost' is only valid in HTTP listeners"),
+        "expected proxy vhost rejection, got: {err}"
+    );
+}
+
+#[test]
+fn proxy_listener_rejects_reject_unknown_host() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:5432" reject-unknown-host=#true {
+            proxy "tcp://127.0.0.1:5432"
         }
         "#,
     )
-    .unwrap();
-    assert_eq!(cfg.listeners[0].default_vhost.as_deref(), Some("h"));
-    assert!(cfg.listeners[1].default_vhost.is_none());
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("'reject-unknown-host' is only valid in HTTP"),
+        "expected proxy reject-unknown-host rejection, got: {err}"
+    );
 }
 
 // -- timeouts --------------------------------------------------

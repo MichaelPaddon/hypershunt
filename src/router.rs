@@ -6,8 +6,7 @@
 
 use crate::access::{PolicyBlock, PolicyRule, Predicate};
 use crate::config::{
-    BasicAuthConfig, Config, HeaderOpConfig, ListenerConfig, PolicyRuleDef,
-    VHostConfig,
+    BasicAuthConfig, Config, HeaderOpConfig, PolicyRuleDef, VHostConfig,
 };
 use crate::handler::Handler;
 use crate::handler::status::{
@@ -87,14 +86,27 @@ struct Rewrite {
 /// headroom while still catching pathological loops cheaply.
 const MAX_REWRITES: usize = 10;
 
-pub struct Router {
+// One listener's routing table.  Each listener serves its own
+// effective set of vhosts (implicit = all non-explicit-only; explicit =
+// its `vhost` reference list), so the literal/regex/default tables are
+// built per listener rather than globally.  Vhosts shared across
+// listeners are still built once and pointed at by `Arc`.
+#[derive(Default)]
+struct VhostTable {
     // Literal hostname -> vhost; checked first at request time.
-    vhosts: HashMap<String, Arc<VHost>>,
-    // Regex patterns in config order; checked when the literal
-    // lookup produces no match.  Anchored at both ends.
+    literals: HashMap<String, Arc<VHost>>,
+    // Regex patterns in list order; checked when the literal lookup
+    // produces no match.  Anchored at both ends.
     patterns: Vec<(Regex, Arc<VHost>)>,
-    // Maps each listener's local name to its default vhost (if any).
-    defaults: HashMap<String, Option<Arc<VHost>>>,
+    // Fallback when the Host matches nothing: the first vhost in the
+    // listener's list, or None when the listener rejects unknown hosts.
+    default: Option<Arc<VHost>>,
+}
+
+pub struct Router {
+    // Per-listener routing table, keyed by the listener's local name
+    // (`ListenerConfig::local_name()` == its bind URL).
+    tables: HashMap<String, VhostTable>,
     // Pre-inlined named policy rule lists for stream-listener use.
     named_policies: HashMap<String, Vec<PolicyRule>>,
 }
@@ -110,14 +122,6 @@ impl Router {
         // them via apply.
         let named_policies = resolve_named_policies(&config.server.policies)?;
 
-        let mut vhosts: HashMap<String, Arc<VHost>> = HashMap::new();
-        let mut patterns: Vec<(Regex, Arc<VHost>)> = Vec::new();
-        // Keyed by the raw config string, including the `~` prefix for
-        // regex names.  Regex names are never inserted into the `vhosts`
-        // literal map, so this is the only place they can be found when
-        // resolving a `default-vhost` reference at construction time.
-        let mut by_config_key: HashMap<String, Arc<VHost>> = HashMap::new();
-
         // Shared, initially-empty reverse-proxy pool registry; filled as
         // handlers are built and stored once the build completes.  The
         // StatusHandler clones this same handle, so it sees every pool
@@ -126,7 +130,12 @@ impl Router {
             Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
         let mut lb_pools: Vec<LbPoolEntry> = Vec::new();
 
-        for vcfg in &config.vhosts {
+        // Build every vhost handler exactly once; index by reference
+        // handle so a listener's `vhost` list can select it.  Vhosts
+        // are shared across listeners via `Arc`.
+        let mut built: Vec<Arc<VHost>> = Vec::with_capacity(config.vhosts.len());
+        let mut by_handle: HashMap<&str, usize> = HashMap::new();
+        for (i, vcfg) in config.vhosts.iter().enumerate() {
             let vhost = Arc::new(build_vhost(
                 vcfg,
                 metrics,
@@ -136,43 +145,67 @@ impl Router {
                 &lb_registry,
                 &mut lb_pools,
             )?);
-
-            let all_names =
-                std::iter::once(&vcfg.name).chain(vcfg.aliases.iter());
-            for n in all_names {
-                by_config_key.insert(n.value.clone(), vhost.clone());
-
-                if n.regex {
-                    // Anchor the pattern so it must match the whole host.
-                    let re = Regex::new(&format!("^(?:{})$", n.value))
-                        .expect("regex validated at config load");
-                    patterns.push((re, vhost.clone()));
-                } else {
-                    vhosts.insert(n.value.clone(), vhost.clone());
-                }
-            }
+            built.push(vhost);
+            // Handle uniqueness is enforced by Config::validate; the
+            // last writer would otherwise win silently.
+            by_handle.insert(vcfg.handle(), i);
         }
 
         // Publish the collected pools now that every handler is built.
         lb_registry.store(Arc::new(lb_pools));
 
-        let defaults: HashMap<String, Option<Arc<VHost>>> = config
-            .listeners
-            .iter()
-            .map(|l: &ListenerConfig| {
-                let vhost = l
-                    .default_vhost
-                    .as_ref()
-                    .and_then(|name| by_config_key.get(name))
-                    .cloned();
-                (l.local_name(), vhost)
-            })
-            .collect();
+        // One routing table per HTTP listener.  Proxy listeners don't
+        // route by vhost, so they get no table (resolve_vhost returns
+        // None for them, which they never call anyway).
+        let mut tables: HashMap<String, VhostTable> = HashMap::new();
+        for l in config.listeners.iter().filter(|l| l.proxy.is_none()) {
+            // Effective ordered set: the explicit `vhost` list, or (when
+            // empty) every non-explicit-only vhost in declaration order.
+            let indices: Vec<usize> = if l.vhosts.is_empty() {
+                config
+                    .vhosts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| !v.explicit_only)
+                    .map(|(i, _)| i)
+                    .collect()
+            } else {
+                // References are validated to resolve in Config::validate.
+                l.vhosts
+                    .iter()
+                    .filter_map(|h| by_handle.get(h.as_str()).copied())
+                    .collect()
+            };
+
+            let mut table = VhostTable::default();
+            for &i in &indices {
+                let vcfg = &config.vhosts[i];
+                let vhost = &built[i];
+                let all_names =
+                    std::iter::once(&vcfg.name).chain(vcfg.aliases.iter());
+                for n in all_names {
+                    if n.regex {
+                        // Anchor so the pattern must match the whole host.
+                        let re = Regex::new(&format!("^(?:{})$", n.value))
+                            .expect("regex validated at config load");
+                        table.patterns.push((re, vhost.clone()));
+                    } else {
+                        table.literals.insert(n.value.clone(), vhost.clone());
+                    }
+                }
+            }
+            // The first listed vhost is the listener default, unless the
+            // listener rejects unknown hosts (then there is no fallback).
+            table.default = if l.reject_unknown_host {
+                None
+            } else {
+                indices.first().map(|&i| built[i].clone())
+            };
+            tables.insert(l.local_name(), table);
+        }
 
         Ok(Self {
-            vhosts,
-            patterns,
-            defaults,
+            tables,
             named_policies,
         })
     }
@@ -228,23 +261,37 @@ impl Router {
         None
     }
 
-    // Resolve the virtual host for a request.
+    // Resolve the virtual host for a request, within the matched
+    // listener's own table: exact literal Host, then regex patterns in
+    // list order, then the listener's default (first listed vhost, or
+    // None when the listener rejects unknown hosts).
     fn resolve_vhost(
         &self,
         host: Option<&str>,
         listener_bind: &str,
     ) -> Option<Arc<VHost>> {
+        let table = self.tables.get(listener_bind).or_else(|| {
+            // A single-listener router serves its one table regardless
+            // of the bind key.  This only matters for test harnesses
+            // that rebind to an ephemeral port after building the
+            // router; in production route() is always called with the
+            // listener's own local_name(), which is a table key, and a
+            // multi-listener router stays strict (a miss -> no route).
+            (self.tables.len() == 1)
+                .then(|| self.tables.values().next())
+                .flatten()
+        })?;
         if let Some(host) = host {
-            if let Some(vhost) = self.vhosts.get(host) {
+            if let Some(vhost) = table.literals.get(host) {
                 return Some(vhost.clone());
             }
-            for (re, vhost) in &self.patterns {
+            for (re, vhost) in &table.patterns {
                 if re.is_match(host) {
                     return Some(vhost.clone());
                 }
             }
         }
-        self.defaults.get(listener_bind).and_then(|v| v.clone())
+        table.default.clone()
     }
 
     /// Inline a list of PolicyRuleDef into a PolicyBlock using the named
@@ -768,19 +815,22 @@ impl Router {
                 }
             }
         };
-        for v in self.vhosts.values() {
-            for loc in &v.locations {
-                push_loc(loc, &mut seen, &mut out);
-            }
-        }
-        for (_, v) in &self.patterns {
-            for loc in &v.locations {
-                push_loc(loc, &mut seen, &mut out);
-            }
-        }
-        for v in self.defaults.values().flatten() {
-            for loc in &v.locations {
-                push_loc(loc, &mut seen, &mut out);
+        // A vhost shared across listeners appears in several tables;
+        // dedup by vhost pointer so its locations are swept only once.
+        let mut seen_vhost = std::collections::HashSet::new();
+        for table in self.tables.values() {
+            let vhosts = table
+                .literals
+                .values()
+                .chain(table.patterns.iter().map(|(_, v)| v))
+                .chain(table.default.iter());
+            for v in vhosts {
+                if !seen_vhost.insert(Arc::as_ptr(v)) {
+                    continue;
+                }
+                for loc in &v.locations {
+                    push_loc(loc, &mut seen, &mut out);
+                }
             }
         }
         out

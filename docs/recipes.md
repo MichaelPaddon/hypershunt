@@ -185,6 +185,60 @@ vhost "ops.example.com" {
 **See also:** [Access policies](guide.md#access-policies),
 [HTTP Basic auth](reference.md#basic-auth).
 
+## Different sites per port (per-listener vhost scoping)
+
+By default every listener serves every vhost.  To serve **different
+sets of vhosts on different ports** — for example a public site on
+443 and an internal admin site on a separate, firewall-restricted
+port — give each listener a [`vhost`](reference.md#vhost-listener-child)
+reference list naming exactly the vhosts it should serve.  Mark the
+admin vhost [`explicit-only`](reference.md#explicit-only) so it never
+leaks onto a listener that didn't ask for it, and add
+[`reject-unknown-host`](reference.md#reject-unknown-host) so probes
+with arbitrary `Host` headers get a `404` instead of a default site.
+
+```kdl
+server user="hypershunt" state-dir="/var/lib/hypershunt"
+
+// Public edge: serves only the public site.
+listener "tcp://[::]:443" reject-unknown-host=#true {
+    tls "acme" email="ops@example.com" { domain "www.example.com" }
+    vhost "public"
+}
+
+// Internal admin edge on a separate, firewall-restricted port.
+listener "tcp://10.0.0.1:8443" reject-unknown-host=#true {
+    tls "self-signed"
+    vhost "admin"
+}
+
+vhost "www.example.com" name="public" {
+    location "/" { static root="/var/www/public" }
+}
+
+// explicit-only: reachable only on listeners that name it.
+vhost "admin.example.com" name="admin" explicit-only=#true {
+    location "/" { proxy { upstream "http://127.0.0.1:9000" } }
+}
+```
+
+To instead serve the **same hostname with different content per
+port**, give two vhosts the same host pattern but distinct
+[`name`](reference.md#name-vhost) handles and list one on each
+listener:
+
+```kdl
+vhost "example.com" name="lan" { location "/" { static root="/srv/lan" } }
+vhost "example.com" name="pub" { location "/" { static root="/srv/pub" } }
+
+listener "tcp://10.0.0.1:80" { vhost "lan" }   // internal content
+listener "tcp://[::]:80"     { vhost "pub" }   // public content
+```
+
+**See also:**
+[Per-listener vhost scoping](guide.md#per-listener-vhost-scoping),
+[listener `vhost` list](reference.md#vhost-listener-child).
+
 ## mTLS-protected internal service
 
 Require clients to present a certificate signed by your internal CA

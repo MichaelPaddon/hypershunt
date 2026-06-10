@@ -326,7 +326,19 @@ pub struct ListenerConfig {
     // `accept_proxy_protocol` is set.
     pub trusted_proxies: Vec<ipnet::IpNet>,
     // HTTP-only fields; unused in stream mode:
-    pub default_vhost: Option<String>,
+    // Ordered list of vhost reference handles this listener serves
+    // (a handle is a vhost's `name=`, defaulting to its host pattern).
+    // Empty means "no explicit list" -> the listener serves the
+    // *implicit* set: every vhost not marked `explicit-only`, in
+    // declaration order.  When non-empty it is the *exact* set, in the
+    // given order; the first entry is this listener's default (the
+    // fallback served when the request Host matches nothing).
+    pub vhosts: Vec<String>,
+    // When true, a request whose Host matches no vhost on this listener
+    // gets a 404 instead of falling back to the default vhost.  Replaces
+    // the former `default-vhost=#null`; overrides "first entry is the
+    // default" (the default becomes None).
+    pub reject_unknown_host: bool,
     pub timeouts: Timeouts,
     // Cap on simultaneous open connections; None = unlimited.
     // New connections are deferred (not dropped) at the limit.
@@ -487,10 +499,21 @@ pub struct VHostName {
 
 #[derive(Debug)]
 pub struct VHostConfig {
-    // Primary hostname; also used as the map key in the router.
+    // Primary host-match pattern (literal hostname, or regex when
+    // `name.regex`).  Note this is the *match* pattern, not the
+    // reference handle -- see `ref_name`.
     pub name: VHostName,
     pub aliases: Vec<VHostName>,
     pub locations: Vec<LocationConfig>,
+    // Optional reference handle (`name=` in KDL), used by a listener's
+    // `vhost` list to select this vhost.  Distinct from the host-match
+    // pattern so two vhosts can share a host (e.g. two `example.com`
+    // served on different listeners) yet be referenced unambiguously.
+    // When None the handle defaults to `name.value` (the pattern).
+    pub ref_name: Option<String>,
+    // When true this vhost is omitted from a listener's *implicit* set;
+    // it is reachable only on listeners that name it explicitly.
+    pub explicit_only: bool,
     // Optional ALPN override for connections whose SNI matches this
     // vhost (or one of its literal aliases).  When set, the TCP/TLS
     // listener picks this list at handshake time via
@@ -502,6 +525,14 @@ pub struct VHostConfig {
     pub alpn: Option<Vec<String>>,
     // 1-based source line of this vhost's node, for error messages.
     pub line: usize,
+}
+
+impl VHostConfig {
+    // Reference handle used by listener `vhost` lists: the explicit
+    // `name=` if set, else the host-match pattern.
+    pub fn handle(&self) -> &str {
+        self.ref_name.as_deref().unwrap_or(self.name.value.as_str())
+    }
 }
 
 /// Config-level header operation: raw strings before name validation.
@@ -810,11 +841,6 @@ impl Config {
         // the error names the misplaced node, not a confusing symptom.
         check_misnesting(text, name, &doc)?;
         let mut config = Config::default();
-        // Raw default-vhost specs, one per listener, in order:
-        //   None          - child node absent; resolved to first vhost
-        //   Some(None)    - explicit null; no fallback vhost
-        //   Some(Some(s)) - named vhost
-        let mut raw_defaults: Vec<Option<Option<String>>> = Vec::new();
         for node in doc.nodes() {
             let line = node_line(text, node);
             match node.name().value() {
@@ -822,9 +848,9 @@ impl Config {
                     config.server = parse_server(node, text, name)?;
                 }
                 "listener" => {
-                    let (listener, raw) = parse_listener(node, text, name)?;
-                    config.listeners.push(listener);
-                    raw_defaults.push(raw);
+                    config
+                        .listeners
+                        .push(parse_listener(node, text, name)?);
                 }
                 "vhost" => {
                     config.vhosts.push(parse_vhost(node, text, name)?);
@@ -841,18 +867,6 @@ impl Config {
                         did_you_mean(other, &TOP_LEVEL_ONLY)
                     )
                 }
-            }
-        }
-        // Resolve: absent -> first vhost name, null -> None, named -> Some(s).
-        // Stream listeners have no default_vhost; skip the assignment for them.
-        let first = config.vhosts.first().map(|v| v.name.value.clone());
-        for (listener, raw) in config.listeners.iter_mut().zip(raw_defaults) {
-            if listener.proxy.is_none() {
-                listener.default_vhost = match raw {
-                    None => first.clone(),
-                    Some(None) => None,
-                    Some(Some(name)) => Some(name),
-                };
             }
         }
         // Auto-Alt-Svc: for every TCP/TLS listener whose port matches a
@@ -1125,16 +1139,59 @@ impl Config {
                 }
             }
         }
-        // Verify every default-vhost reference resolves (HTTP listeners only).
-        let known = self.vhost_names();
+        // Per-listener vhost scoping checks.  First, reference handles
+        // (a vhost's `name=`, defaulting to its host pattern) must be
+        // unique across vhosts so a listener `vhost` list is
+        // unambiguous.
+        let mut by_handle: HashMap<&str, &VHostConfig> = HashMap::new();
+        for v in &self.vhosts {
+            let handle = v.handle();
+            if by_handle.insert(handle, v).is_some() {
+                bail!(
+                    "{}duplicate vhost handle '{handle}'; give one a \
+                     distinct `name=` to disambiguate",
+                    loc(name, v.line)
+                );
+            }
+        }
+        // Then, per HTTP listener: every reference must resolve, and the
+        // effective set must not serve the same literal host twice
+        // (which Host wins would be ambiguous).
         for l in self.listeners.iter() {
-            // Capture the prefix before `name` is shadowed below.
+            if l.proxy.is_some() {
+                continue;
+            }
             let at = loc(name, l.line);
-            if l.proxy.is_none()
-                && let Some(ref name) = l.default_vhost
-                && !known.contains(name.as_str())
-            {
-                bail!("{at}default-vhost '{name}' not found in vhosts");
+            // Effective set: explicit list (in order) or, when none was
+            // given, every non-explicit-only vhost in declaration order.
+            let effective: Vec<&VHostConfig> = if l.vhosts.is_empty() {
+                self.vhosts.iter().filter(|v| !v.explicit_only).collect()
+            } else {
+                let mut out = Vec::with_capacity(l.vhosts.len());
+                for h in &l.vhosts {
+                    match by_handle.get(h.as_str()) {
+                        Some(v) => out.push(*v),
+                        None => bail!(
+                            "{at}listener 'vhost' references unknown \
+                             vhost '{h}'"
+                        ),
+                    }
+                }
+                out
+            };
+            let mut seen: HashSet<&str> = HashSet::new();
+            for v in &effective {
+                let names =
+                    std::iter::once(&v.name).chain(v.aliases.iter());
+                for n in names {
+                    if !n.regex && !seen.insert(n.value.as_str()) {
+                        bail!(
+                            "{at}host '{}' is served by more than one \
+                             vhost on this listener",
+                            n.value
+                        );
+                    }
+                }
             }
         }
         // Validate header names in request-headers and response-headers.
@@ -1280,17 +1337,6 @@ impl Config {
                 .map(|c| &c.source),
             other => Some(other),
         }
-    }
-
-    // Returns the set of all known hostnames (names + aliases).
-    pub fn vhost_names(&self) -> std::collections::HashSet<&str> {
-        self.vhosts
-            .iter()
-            .flat_map(|v| {
-                std::iter::once(v.name.value.as_str())
-                    .chain(v.aliases.iter().map(|a| a.value.as_str()))
-            })
-            .collect()
     }
 }
 
