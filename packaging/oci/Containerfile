@@ -32,10 +32,11 @@ RUN mkdir src \
 
 # ── Real build ────────────────────────────────────────────────────────────────
 COPY src ./src
-# The status page embeds the brand icon via include_bytes! at compile
-# time.  Copy only this file so unrelated docs edits don't bust the
-# build cache.
+# The status page embeds the brand lockup + square favicon via
+# include_bytes! at compile time.  Copy only these files so unrelated
+# docs edits don't bust the build cache.
 COPY docs/hs-icon.svg ./docs/hs-icon.svg
+COPY docs/hs-favicon.svg ./docs/hs-favicon.svg
 RUN cargo build --release
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────

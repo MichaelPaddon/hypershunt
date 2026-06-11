@@ -11,19 +11,33 @@ use bytes::Bytes;
 use hyper::{Response, StatusCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// SVG brand icon embedded at compile time and served from a sub-path so
-// the browser caches it independently of the page HTML.  The same asset
-// backs both the sidebar brand image and the favicon.
+// Wide brand lockup embedded at compile time and served from a sub-path
+// so the browser caches it independently of the page HTML.  Backs the
+// sidebar brand image.
 pub(super) const ICON_SVG: &[u8] =
     include_bytes!("../../../docs/hs-icon.svg");
 pub(super) const ICON_FILE: &str = "hs-icon.svg";
 
-/// Serve the SVG brand icon with a 24-hour cache and ETag support.
+// Square favicon variant: the wide lockup letterboxes to an illegible
+// strip in the square browser-tab viewport, so the tab uses a square
+// monogram crop instead.
+pub(super) const FAVICON_SVG: &[u8] =
+    include_bytes!("../../../docs/hs-favicon.svg");
+pub(super) const FAVICON_FILE: &str = "hs-favicon.svg";
+
+/// Serve the wide brand lockup with a 24-hour cache and ETag support.
 /// Returns 304 Not Modified when the client's ETag matches.
 pub(super) fn serve_icon(
     headers: &hyper::HeaderMap,
 ) -> HttpResponse {
     serve_cached_asset(ICON_SVG, "image/svg+xml", headers)
+}
+
+/// Serve the square favicon with the same cache/ETag handling.
+pub(super) fn serve_favicon(
+    headers: &hyper::HeaderMap,
+) -> HttpResponse {
+    serve_cached_asset(FAVICON_SVG, "image/svg+xml", headers)
 }
 
 /// Serve an embedded, immutable byte asset with a 24-hour cache and a
@@ -594,13 +608,19 @@ pub(super) fn render_html(
     matched_prefix: &str,
 ) -> HttpResponse {
     let total_lat: u64 = s.latency.iter().sum();
-    // Brand icon served from a sub-path relative to wherever the status
-    // location is mounted (/, /status, /.hypershunt/status, …).  The
-    // same URL backs both the sidebar image and the favicon link.
+    // Brand assets served from a sub-path relative to wherever the
+    // status location is mounted (/, /status, /.hypershunt/status, …):
+    // the wide lockup for the sidebar image, the square crop for the
+    // browser-tab favicon.
     let icon_src = format!(
         "{}/{}",
         matched_prefix.trim_end_matches('/'),
         ICON_FILE
+    );
+    let favicon_src = format!(
+        "{}/{}",
+        matched_prefix.trim_end_matches('/'),
+        FAVICON_FILE
     );
     let resource_sec = resource_section(s.memory_kb, s.cpu_percent);
     let certs_sec = certs_section(certs);
@@ -677,7 +697,7 @@ pub(super) fn render_html(
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>hypershunt — Status</title>
-<link rel="icon" type="image/svg+xml" href="{icon_src}">
+<link rel="icon" type="image/svg+xml" href="{favicon_src}">
 <style>{css}</style>
 </head>
 <body>
@@ -884,6 +904,7 @@ pub(super) fn render_html(
 </html>"##,
         css = CSS,
         icon_src = icon_src,
+        favicon_src = favicon_src,
         version = sum.version,
         mem_nav = mem_nav,
         auth_nav = auth_nav,

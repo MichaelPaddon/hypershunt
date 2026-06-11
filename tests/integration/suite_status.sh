@@ -21,11 +21,16 @@ EOF
     assert_body   "status/json_fields" "requests" \
         "http://127.0.0.1:8084/" -H "Accept: application/json"
 
-    # SVG brand icon served from the sub-path endpoint.
+    # SVG brand lockup (sidebar) + square favicon (browser tab), both
+    # served from the sub-path endpoint as image/svg+xml.
     assert_status "status/icon_200"    200 \
         "http://127.0.0.1:8084/hs-icon.svg"
     assert_header "status/icon_type"   "Content-Type" "image/svg+xml" \
         "http://127.0.0.1:8084/hs-icon.svg"
+    assert_status "status/favicon_200" 200 \
+        "http://127.0.0.1:8084/hs-favicon.svg"
+    assert_header "status/favicon_type" "Content-Type" "image/svg+xml" \
+        "http://127.0.0.1:8084/hs-favicon.svg"
 
     stop_server
 }
