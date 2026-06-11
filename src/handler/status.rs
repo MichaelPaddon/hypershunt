@@ -314,17 +314,12 @@ impl Handler for StatusHandler {
         matched_prefix: &str,
         _ctx: &RequestContext<'_>,
     ) -> HttpResponse {
-        // Logo and favicon requests are intercepted before content-
-        // negotiation so the browser caches these assets independently
-        // of the page HTML.
-        match req.uri().path().rsplit('/').next() {
-            Some(f) if f == render_html::LOGO_FILE => {
-                return render_html::serve_logo(req.headers());
-            }
-            Some(f) if f == render_html::FAVICON_FILE => {
-                return render_html::serve_favicon(req.headers());
-            }
-            _ => {}
+        // Brand-icon requests (sidebar image + favicon share one asset)
+        // are intercepted before content-negotiation so the browser
+        // caches the icon independently of the page HTML.
+        if req.uri().path().rsplit('/').next() == Some(render_html::ICON_FILE)
+        {
+            return render_html::serve_icon(req.headers());
         }
         let period = query_period(req.uri());
         let snap = self.metrics.snapshot();
@@ -1283,20 +1278,19 @@ mod tests {
         assert_eq!(s.listeners[0].handler_timeout_secs, Some(30));
     }
 
-    // -- PNG logo endpoint -----------------------------------------
+    // -- brand icon endpoint ---------------------------------------
 
     #[tokio::test]
-    async fn serve_logo_returns_png() {
+    async fn serve_icon_returns_svg() {
         use http_body_util::BodyExt;
         use hyper::HeaderMap;
-        let resp =
-            render_html::serve_logo(&HeaderMap::new());
+        let resp = render_html::serve_icon(&HeaderMap::new());
         assert_eq!(resp.status(), 200);
         assert_eq!(
             resp.headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok()),
-            Some("image/png"),
+            Some("image/svg+xml"),
         );
         let bytes =
             resp.into_body().collect().await.unwrap().to_bytes();
@@ -1304,12 +1298,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_logo_304_on_matching_etag() {
+    async fn serve_icon_304_on_matching_etag() {
         use http_body_util::BodyExt;
         use hyper::HeaderMap;
         // First request to learn the ETag.
-        let resp =
-            render_html::serve_logo(&HeaderMap::new());
+        let resp = render_html::serve_icon(&HeaderMap::new());
         let etag = resp
             .headers()
             .get("etag")
@@ -1318,7 +1311,7 @@ mod tests {
         // Second request with matching If-None-Match.
         let mut hdrs = HeaderMap::new();
         hdrs.insert("if-none-match", etag);
-        let resp2 = render_html::serve_logo(&hdrs);
+        let resp2 = render_html::serve_icon(&hdrs);
         assert_eq!(resp2.status(), 304);
         let bytes =
             resp2.into_body().collect().await.unwrap().to_bytes();
@@ -1326,7 +1319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn render_html_logo_img_src_reflects_prefix() {
+    async fn render_html_icon_refs_reflect_prefix() {
         use http_body_util::BodyExt;
         let paths: Vec<(String, u64)> = vec![];
         let resp = render_html(
@@ -1342,36 +1335,18 @@ mod tests {
         let bytes =
             resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
+        // The sidebar brand image uses the icon at the matched prefix.
         assert!(
-            html.contains(
-                "src=\"/status/hypershunt-logo.png\""
-            ),
-            "img src must use the matched prefix",
+            html.contains("src=\"/status/hs-icon.svg\""),
+            "img src must use the matched prefix: {html}",
         );
-        // Favicon link must be present and use the matched prefix.
+        // The favicon link uses the same icon asset.
         assert!(
             html.contains(
                 "rel=\"icon\" type=\"image/svg+xml\" \
-                 href=\"/status/hypershunt-favicon.svg\""
+                 href=\"/status/hs-icon.svg\""
             ),
             "favicon link must use the matched prefix: {html}",
         );
-    }
-
-    #[tokio::test]
-    async fn serve_favicon_returns_svg() {
-        use http_body_util::BodyExt;
-        use hyper::HeaderMap;
-        let resp = render_html::serve_favicon(&HeaderMap::new());
-        assert_eq!(resp.status(), 200);
-        assert_eq!(
-            resp.headers()
-                .get("Content-Type")
-                .and_then(|v| v.to_str().ok()),
-            Some("image/svg+xml"),
-        );
-        let bytes =
-            resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(!bytes.is_empty(), "favicon body must be non-empty");
     }
 }

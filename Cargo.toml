@@ -205,11 +205,6 @@ dest   = "usr/share/doc/hypershunt/site/"
 mode   = "644"
 
 [[package.metadata.deb.assets]]
-source = "docs/*.png"
-dest   = "usr/share/doc/hypershunt/site/"
-mode   = "644"
-
-[[package.metadata.deb.assets]]
 source = "docs/*.svg"
 dest   = "usr/share/doc/hypershunt/site/"
 mode   = "644"
@@ -282,11 +277,6 @@ mode   = "644"
 
 [[package.metadata.generate-rpm.assets]]
 source = "docs/index.html"
-dest   = "/usr/share/doc/hypershunt/site/"
-mode   = "644"
-
-[[package.metadata.generate-rpm.assets]]
-source = "docs/*.png"
 dest   = "/usr/share/doc/hypershunt/site/"
 mode   = "644"
 

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>hypershunt</title>
-  <link rel="icon" type="image/svg+xml" href="hypershunt-favicon.svg">
+  <link rel="icon" type="image/svg+xml" href="hs-icon.svg">
   <link rel="stylesheet" href="vendor/vue.css">
   <style>
     /* Theme variables.  vue.css hardcodes its colours (it exposes only
@@ -37,6 +37,11 @@
     /* Slightly tighter sidebar font + better code blocks. */
     .sidebar { font-size: 14.5px; }
     pre[data-lang] { position: relative; }
+
+    /* Tighten the whitespace above/below the sidebar brand icon.
+       (theme defaults: .sidebar padding-top 40px, brand margin-bottom 1rem) */
+    .sidebar { padding-top: 14px; }
+    .sidebar > h1 { margin-bottom: 0.4rem; }
 
     /* Home-page card grid: home.md wraps its link list in
        <div class="cards"> -- each consecutive paragraph
@@ -234,7 +239,7 @@
   <script>
     window.$docsify = {
       name: 'hypershunt',
-      logo: 'hypershunt-logo.png',
+      logo: 'hs-icon.svg',
       loadSidebar: true,
       subMaxLevel: 3,
       auto2top: true,
