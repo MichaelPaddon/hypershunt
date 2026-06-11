@@ -48,6 +48,8 @@ source "$TESTS_DIR/suite_websocket.sh"
 source "$TESTS_DIR/suite_routing.sh"
 # shellcheck source=suite_health.sh
 source "$TESTS_DIR/suite_health.sh"
+# shellcheck source=suite_respond.sh
+source "$TESTS_DIR/suite_respond.sh"
 # shellcheck source=suite_headers.sh
 source "$TESTS_DIR/suite_headers.sh"
 # shellcheck source=suite_jwt.sh
@@ -114,6 +116,7 @@ suite_ldap_auth
 suite_health_endpoint
 suite_health_config
 suite_health_lame_duck
+suite_respond
 suite_multi_vhost
 suite_vhost_aliases
 suite_regex_vhost

@@ -531,6 +531,7 @@ value set IS the predicate's content (rule 4, exception clause).
 - [`<static-handler>`](#static-handler)
 - [`<proxy-handler>`](#proxy-handler)
 - [`<redirect-handler>`](#redirect-handler)
+- [`<respond-handler>`](#respond-handler)
 - [`<fastcgi-handler>`](#fastcgi-handler)
 - [`<scgi-handler>`](#scgi-handler)
 - [`<cgi-handler>`](#cgi-handler)
@@ -614,6 +615,15 @@ optional per-upstream property.
 
 `"redirect"` `to=`[`<string>`](#string)
 ( `code=`[`<integer>`](#integer) )?
+
+### `respond-handler`
+
+`"respond"` ( `status=`[`<integer>`](#integer) )?
+( `body=`[`<string>`](#string) | `file=`[`<string>`](#string) )?
+( `content-type=`[`<string>`](#string) )?
+
+`status` defaults to `200` (range 100–599).  `body` and `file` are
+mutually exclusive; with neither, the body is empty.
 
 ### `fastcgi-handler`
 

@@ -639,6 +639,7 @@ fn handler_kind(h: &crate::config::HandlerConfig) -> HandlerKind {
         H::Static { .. } => HandlerKind::Static,
         H::Proxy { .. } => HandlerKind::Proxy,
         H::Redirect { .. } => HandlerKind::Redirect,
+        H::Respond { .. } => HandlerKind::Respond,
         H::FastCgi { .. } => HandlerKind::FastCgi,
         H::Scgi { .. } => HandlerKind::Scgi,
         H::Cgi { .. } => HandlerKind::Cgi,

@@ -787,6 +787,7 @@ fn parse_location(
                 "static"
                     | "proxy"
                     | "redirect"
+                    | "respond"
                     | "fastcgi"
                     | "scgi"
                     | "cgi"

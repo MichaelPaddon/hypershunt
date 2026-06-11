@@ -1043,6 +1043,47 @@ preserved through a method-preserving redirect.
 
 **See also**: [Reference -- redirect](reference.md#redirect).
 
+## Canned responses
+
+Use [`respond`](reference.md#respond) when a location should return a
+fixed answer with no back-end: health/ack endpoints, custom block
+messages, fixed tokens, tiny stubs, and maintenance pages.
+
+```kdl
+// Fixed status + inline body (Content-Type defaults to text/plain)
+location "/health" { respond status=200 body="OK\n" }
+
+// Status only, empty body
+location "/ping" { respond status=204 }
+
+// Custom denial message
+location "/admin" {
+    respond status=403 body="Not for you.\n"
+}
+
+// Templated body — request variables expand like a redirect target
+location "/whoami" {
+    respond status=200 body="{client_ip} -> {host}{path}\n"
+}
+```
+
+A **maintenance page** from a file (the path resolves relative to the
+config file; the file is re-read each request, so you can edit it live):
+
+```kdl
+location "/" {
+    respond status=503 file="maintenance.html" content-type="text/html"
+}
+```
+
+`body` and `file` are mutually exclusive; with neither, the body is
+empty.  Inline bodies are templated; file bodies are sent verbatim.
+Set any extra headers with the location's
+[`response-headers`](reference.md#response-headers) block — a
+`set "Content-Type" …` there overrides `content-type=`.
+
+**See also**: [Reference -- respond](reference.md#respond).
+
 ## Request matching
 
 [`match`](reference.md#match) gates a location on something other

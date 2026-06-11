@@ -510,6 +510,7 @@ pub enum HandlerKind {
     Static,
     Proxy,
     Redirect,
+    Respond,
     FastCgi,
     Scgi,
     Cgi,
@@ -518,7 +519,7 @@ pub enum HandlerKind {
 }
 
 /// Number of `HandlerKind` variants; sizes the `per_kind` array.
-pub const HANDLER_KINDS: usize = 8;
+pub const HANDLER_KINDS: usize = 9;
 
 /// All kinds in discriminant order — used to label the per-handler
 /// snapshot without reflection.
@@ -526,6 +527,7 @@ pub const HANDLER_KIND_ALL: [HandlerKind; HANDLER_KINDS] = [
     HandlerKind::Static,
     HandlerKind::Proxy,
     HandlerKind::Redirect,
+    HandlerKind::Respond,
     HandlerKind::FastCgi,
     HandlerKind::Scgi,
     HandlerKind::Cgi,
@@ -544,6 +546,7 @@ impl HandlerKind {
             Self::Static => "static",
             Self::Proxy => "proxy",
             Self::Redirect => "redirect",
+            Self::Respond => "respond",
             Self::FastCgi => "fastcgi",
             Self::Scgi => "scgi",
             Self::Cgi => "cgi",
