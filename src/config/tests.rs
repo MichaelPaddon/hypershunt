@@ -1988,6 +1988,136 @@ fn health_positional_bool_true() {
     assert!(cfg.server.health.enabled);
 }
 
+#[test]
+fn health_default_paths() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(cfg.server.health.liveness_paths, ["/healthz", "/livez"]);
+    assert_eq!(cfg.server.health.readiness_paths, ["/readyz"]);
+}
+
+#[test]
+fn health_custom_paths_override_defaults() {
+    let cfg = Config::parse(
+        r#"
+        server {
+            health {
+                liveness-path "/alive"
+                readiness-path "/ready"
+                readiness-path "/ready2"
+            }
+        }
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(cfg.server.health.liveness_paths, ["/alive"]);
+    assert_eq!(cfg.server.health.readiness_paths, ["/ready", "/ready2"]);
+}
+
+#[test]
+fn health_path_must_be_absolute() {
+    let err = Config::parse(
+        r#"
+        server { health { liveness-path "alive" } }
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("must start with '/'"),
+        "expected absolute-path error, got: {err}"
+    );
+}
+
+#[test]
+fn health_path_liveness_readiness_overlap_rejected() {
+    let err = Config::parse(
+        r#"
+        server {
+            health {
+                liveness-path "/healthz"
+                readiness-path "/healthz"
+            }
+        }
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("both liveness and readiness"),
+        "expected overlap error, got: {err}"
+    );
+}
+
+#[test]
+fn listener_health_override_parses() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80" health=#false
+        listener "tcp://0.0.0.0:8080" health=#true
+        listener "tcp://0.0.0.0:9090"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(cfg.listeners[0].health, Some(false));
+    assert_eq!(cfg.listeners[1].health, Some(true));
+    assert_eq!(cfg.listeners[2].health, None);
+}
+
+#[test]
+fn lame_duck_timeout_parses() {
+    let cfg = Config::parse(
+        r#"
+        server lame-duck-timeout=5
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(cfg.server.lame_duck_timeout, 5);
+}
+
+#[test]
+fn lame_duck_timeout_defaults_zero() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(cfg.server.lame_duck_timeout, 0);
+}
+
+#[test]
+fn proxy_listener_rejects_health() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:5432" health=#false {
+            proxy "tcp://127.0.0.1:5432"
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("'health' is only valid in HTTP listeners"),
+        "expected proxy health rejection, got: {err}"
+    );
+}
+
 // -- request-headers / response-headers parsing ---------------
 
 #[test]

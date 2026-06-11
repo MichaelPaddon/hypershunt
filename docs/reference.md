@@ -132,6 +132,27 @@ server upgrade-startup-timeout=60
 **Default:** `60`.
 **See also:** [`graceful-drain-timeout`](#graceful-drain-timeout).
 
+### lame-duck-timeout
+
+**Property** on [`server`](#server).  Optional integer.
+
+Seconds an HTTP (TCP) listener keeps **accepting and serving** after
+SIGTERM before it stops accepting and drains.  Throughout this window
+readiness paths (e.g. [`/readyz`](#health)) return `503` while the
+server still answers requests, so a load balancer / kubelet
+deregisters this instance *before* new connections start being
+refused — the clean way to drain during a rolling update.  Liveness
+stays `200`.  `0` stops accepting immediately on SIGTERM (no
+lame-duck).
+
+```kdl
+server lame-duck-timeout=10
+```
+
+**Default:** `0`.
+**See also:** [`health`](#health),
+[`graceful-drain-timeout`](#graceful-drain-timeout).
+
 ### cert-key-mode
 
 **Property** on [`server`](#server).  Optional octal string.
@@ -1043,20 +1064,67 @@ file.
 
 **Child** of [`server`](#server).  Optional.
 
-Enables the built-in health endpoint at `/.well-known/health` on
-every vhost.  The endpoint returns `200 OK` with `text/plain` body
-`ok\n` when the process is healthy.  Bare `health` (no properties)
-is equivalent to `health enabled=#true`.
+Enables the built-in Kubernetes-style health endpoints, intercepted
+before vhost routing so they work without a `Host` header and cannot
+be shadowed by a user `location`.  Two classes, both answering
+`GET`/`HEAD` with a small JSON body and `Cache-Control: no-cache,
+no-store`:
+
+- **liveness** (`/healthz`, `/livez` by default) — always `200`
+  (`{"status":"ok","check":"livez"}`) while the process runs.
+- **readiness** (`/readyz` by default) — `200` normally, but `503`
+  (`{"status":"draining",...}` + `Retry-After`) once the server is
+  gracefully draining (SIGTERM / upgrade hand-off), so a load
+  balancer / kubelet deregisters this instance before it goes away.
+  See [`lame-duck-timeout`](#lame-duck-timeout) to keep accepting
+  during that window.
+
+Liveness never flips to `503` while draining — a draining process is
+still alive and must not be restarted.
 
 ```kdl
-server { health enabled=#true }
+server {
+    health {
+        liveness-path "/livez"     # repeatable; overrides the defaults
+        readiness-path "/readyz"   # repeatable; overrides the defaults
+    }
+}
 ```
 
 ##### enabled
 
-**Property** on [`health`](#health).  Optional boolean.
+**Property** on [`health`](#health).  Optional boolean.  Server-wide
+default; a listener's [`health=`](#health-listener) overrides it per
+listener.  Bare `health` (no properties) is equivalent to `health
+enabled=#true`.
 
 **Default:** `#true` (when the `health` node is present).
+
+##### liveness-path / readiness-path
+
+**Repeating children** of [`health`](#health).  Optional.
+
+Override the default liveness / readiness path sets.  When either is
+given it *replaces* that set's defaults.  Paths must be absolute, and
+a path cannot be both a liveness and a readiness path.
+
+**Default:** liveness `/healthz` + `/livez`; readiness `/readyz`.
+
+### health (listener)
+
+**Property** on [`listener`](#listener).  Optional boolean.
+
+Per-listener override of the server-wide health default.  Set
+`health=#false` to keep the endpoints off a public listener (so
+liveness/readiness aren't exposed to the internet), or `health=#true`
+to force them on.  Ignored on L4 proxy listeners.
+
+```kdl
+listener "tcp://[::]:443" health=#false        # public: no health
+listener "tcp://10.0.0.1:9000"                 # admin: health on
+```
+
+**Default:** unset (inherits `server` `health enabled`).
 
 ### policy (server)
 

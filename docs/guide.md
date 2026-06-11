@@ -1990,28 +1990,56 @@ The page shows:
 HTML by default; `Accept: application/json` switches to JSON for
 scraping.
 
-### `/.well-known/health`
+### Health endpoints (liveness / readiness)
 
-[`health`](reference.md#health) on the server block enables a
-plain-text health endpoint on every vhost:
+[`health`](reference.md#health) (on by default) serves
+Kubernetes-style probes, intercepted before routing so they work
+without a `Host` header:
 
-```kdl
-server { health enabled=#true }
+- **liveness** `/healthz`, `/livez` — `200` JSON while the process
+  runs.  Point a `livenessProbe` here; it must NOT fail during a
+  graceful drain, or the kubelet would restart a pod that's cleanly
+  shutting down.
+- **readiness** `/readyz` — `200` normally, `503` while draining.
+  Point a `readinessProbe` here so the pod is removed from Service
+  endpoints as soon as it starts shutting down.
+
+```yaml
+# Kubernetes pod spec
+livenessProbe:  { httpGet: { path: /livez,  port: 80 } }
+readinessProbe: { httpGet: { path: /readyz, port: 80 } }
 ```
 
-A GET returns `200 OK` with body `ok\n` when the process is
-running.  Useful for container healthchecks (`HEALTHCHECK CMD
-curl -fsS http://localhost/.well-known/health`).
+For a clean rolling update, set
+[`lame-duck-timeout`](reference.md#lame-duck-timeout) so the server
+keeps accepting and serving for a few seconds after SIGTERM while
+`/readyz` returns `503` — the load balancer deregisters the instance
+before any connection is refused:
+
+```kdl
+server lame-duck-timeout=10
+```
+
+Rename the paths with `liveness-path` / `readiness-path`, disable
+globally with `health enabled=#false`, or keep them off a public
+listener with [`health=#false`](reference.md#health-listener):
+
+```kdl
+listener "tcp://[::]:443" health=#false   # public: no probes exposed
+listener "tcp://10.0.0.1:9000"            # internal: probes on
+```
 
 ### Restricting access
 
-Both endpoints expose operational detail; gate them behind a
+The status page exposes operational detail; gate it behind a
 [`policy`](reference.md#policy-location) (IP allowlist or
-authenticated identity) in production.
+authenticated identity) in production.  (Health probes are
+intentionally exempt from policy — restrict them via per-listener
+`health=#false` instead.)
 
 **See also**: [Reference -- status](reference.md#status),
 [`health`](reference.md#health),
-[Rate limit naming for the status page](#rate-limiting).
+[`lame-duck-timeout`](reference.md#lame-duck-timeout).
 
 ## Access logging
 
@@ -2431,7 +2459,8 @@ list:
       `request-header` and `handler` values for your workload
       (defaults are reasonable for general web traffic).
 - [ ] [`health`](reference.md#health) is enabled and the
-      container's `HEALTHCHECK` hits `/.well-known/health`.
+      container's `HEALTHCHECK` (and any k8s probes) hit `/livez`
+      (liveness) / `/readyz` (readiness).
 - [ ] [`status`](reference.md#status) handler is gated behind a
       [`policy`](reference.md#policy-location) (IP allowlist or
       auth).

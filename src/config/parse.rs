@@ -185,10 +185,26 @@ pub(super) fn parse_server(
         .and_then(|doc| {
             doc.nodes().iter().find(|n| n.name().value() == "health")
         })
-        .map(|n| HealthConfig {
-            // `health` enables health endpoint when present.  Use
-            // `health enabled=#false` to explicitly disable.
-            enabled: prop_bool(n, "enabled").unwrap_or(true),
+        .map(|n| {
+            // `health enabled=#false` disables; `liveness-path` /
+            // `readiness-path` repeating children override the default
+            // path sets (empty -> defaults).
+            let default = HealthConfig::default();
+            let liveness = repeated_strs(n, "liveness-path");
+            let readiness = repeated_strs(n, "readiness-path");
+            HealthConfig {
+                enabled: prop_bool(n, "enabled").unwrap_or(true),
+                liveness_paths: if liveness.is_empty() {
+                    default.liveness_paths
+                } else {
+                    liveness
+                },
+                readiness_paths: if readiness.is_empty() {
+                    default.readiness_paths
+                } else {
+                    readiness
+                },
+            }
         })
         .unwrap_or_default();
     // Collect named policy blocks defined in the server node.
@@ -266,6 +282,8 @@ pub(super) fn parse_server(
     let upgrade_startup_timeout =
         parse_nonneg_u32(node, "upgrade-startup-timeout", 60)
             .context("server.upgrade-startup-timeout")?;
+    let lame_duck_timeout = parse_nonneg_u32(node, "lame-duck-timeout", 0)
+        .context("server.lame-duck-timeout")?;
 
     Ok(ServerConfig {
         state_dir: prop_str(node, "state-dir"),
@@ -287,6 +305,7 @@ pub(super) fn parse_server(
         access_log,
         graceful_drain_timeout,
         upgrade_startup_timeout,
+        lame_duck_timeout,
     })
 }
 
@@ -471,6 +490,12 @@ pub(super) fn parse_listener(
                  valid in HTTP listeners"
             );
         }
+        if node.get("health").is_some() {
+            bail!(
+                "{name}:{proxy_line}: 'health' is only valid in HTTP \
+                 listeners"
+            );
+        }
         if children.iter().any(|n| n.name().value() == "timeouts") {
             bail!(
                 "{name}:{proxy_line}: 'timeouts' is only valid in HTTP \
@@ -539,6 +564,7 @@ pub(super) fn parse_listener(
             trusted_proxies,
             vhosts: Vec::new(),
             reject_unknown_host: false,
+            health: None,
             timeouts: Timeouts::default(),
             max_connections,
             max_request_body: None,
@@ -609,6 +635,7 @@ pub(super) fn parse_listener(
         trusted_proxies,
         vhosts,
         reject_unknown_host,
+        health: prop_bool(node, "health"),
         timeouts,
         max_connections,
         max_request_body,
