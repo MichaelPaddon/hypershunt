@@ -215,6 +215,7 @@ fn handler_type_name(h: &HandlerConfig) -> &'static str {
         HandlerConfig::Static { .. } => "static",
         HandlerConfig::Proxy { .. } => "proxy",
         HandlerConfig::Redirect { .. } => "redirect",
+        HandlerConfig::Respond { .. } => "respond",
         HandlerConfig::FastCgi { .. } => "fastcgi",
         HandlerConfig::Scgi { .. } => "scgi",
         HandlerConfig::Cgi { .. } => "cgi",

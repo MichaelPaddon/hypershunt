@@ -1225,6 +1225,103 @@ fn redirect_positional_form_parses() {
 }
 
 #[test]
+fn respond_inline_body_parses() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/health" {
+                respond status=200 body="OK\n" content-type="text/plain"
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    if let HandlerConfig::Respond {
+        status,
+        body,
+        content_type,
+    } = &cfg.vhosts[0].locations[0].handler
+    {
+        assert_eq!(*status, 200);
+        assert!(matches!(body, RespondBody::Inline(b) if b == "OK\n"));
+        assert_eq!(content_type.as_deref(), Some("text/plain"));
+    } else {
+        panic!("expected Respond handler");
+    }
+}
+
+#[test]
+fn respond_bare_defaults_to_200_empty() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/ping" { respond }
+        }
+        "#,
+    )
+    .unwrap();
+    if let HandlerConfig::Respond {
+        status,
+        body,
+        content_type,
+    } = &cfg.vhosts[0].locations[0].handler
+    {
+        assert_eq!(*status, 200);
+        assert!(matches!(body, RespondBody::Empty));
+        assert!(content_type.is_none());
+    } else {
+        panic!("expected Respond handler");
+    }
+}
+
+#[test]
+fn respond_body_and_file_together_is_error() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/x" { respond body="hi" file="x.html" }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("only one of"), "got: {err}");
+}
+
+#[test]
+fn respond_out_of_range_status_is_error() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/x" { respond status=799 }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("status must be"), "got: {err}");
+}
+
+#[test]
+fn respond_invalid_content_type_is_error() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/x" { respond body="hi" content-type="bad\nvalue" }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("content-type"), "got: {err}");
+}
+
+#[test]
 fn fastcgi_property_form_parses() {
     let cfg = Config::parse(
         r#"

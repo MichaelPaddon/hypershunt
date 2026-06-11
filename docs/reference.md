@@ -2007,7 +2007,8 @@ TCP/TLS only.
 
 Matches a URL path prefix and runs a handler (one of
 [`static`](#static), [`proxy`](#proxy-handler),
-[`redirect`](#redirect), [`fastcgi`](#fastcgi), [`scgi`](#scgi),
+[`redirect`](#redirect), [`respond`](#respond),
+[`fastcgi`](#fastcgi), [`scgi`](#scgi),
 [`cgi`](#cgi), [`status`](#status), [`auth-request`](#auth-request)).
 Locations are matched by longest-prefix; the longest matching
 prefix among the vhost's locations wins.
@@ -2793,6 +2794,63 @@ redirect to="https://{host}{path_and_query}" code=301
 HTTP status code.
 
 **Default:** `301`.
+
+#### respond
+
+**Handler** child of [`location`](#location).  Returns a fixed,
+inline (or file-backed) static response: a status code, an optional
+body, and an optional `Content-Type`.  Useful for health/ack
+endpoints, maintenance pages, fixed tokens, custom block messages,
+and small stubs.  Composes with the location's
+[`response-headers`](#response-headers).
+
+```kdl
+location "/health"  { respond status=200 body="OK\n" }
+location "/ping"    { respond status=204 }
+location "/blocked" { respond status=403 body="denied" content-type="text/plain" }
+location "/maint"   { respond status=503 file="maint.html" content-type="text/html" }
+location "/whoami"  { respond status=200 body="{client_ip} -> {host}{path}\n" }
+```
+
+##### status (respond)
+
+**Property** on [`respond`](#respond).  Optional integer (100–599).
+
+HTTP status code.
+
+**Default:** `200`.
+
+##### body (respond)
+
+**Property** on [`respond`](#respond).  Optional string.  Mutually
+exclusive with [`file`](#file-respond).
+
+Inline response body.  Supports the same template variables as
+[`redirect`](#to-redirect) `to` (e.g. `{host}`, `{path}`,
+`{client_ip}`).
+
+When neither `body` nor `file` is given, the response has an empty
+body (`Content-Length: 0`).
+
+##### file (respond)
+
+**Property** on [`respond`](#respond).  Optional string.  Mutually
+exclusive with [`body`](#body-respond).
+
+Path to a file whose contents form the response body.  The file is
+read on each request, so edits take effect without a reload.  A
+**relative path resolves against the directory of the config file**
+(not the process working directory).  A missing or unreadable file
+yields `500`.  File bodies are emitted verbatim (no templating).
+
+##### content-type (respond)
+
+**Property** on [`respond`](#respond).  Optional string.
+
+`Content-Type` for the response.  **Default:** `text/plain;
+charset=utf-8` when a body is present (no default for an empty body).
+A [`response-headers`](#response-headers) `set "Content-Type" …`
+rule overrides it.
 
 #### fastcgi
 

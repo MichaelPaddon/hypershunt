@@ -17,12 +17,16 @@ pub mod scgi;
 pub mod static_files;
 pub mod status;
 
-use crate::config::HandlerConfig;
-use crate::error::{HttpResponse, ReqBody, response_redirect};
+use crate::config::{HandlerConfig, RespondBody};
+use crate::error::{
+    HttpResponse, ReqBody, bytes_body, response_500, response_redirect,
+};
 use crate::headers::{RequestContext, Template};
 use crate::metrics::Metrics;
 use async_trait::async_trait;
-use hyper::Request;
+use bytes::Bytes;
+use hyper::{Method, Request, Response, StatusCode, header};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Trait every request handler implements.  Picked up by the router
@@ -55,6 +59,86 @@ impl Handler for RedirectHandler {
         ctx: &RequestContext<'_>,
     ) -> HttpResponse {
         response_redirect(&self.to.render(ctx), self.code)
+    }
+}
+
+/// Where a `RespondHandler` gets its body.  Inline bodies are templated
+/// (so `{host}`, `{path}`, … expand like a redirect target); file bodies
+/// are read per-request and emitted verbatim.
+enum RespondBodySource {
+    Empty,
+    Inline(Template),
+    File(PathBuf),
+}
+
+/// Static-response handler: emits a fixed status with an optional inline
+/// or file-backed body and an optional Content-Type.  The `redirect`
+/// handler's body-less cousin for canned responses (health acks,
+/// maintenance pages, block messages, tiny stubs).
+pub struct RespondHandler {
+    status: StatusCode,
+    body: RespondBodySource,
+    content_type: Option<String>,
+}
+
+impl RespondHandler {
+    /// Build the response.  Split out from `handle` so tests can drive it
+    /// with a bare `Method` + `RequestContext` instead of a live
+    /// `Request<ReqBody>`.
+    async fn respond(
+        &self,
+        method: &Method,
+        ctx: &RequestContext<'_>,
+    ) -> HttpResponse {
+        let body_bytes: Option<Bytes> = match &self.body {
+            RespondBodySource::Empty => None,
+            RespondBodySource::Inline(t) => Some(Bytes::from(t.render(ctx))),
+            RespondBodySource::File(path) => {
+                match tokio::fs::read(path).await {
+                    Ok(b) => Some(Bytes::from(b)),
+                    // A misconfigured/removed file is a server fault.
+                    Err(_) => return response_500(),
+                }
+            }
+        };
+
+        let mut builder = Response::builder().status(self.status);
+        // Content-Type: an explicit value always wins; otherwise default
+        // to text/plain only when there is actually a body to type.
+        let ct = self.content_type.as_deref().or(if body_bytes.is_some() {
+            Some("text/plain; charset=utf-8")
+        } else {
+            None
+        });
+        if let Some(ct) = ct {
+            builder = builder.header(header::CONTENT_TYPE, ct);
+        }
+
+        // HEAD: report Content-Length but send no body.
+        let body = match body_bytes {
+            Some(bytes) if *method == Method::HEAD => {
+                builder = builder
+                    .header(header::CONTENT_LENGTH, bytes.len().to_string());
+                bytes_body(Bytes::new())
+            }
+            Some(bytes) => bytes_body(bytes),
+            None => bytes_body(Bytes::new()),
+        };
+        builder
+            .body(body)
+            .expect("validated status, header value, and body")
+    }
+}
+
+#[async_trait]
+impl Handler for RespondHandler {
+    async fn handle(
+        &self,
+        req: Request<ReqBody>,
+        _matched_prefix: &str,
+        ctx: &RequestContext<'_>,
+    ) -> HttpResponse {
+        self.respond(req.method(), ctx).await
     }
 }
 
@@ -159,6 +243,34 @@ pub fn build_handler(
             }) as Arc<dyn Handler>,
             None,
         )),
+        HandlerConfig::Respond {
+            status,
+            body,
+            content_type,
+        } => {
+            let body = match body {
+                RespondBody::Empty => RespondBodySource::Empty,
+                RespondBody::Inline(s) => {
+                    RespondBodySource::Inline(Template::parse(s))
+                }
+                RespondBody::File(p) => {
+                    RespondBodySource::File(PathBuf::from(p))
+                }
+            };
+            // Status is validated to 100-599 at parse time; re-check
+            // defensively rather than unwrap.
+            let status = StatusCode::from_u16(*status).map_err(|_| {
+                anyhow::anyhow!("respond: invalid status code {status}")
+            })?;
+            Ok((
+                Arc::new(RespondHandler {
+                    status,
+                    body,
+                    content_type: content_type.clone(),
+                }) as Arc<dyn Handler>,
+                None,
+            ))
+        }
         HandlerConfig::FastCgi { socket, root, index } => Ok((
             Arc::new(fcgi::FcgiHandler::new(
                 socket,
@@ -206,5 +318,128 @@ pub fn build_handler(
                 anyhow::bail!("cgi handler is only supported on Unix")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod respond_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    fn ctx<'a>(host: &'a str, path: &'a str) -> RequestContext<'a> {
+        RequestContext {
+            client_ip: "203.0.113.7",
+            username: "",
+            groups: "",
+            method: "GET",
+            path,
+            query: "",
+            path_and_query: path,
+            host,
+            scheme: "http",
+            client_cert_subject: "",
+            client_cert_sans: "",
+        }
+    }
+
+    async fn body_of(resp: HttpResponse) -> Vec<u8> {
+        resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+    }
+
+    fn inline(body: &str, content_type: Option<&str>) -> RespondHandler {
+        RespondHandler {
+            status: StatusCode::OK,
+            body: RespondBodySource::Inline(Template::parse(body)),
+            content_type: content_type.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_configured_status_and_body() {
+        let h = RespondHandler {
+            status: StatusCode::IM_A_TEAPOT,
+            body: RespondBodySource::Inline(Template::parse("hi\n")),
+            content_type: None,
+        };
+        let r = h.respond(&Method::GET, &ctx("example.com", "/")).await;
+        assert_eq!(r.status(), 418);
+        assert_eq!(body_of(r).await, b"hi\n");
+    }
+
+    #[tokio::test]
+    async fn inline_body_is_templated() {
+        let h = inline("{client_ip} -> {host}{path}\n", None);
+        let r = h.respond(&Method::GET, &ctx("example.com", "/x")).await;
+        assert_eq!(body_of(r).await, b"203.0.113.7 -> example.com/x\n");
+    }
+
+    #[tokio::test]
+    async fn empty_body_has_no_content_type_and_zero_length() {
+        let h = RespondHandler {
+            status: StatusCode::NO_CONTENT,
+            body: RespondBodySource::Empty,
+            content_type: None,
+        };
+        let r = h.respond(&Method::GET, &ctx("h", "/")).await;
+        assert_eq!(r.status(), 204);
+        assert!(r.headers().get(header::CONTENT_TYPE).is_none());
+        assert_eq!(body_of(r).await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn default_content_type_when_body_present() {
+        let h = inline("hello", None);
+        let r = h.respond(&Method::GET, &ctx("h", "/")).await;
+        assert_eq!(
+            r.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_content_type_wins() {
+        let h = inline("{\"ok\":true}", Some("application/json"));
+        let r = h.respond(&Method::GET, &ctx("h", "/")).await;
+        assert_eq!(
+            r.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_sends_content_length_but_no_body() {
+        let h = inline("hello", None);
+        let r = h.respond(&Method::HEAD, &ctx("h", "/")).await;
+        assert_eq!(r.headers().get(header::CONTENT_LENGTH).unwrap(), "5");
+        assert_eq!(body_of(r).await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn file_body_is_served_with_default_type() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("hypershunt_respond_test_ok.txt");
+        std::fs::write(&path, b"from-file\n").unwrap();
+        let h = RespondHandler {
+            status: StatusCode::OK,
+            body: RespondBodySource::File(path.clone()),
+            content_type: None,
+        };
+        let r = h.respond(&Method::GET, &ctx("h", "/")).await;
+        assert_eq!(r.status(), 200);
+        assert_eq!(body_of(r).await, b"from-file\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn missing_file_yields_500() {
+        let h = RespondHandler {
+            status: StatusCode::OK,
+            body: RespondBodySource::File(PathBuf::from(
+                "/nonexistent/hypershunt/respond.html",
+            )),
+            content_type: None,
+        };
+        let r = h.respond(&Method::GET, &ctx("h", "/")).await;
+        assert_eq!(r.status(), 500);
     }
 }

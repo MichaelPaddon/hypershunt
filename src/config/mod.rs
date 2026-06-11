@@ -688,6 +688,20 @@ pub enum RateLimitKeyConfig {
     Header(String),
 }
 
+/// Body source for the `respond` handler.
+#[derive(Debug, Clone)]
+pub enum RespondBody {
+    /// No body; the response carries Content-Length 0.
+    Empty,
+    /// Inline body text, compiled to a `Template` and rendered against
+    /// the request context at request time.
+    Inline(String),
+    /// Path to a file whose contents form the body, read per-request so
+    /// edits take effect without a reload.  Stored already resolved
+    /// relative to the config file's directory.
+    File(String),
+}
+
 #[derive(Debug)]
 pub enum HandlerConfig {
     Static {
@@ -788,6 +802,14 @@ pub enum HandlerConfig {
     Redirect {
         to: String,
         code: u16,
+    },
+    /// Inline/file-backed static response: a fixed status code, an
+    /// optional body (inline template or file), and an optional
+    /// Content-Type.  Composes with the location's `response-headers`.
+    Respond {
+        status: u16,
+        body: RespondBody,
+        content_type: Option<String>,
     },
     FastCgi {
         socket: String,

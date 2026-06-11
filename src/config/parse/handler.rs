@@ -3,13 +3,14 @@
 // into typed `HandlerConfig` variants.
 
 use super::super::kdl::*;
-use super::super::{HandlerConfig, UpstreamTlsConfig};
+use super::super::{HandlerConfig, RespondBody, UpstreamTlsConfig};
 use super::{
     node_line, parse_proxy_protocol, prop_bool, prop_i64, prop_str,
     repeated_strs,
 };
 use ::kdl::KdlNode;
 use anyhow::{Context, anyhow, bail};
+use hyper::header::HeaderValue;
 
 pub(super) fn parse_handler(
     node: &KdlNode,
@@ -22,6 +23,7 @@ pub(super) fn parse_handler(
         "static" => parse_static(node, src, name),
         "proxy" => parse_proxy(node, src, name),
         "redirect" => parse_redirect(node, src, name),
+        "respond" => parse_respond(node, src, name),
         "fastcgi" => {
             let (socket, root, index) =
                 parse_socket_handler(node, src, name, "fastcgi")?;
@@ -409,5 +411,114 @@ fn parse_redirect(
     })?;
     let code = prop_i64(node, "code").map(|n| n as u16).unwrap_or(301);
     Ok(HandlerConfig::Redirect { to, code })
+}
+
+fn parse_respond(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<HandlerConfig> {
+    let line = node_line(src, node);
+    // status defaults to 200 (a bare `respond` is a valid 200 endpoint).
+    let status = match prop_i64(node, "status") {
+        Some(n) if (100..=599).contains(&n) => n as u16,
+        Some(n) => bail!(
+            "{name}:{line}: respond status must be 100-599, got {n}"
+        ),
+        None => 200,
+    };
+    // `body` (inline) and `file` are mutually exclusive, mirroring the
+    // error-page path/html rule.  Absent both -> an empty body.
+    let inline = prop_str(node, "body");
+    let file = prop_str(node, "file");
+    let body = match (inline, file) {
+        (Some(_), Some(_)) => bail!(
+            "{name}:{line}: respond accepts only one of body=\"...\" \
+             or file=\"...\""
+        ),
+        (Some(b), None) => RespondBody::Inline(b),
+        // A relative file path resolves against the config file's
+        // directory so configs stay portable regardless of CWD.
+        (None, Some(f)) => {
+            RespondBody::File(resolve_config_relative(name, &f))
+        }
+        (None, None) => RespondBody::Empty,
+    };
+    // Reject a malformed Content-Type now rather than silently dropping
+    // the header at request time.
+    let content_type = prop_str(node, "content-type");
+    if let Some(ct) = &content_type {
+        HeaderValue::from_str(ct).map_err(|_| {
+            anyhow!(
+                "{name}:{line}: respond content-type is not a valid \
+                 header value: {ct:?}"
+            )
+        })?;
+    }
+    Ok(HandlerConfig::Respond {
+        status,
+        body,
+        content_type,
+    })
+}
+
+/// Resolve a possibly-relative path against the directory of the KDL
+/// config file.  `name` is the config file path threaded through every
+/// parser (empty under `Config::parse` in tests).  Absolute paths and
+/// the empty-`name` case pass through unchanged so absolute paths and
+/// inline test configs behave intuitively.
+fn resolve_config_relative(name: &str, path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() || name.is_empty() {
+        return path.to_owned();
+    }
+    match std::path::Path::new(name).parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            dir.join(p).to_string_lossy().into_owned()
+        }
+        _ => path.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_config_relative;
+
+    #[test]
+    fn absolute_path_passes_through() {
+        assert_eq!(
+            resolve_config_relative("/etc/hypershunt.kdl", "/var/x.html"),
+            "/var/x.html"
+        );
+    }
+
+    #[test]
+    fn relative_joins_config_dir() {
+        assert_eq!(
+            resolve_config_relative("/etc/hypershunt.kdl", "maint.html"),
+            "/etc/maint.html"
+        );
+        assert_eq!(
+            resolve_config_relative("/etc/hs/site.kdl", "pages/503.html"),
+            "/etc/hs/pages/503.html"
+        );
+    }
+
+    #[test]
+    fn empty_name_passes_through() {
+        // Config::parse (tests) supplies an empty name -> keep the path
+        // as-is, resolved relative to CWD like every other path.
+        assert_eq!(resolve_config_relative("", "maint.html"), "maint.html");
+    }
+
+    #[test]
+    fn bare_config_name_has_no_dir() {
+        // A config named without a directory component -> nothing to
+        // prefix, so the path is unchanged.
+        assert_eq!(
+            resolve_config_relative("hypershunt.kdl", "maint.html"),
+            "maint.html"
+        );
+    }
 }
 
