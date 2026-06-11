@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/hs-icon.svg" alt="hypershunt" width="440">
+  <img src="docs/hs-logo.svg" alt="hypershunt" width="440">
   <p>HTTP server and reverse proxy.<br>
   Simple configuration. Just works. No surprises.</p>
 </div>

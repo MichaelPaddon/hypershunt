@@ -314,12 +314,17 @@ impl Handler for StatusHandler {
         matched_prefix: &str,
         _ctx: &RequestContext<'_>,
     ) -> HttpResponse {
-        // Brand-icon requests (sidebar image + favicon share one asset)
-        // are intercepted before content-negotiation so the browser
-        // caches the icon independently of the page HTML.
-        if req.uri().path().rsplit('/').next() == Some(render_html::ICON_FILE)
-        {
-            return render_html::serve_icon(req.headers());
+        // Brand-asset requests (the sidebar lockup and the square
+        // favicon) are intercepted before content-negotiation so the
+        // browser caches them independently of the page HTML.
+        match req.uri().path().rsplit('/').next() {
+            Some(f) if f == render_html::ICON_FILE => {
+                return render_html::serve_icon(req.headers());
+            }
+            Some(f) if f == render_html::FAVICON_FILE => {
+                return render_html::serve_favicon(req.headers());
+            }
+            _ => {}
         }
         let period = query_period(req.uri());
         let snap = self.metrics.snapshot();
@@ -1335,18 +1340,35 @@ mod tests {
         let bytes =
             resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&bytes).unwrap();
-        // The sidebar brand image uses the icon at the matched prefix.
+        // The sidebar brand image uses the wide lockup at the prefix.
         assert!(
             html.contains("src=\"/status/hs-icon.svg\""),
             "img src must use the matched prefix: {html}",
         );
-        // The favicon link uses the same icon asset.
+        // The browser-tab favicon uses the square crop, not the lockup.
         assert!(
             html.contains(
                 "rel=\"icon\" type=\"image/svg+xml\" \
-                 href=\"/status/hs-icon.svg\""
+                 href=\"/status/hs-favicon.svg\""
             ),
-            "favicon link must use the matched prefix: {html}",
+            "favicon link must use the square favicon: {html}",
         );
+    }
+
+    #[tokio::test]
+    async fn serve_favicon_returns_svg() {
+        use http_body_util::BodyExt;
+        use hyper::HeaderMap;
+        let resp = render_html::serve_favicon(&HeaderMap::new());
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/svg+xml"),
+        );
+        let bytes =
+            resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(!bytes.is_empty());
     }
 }
