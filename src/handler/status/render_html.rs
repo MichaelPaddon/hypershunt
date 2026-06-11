@@ -11,31 +11,19 @@ use bytes::Bytes;
 use hyper::{Response, StatusCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// PNG logo embedded at compile time and served from a sub-path so the
-// browser caches it after the first load rather than bloating the HTML.
-pub(super) const LOGO_PNG: &[u8] =
-    include_bytes!("../../../docs/hypershunt-logo.png");
-pub(super) const LOGO_FILE: &str = "hypershunt-logo.png";
+// SVG brand icon embedded at compile time and served from a sub-path so
+// the browser caches it independently of the page HTML.  The same asset
+// backs both the sidebar brand image and the favicon.
+pub(super) const ICON_SVG: &[u8] =
+    include_bytes!("../../../docs/hs-icon.svg");
+pub(super) const ICON_FILE: &str = "hs-icon.svg";
 
-// SVG favicon, embedded at compile time and served from a sub-path so
-// the browser caches it independently of the page HTML.
-pub(super) const FAVICON_SVG: &[u8] =
-    include_bytes!("../../../docs/hypershunt-favicon.svg");
-pub(super) const FAVICON_FILE: &str = "hypershunt-favicon.svg";
-
-/// Serve the PNG logo with a 24-hour cache and ETag support.
+/// Serve the SVG brand icon with a 24-hour cache and ETag support.
 /// Returns 304 Not Modified when the client's ETag matches.
-pub(super) fn serve_logo(
+pub(super) fn serve_icon(
     headers: &hyper::HeaderMap,
 ) -> HttpResponse {
-    serve_cached_asset(LOGO_PNG, "image/png", headers)
-}
-
-/// Serve the SVG favicon with the same cache/ETag handling as the logo.
-pub(super) fn serve_favicon(
-    headers: &hyper::HeaderMap,
-) -> HttpResponse {
-    serve_cached_asset(FAVICON_SVG, "image/svg+xml", headers)
+    serve_cached_asset(ICON_SVG, "image/svg+xml", headers)
 }
 
 /// Serve an embedded, immutable byte asset with a 24-hour cache and a
@@ -606,17 +594,13 @@ pub(super) fn render_html(
     matched_prefix: &str,
 ) -> HttpResponse {
     let total_lat: u64 = s.latency.iter().sum();
-    // Logo served from a sub-path relative to wherever the status
-    // location is mounted (/, /status, /.hypershunt/status, …).
-    let logo_src = format!(
+    // Brand icon served from a sub-path relative to wherever the status
+    // location is mounted (/, /status, /.hypershunt/status, …).  The
+    // same URL backs both the sidebar image and the favicon link.
+    let icon_src = format!(
         "{}/{}",
         matched_prefix.trim_end_matches('/'),
-        LOGO_FILE
-    );
-    let favicon_src = format!(
-        "{}/{}",
-        matched_prefix.trim_end_matches('/'),
-        FAVICON_FILE
+        ICON_FILE
     );
     let resource_sec = resource_section(s.memory_kb, s.cpu_percent);
     let certs_sec = certs_section(certs);
@@ -693,14 +677,14 @@ pub(super) fn render_html(
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>hypershunt — Status</title>
-<link rel="icon" type="image/svg+xml" href="{favicon_src}">
+<link rel="icon" type="image/svg+xml" href="{icon_src}">
 <style>{css}</style>
 </head>
 <body>
 
 <aside class="sidebar">
   <div class="sidebar-brand">
-    <a id="logo-link" href="/" style="display:block"><img class="brand-logo" src="{logo_src}" alt="hypershunt" width="140"></a>
+    <a id="logo-link" href="/" style="display:block"><img class="brand-logo" src="{icon_src}" alt="hypershunt" width="140"></a>
   </div>
   <div class="sidebar-live">
     <span class="live-dot" id="live-dot"></span>
@@ -899,8 +883,7 @@ pub(super) fn render_html(
 </body>
 </html>"##,
         css = CSS,
-        logo_src = logo_src,
-        favicon_src = favicon_src,
+        icon_src = icon_src,
         version = sum.version,
         mem_nav = mem_nav,
         auth_nav = auth_nav,
