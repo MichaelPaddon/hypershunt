@@ -45,24 +45,43 @@ vhost "example.com" {
 Force every plaintext request to HTTPS while still answering ACME
 challenges (hypershunt serves the challenge before the redirect fires).
 
+The catch: the redirect must fire on port 80 **only**.  A single vhost
+that redirects to its own `https://` URL and is served on the TLS
+listener too would `301` HTTPS requests back to themselves — an infinite
+loop.  So scope a redirect-only vhost to port 80 with
+[`explicit-only`](reference.md#explicit-only) (keeping it off every other
+listener) and serve the real site on 443:
+
 ```kdl
 server user="hypershunt" state-dir="/var/lib/hypershunt"
 
-listener "tcp://[::]:80"
+# Port 80 serves ONLY the redirect vhost.  ACME HTTP-01 challenges are
+# answered before the redirect fires, so renewals keep working.
+listener "tcp://[::]:80" { vhost "to-https" }
+
+# Port 443 serves the real site.  Because the redirect vhost is
+# explicit-only, the implicit set here is just "site" -- HTTPS never
+# redirects to itself.
 listener "tcp://[::]:443" {
     tls "acme" email="ops@example.com" { domain "example.com" }
 }
 
-vhost "example.com" {
-    // Plaintext requests get a permanent redirect to the TLS site,
-    // preserving the original path and query.
+# Redirect-only vhost: explicit-only keeps it off every listener except
+# the one that names it (port 80).  Preserves the original path + query.
+vhost "example.com" name="to-https" explicit-only=#true {
     location "/" {
         redirect to="https://{host}{path_and_query}" code=301
     }
 }
+
+# The real site, served on 443.
+vhost "example.com" name="site" {
+    location "/" { static root="/var/www/example" }
+}
 ```
 
-**See also:** [URL redirects](guide.md#url-redirects).
+**See also:** [URL redirects](guide.md#url-redirects),
+[Different sites per port](#different-sites-per-port-per-listener-vhost-scoping).
 
 ## Reverse proxy with load balancing
 

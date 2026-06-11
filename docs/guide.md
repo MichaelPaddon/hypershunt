@@ -1024,6 +1024,14 @@ location "/old-section/" {
 }
 ```
 
+> [!WARNING]
+> A same-host `http -> https` redirect must be served on the **HTTP
+> listener only**.  If the same vhost is also served on the TLS
+> listener, HTTPS requests redirect to themselves and loop.  Scope it
+> with an [`explicit-only`](reference.md#explicit-only) vhost listed on
+> the port-80 listener — see
+> [Redirect all HTTP to HTTPS](recipes.md#redirect-all-http-to-https).
+
 Template variables: `{host}` (the original `Host`),
 `{path_and_query}` (path plus original query string), plus the
 same set available in [header rules](#header-manipulation)
