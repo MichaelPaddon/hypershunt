@@ -23,9 +23,10 @@ listener "tcp://[::]:443" {
 }
 
 vhost "localhost" {
-    // Built-in status page.  Useful for container health checks:
-    //   curl -f http://localhost:80/status
-    // Restrict to internal IPs in production via a policy block.
+    // Built-in status page.  For container/k8s health checks prefer the
+    // lightweight probe endpoints (always on): /livez (liveness) and
+    // /readyz (readiness, 503 while draining).  Restrict the status page
+    // to internal IPs in production via a policy block.
     location "/status" {
         status
     }

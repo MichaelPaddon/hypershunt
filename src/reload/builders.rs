@@ -560,7 +560,10 @@ mod tests {
             authenticator: Arc::new(AnonymousAuthenticator),
             metrics: metrics.clone(),
             geoip: None,
-            health_enabled: cfg.server.health.enabled,
+            health: Arc::new(crate::handler::health::HealthState::from_config(
+                &cfg.server.health,
+                &cfg.listeners,
+            )),
             error_pages: Arc::new(ErrorPages::new(HashMap::new())),
             jwt_manager: None,
             oidc: None,

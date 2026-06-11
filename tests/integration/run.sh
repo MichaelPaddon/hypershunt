@@ -46,6 +46,8 @@ source "$TESTS_DIR/suite_udp.sh"
 source "$TESTS_DIR/suite_websocket.sh"
 # shellcheck source=suite_routing.sh
 source "$TESTS_DIR/suite_routing.sh"
+# shellcheck source=suite_health.sh
+source "$TESTS_DIR/suite_health.sh"
 # shellcheck source=suite_headers.sh
 source "$TESTS_DIR/suite_headers.sh"
 # shellcheck source=suite_jwt.sh
@@ -110,6 +112,8 @@ suite_websocket_h1_h1
 suite_websocket_h1_h2c
 suite_ldap_auth
 suite_health_endpoint
+suite_health_config
+suite_health_lame_duck
 suite_multi_vhost
 suite_vhost_aliases
 suite_regex_vhost

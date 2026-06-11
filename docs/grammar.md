@@ -150,6 +150,7 @@ Examples:
 - `inherit-supplementary-groups=`[`<boolean>`](#boolean)
 - `graceful-drain-timeout=`[`<integer>`](#integer)
 - `upgrade-startup-timeout=`[`<integer>`](#integer)
+- `lame-duck-timeout=`[`<integer>`](#integer)
 - `cert-key-mode=`[`<string>`](#string)
 
 ### `server-child`
@@ -157,10 +158,19 @@ Examples:
 - [`<tls-options-block>`](#tls-options-block)
 - [`<auth-backend>`](#auth-backend)
 - `"geoip"` `db=`[`<string>`](#string)
-- `"health"` ( `enabled=`[`<boolean>`](#boolean) )?
+- `"health"` ( `enabled=`[`<boolean>`](#boolean) )? ( `{`
+  [`<health-child>`](#health-child)* `}` )?
 - [`<policy-def>`](#policy-def)
 - [`<error-page-def>`](#error-page-def)
 - [`<access-log-block>`](#access-log-block)
+
+### `health-child`
+
+- `"liveness-path"` [`<string>`](#string)
+- `"readiness-path"` [`<string>`](#string)
+
+Both are repeating single-argument children (rule 4); each overrides
+its default path set when present.
 
 ### `tls-options-block`
 
@@ -335,6 +345,7 @@ Prefixed children for repeating values of the wrapped backend:
 
 - `accept-proxy-protocol=`( `"v1"` | `"v2"` )
 - `reject-unknown-host=`[`<boolean>`](#boolean)
+- `health=`[`<boolean>`](#boolean)
 - `max-connections=`[`<integer>`](#integer)
 - `max-request-body=`[`<integer>`](#integer)
 

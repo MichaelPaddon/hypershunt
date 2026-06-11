@@ -57,7 +57,12 @@ impl TestServer {
             crate::handler::status::ServerSummary::from_config(&config),
         );
         let router = Router::new(&config, &metrics, &summary, None).unwrap();
-        let health_enabled = config.server.health.enabled;
+        let health = Arc::new(
+            crate::handler::health::HealthState::from_config(
+                &config.server.health,
+                &config.listeners,
+            ),
+        );
         // Take the parsed ListenerConfig so timeouts etc. are honoured.
         let cfg = config.listeners.into_iter().next().unwrap();
         let state = Arc::new(AppState {
@@ -66,7 +71,7 @@ impl TestServer {
             authenticator: Arc::new(AnonymousAuthenticator),
             metrics,
             geoip: None,
-            health_enabled,
+            health,
             error_pages: Arc::new(ErrorPages::new(HashMap::new())),
             jwt_manager: None,
             oidc: None,
@@ -148,6 +153,7 @@ impl TestServer {
             trusted_proxies: Vec::new(),
             vhosts: Vec::new(),
             reject_unknown_host: false,
+            health: None,
             timeouts: Timeouts::default(),
             max_connections: None,
             max_request_body: None,
