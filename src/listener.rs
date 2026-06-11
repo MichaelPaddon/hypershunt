@@ -69,8 +69,10 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     // Optional GeoIP reader; present when server.geoip is configured.
     pub geoip: Option<Arc<geoip::CountryReader>>,
-    // When true, /healthz /livez /readyz are intercepted before routing.
-    pub health_enabled: bool,
+    // Resolved health-endpoint config: which paths are liveness vs
+    // readiness, and on which listeners they're served.  Built from
+    // server `health` config + per-listener `health=` overrides.
+    pub health: Arc<crate::handler::health::HealthState>,
     // Per-status custom error pages; empty if none configured.
     pub error_pages: Arc<ErrorPages>,
     // JWT manager: present when `auth jwt` is configured.  Serves the

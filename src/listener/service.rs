@@ -255,12 +255,16 @@ impl HypershuntService {
                 }
             }
 
-            // Health endpoint interception: /healthz, /livez, /readyz.
+            // Health endpoint interception (liveness/readiness).
             // Answered before vhost routing so they work without a Host
             // header and cannot be shadowed by user-defined locations.
-            if state.health_enabled
-                && let Some(resp) = crate::handler::health::try_serve(&req)
-            {
+            // Readiness flips to 503 while the process is draining.
+            if let Some(resp) = crate::handler::health::try_serve(
+                &req,
+                &bind,
+                &state.health,
+                &crate::handler::health::DRAINING,
+            ) {
                 let ms = start.elapsed().as_millis();
                 state.metrics.dec_active();
                 state.metrics.record(resp.status().as_u16(), ms);

@@ -132,6 +132,13 @@ pub struct ServerConfig {
     /// accept behaviour.  Default 60.
     #[allow(dead_code)] // consumed by SIGUSR2 ready-pipe protocol (#109)
     pub upgrade_startup_timeout: u32,
+    /// Seconds an HTTP (TCP) listener keeps accepting and serving after
+    /// SIGTERM before it stops accepting and drains.  During this
+    /// "lame-duck" window readiness paths return `503`, so a load
+    /// balancer / kubelet deregisters this instance *before* new
+    /// connections start being refused.  `0` (the default) stops
+    /// accepting immediately.
+    pub lame_duck_timeout: u32,
 }
 
 impl Default for ServerConfig {
@@ -152,6 +159,7 @@ impl Default for ServerConfig {
             graceful_drain_timeout: 0,
             // Mirror parse_server()'s default for the same key.
             upgrade_startup_timeout: 60,
+            lame_duck_timeout: 0,
         }
     }
 }
@@ -180,18 +188,36 @@ pub enum AccessLogFormatConfig {
 
 /// Built-in health endpoint configuration.
 ///
-/// When enabled (the default), GET/HEAD requests to `/healthz`,
-/// `/livez`, and `/readyz` are intercepted before vhost routing and
-/// answered with a lightweight JSON response.  Disable only if you
-/// need those paths for application traffic.
+/// When enabled (the default), GET/HEAD requests to the liveness and
+/// readiness paths are intercepted before vhost routing and answered
+/// with a lightweight JSON response.  Liveness paths return `200` while
+/// the process runs; readiness paths return `200` normally and `503`
+/// while the server is gracefully draining.  Disable, restrict per
+/// listener (`health=#false`), or rename the paths as needed.
 #[derive(Debug, Clone)]
 pub struct HealthConfig {
+    /// Server-wide default for whether health endpoints are served.  A
+    /// listener's `health=` overrides this for that listener.
     pub enabled: bool,
+    /// Paths that always return `200` while the process runs.
+    pub liveness_paths: Vec<String>,
+    /// Paths that return `503` while draining, `200` otherwise.
+    pub readiness_paths: Vec<String>,
 }
 
 impl Default for HealthConfig {
     fn default() -> Self {
-        HealthConfig { enabled: true }
+        HealthConfig {
+            enabled: true,
+            liveness_paths: crate::handler::health::DEFAULT_LIVENESS_PATHS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            readiness_paths: crate::handler::health::DEFAULT_READINESS_PATHS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
     }
 }
 
@@ -339,6 +365,11 @@ pub struct ListenerConfig {
     // the former `default-vhost=#null`; overrides "first entry is the
     // default" (the default becomes None).
     pub reject_unknown_host: bool,
+    // Per-listener override for the built-in health endpoints.  None
+    // inherits the server-level `health enabled=` default; Some(false)
+    // keeps health off this listener (e.g. a public port), Some(true)
+    // forces it on.  Ignored on L4 proxy listeners.
+    pub health: Option<bool>,
     pub timeouts: Timeouts,
     // Cap on simultaneous open connections; None = unlimited.
     // New connections are deferred (not dropped) at the limit.
@@ -924,6 +955,27 @@ impl Config {
         let has_http = self.listeners.iter().any(|l| l.proxy.is_none());
         if has_http && self.vhosts.is_empty() {
             bail!("config must define at least one vhost");
+        }
+        // Health paths must be absolute, and a path can't be both a
+        // liveness and a readiness check (its drain behaviour would be
+        // ambiguous).
+        {
+            let h = &self.server.health;
+            for p in h.liveness_paths.iter().chain(h.readiness_paths.iter()) {
+                if !p.starts_with('/') {
+                    bail!("health path '{p}' must start with '/'");
+                }
+            }
+            let live: HashSet<&str> =
+                h.liveness_paths.iter().map(String::as_str).collect();
+            for p in &h.readiness_paths {
+                if live.contains(p.as_str()) {
+                    bail!(
+                        "health path '{p}' is listed as both liveness \
+                         and readiness"
+                    );
+                }
+            }
         }
         // Per-listener layer matrix:
         //

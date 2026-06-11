@@ -350,7 +350,10 @@ async fn main() -> anyhow::Result<()> {
         authenticator,
         metrics: metrics.clone(),
         geoip,
-        health_enabled: config.server.health.enabled,
+        health: Arc::new(crate::handler::health::HealthState::from_config(
+            &config.server.health,
+            &config.listeners,
+        )),
         error_pages,
         jwt_manager,
         oidc,
@@ -634,11 +637,32 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await.context("ctrl-c signal")?;
 
+    // We are now draining.  Flip readiness to 503 immediately so a load
+    // balancer / kubelet sees the instance as not-ready right away.
+    crate::handler::health::set_draining();
     if via_upgrade {
+        // The child already took over accepting; drain the parent
+        // promptly (no lame-duck -- the child serves new traffic).
         tracing::info!(
             "upgrade: child took over; draining parent connections"
         );
     } else {
+        // Lame-duck window: keep accepting + serving (readiness already
+        // reports 503) so the LB deregisters this instance before we
+        // stop accepting and connections would be refused.  We delay the
+        // shutdown signal rather than the accept loop so in-flight and
+        // fresh requests are both served normally during the window.
+        let lame_duck = config.server.lame_duck_timeout;
+        if lame_duck > 0 {
+            tracing::info!(
+                secs = lame_duck,
+                "shutdown: lame-duck (readiness 503, still serving)"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(
+                lame_duck as u64,
+            ))
+            .await;
+        }
         tracing::info!("shutdown: signalling listeners");
         let _ = shutdown_tx.send(true);
     }
