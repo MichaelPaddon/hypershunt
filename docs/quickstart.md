@@ -15,8 +15,11 @@ The examples use `podman`; replace with `docker` (and drop the
 ## Serve the bundled landing page
 
 ```sh
-podman run --rm -p 8080:80 ghcr.io/michaelpaddon/hypershunt:latest
+podman run --rm --pull=newer -p 8080:80 ghcr.io/michaelpaddon/hypershunt:latest
 ```
+
+(`--pull=newer` refreshes a previously cached `:latest` image; the
+later commands on this page can omit it.)
 
 Open <http://localhost:8080>.  You'll see hypershunt's built-in
 landing page served from `/var/www/hypershunt/` inside the container.

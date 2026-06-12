@@ -48,7 +48,7 @@ Or try it in one line, no root required — the container serves its own
 documentation out of the box:
 
 ```sh
-podman run --rm -p 8080:80 -p 8443:443 ghcr.io/michaelpaddon/hypershunt:latest
+podman run --rm --pull=newer -p 8080:80 -p 8443:443 ghcr.io/michaelpaddon/hypershunt:latest
 ```
 
 Open <http://localhost:8080> (or <https://localhost:8443> with the
