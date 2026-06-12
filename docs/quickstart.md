@@ -12,7 +12,7 @@ container image.  No build, no install.
 The examples use `podman`; replace with `docker` (and drop the
 `:Z` SELinux relabel flag) on systems without podman.
 
-## Serve the bundled landing page
+## Serve the bundled documentation
 
 ```sh
 podman run --rm --pull=newer -p 8080:80 ghcr.io/michaelpaddon/hypershunt:latest
@@ -21,10 +21,12 @@ podman run --rm --pull=newer -p 8080:80 ghcr.io/michaelpaddon/hypershunt:latest
 (`--pull=newer` refreshes a previously cached `:latest` image; the
 later commands on this page can omit it.)
 
-Open <http://localhost:8080>.  You'll see hypershunt's built-in
-landing page served from `/var/www/hypershunt/` inside the container.
-The image runs as root just long enough to bind ports, then
-drops to the `hypershunt` user.
+Open <http://localhost:8080>.  The container's web root
+(`/var/www/hypershunt/`) starts empty, so the request redirects to
+the bundled documentation site at `/docs/` — the page you're
+reading now.  Drop your own `index.html` into the web root and the
+redirect stops firing.  The image runs as root just long enough to
+bind ports, then drops to the `hypershunt` user.
 
 Stop with `Ctrl-C`.
 
@@ -85,7 +87,7 @@ podman run --rm -p 8080:80 \
     ghcr.io/michaelpaddon/hypershunt:latest
 ```
 
-This vhost reverse-proxies `/api/` to a back-end and serves
+This vhost reverse-proxies `/api/` to a backend and serves
 everything else from the mounted directory.  See the
 [configuration guide](guide.md) for every common scenario and the
 [reference](reference.md) for every directive.
@@ -108,7 +110,7 @@ podman run --rm -p 8443:443 \
 ```
 
 Open <https://localhost:8443>.  Your browser will warn about the
-self-signed certificate -- that's expected.  Self-signed is for
+self-signed certificate — that's expected.  Self-signed is for
 local development only; for a real deployment use [Let's Encrypt
 via ACME](guide.md#https--tls-termination).
 
@@ -124,7 +126,7 @@ Issue against Let's Encrypt's **staging** CA first (`staging=#true`
 below).  Production issuance is
 [rate-limited](https://letsencrypt.org/docs/rate-limits/), and the
 limits are easy to exhaust while you're still ironing out DNS,
-firewall, or config mistakes -- staging has far looser limits and
+firewall, or config mistakes — staging has far looser limits and
 verifies the whole flow end to end.  Its certificates aren't
 publicly trusted, so browsers will warn until you switch to
 production.
@@ -160,7 +162,7 @@ A few things changed:
 
 - `-d --name hypershunt` runs the container detached.
 - The `hypershunt-state` named volume persists the ACME-issued
-  certificate across container restarts -- without it every
+  certificate across container restarts — without it every
   restart triggers a fresh ACME request and rate-limits become
   a problem.
 - `server state-dir=`, `tls "acme"`, and `user=` are required
@@ -187,12 +189,12 @@ podman stop hypershunt && podman rm hypershunt
 
 ## Where next
 
-- [Configuration guide](guide.md) -- 35 scenario-driven chapters
+- [Configuration guide](guide.md) — 35 scenario-driven chapters
   covering everything from virtual hosts to OIDC sign-on.
-- [Configuration reference](reference.md) -- every directive
+- [Configuration reference](reference.md) — every directive
   hypershunt accepts, with semantics, defaults, and worked KDL
   examples.
-- [Grammar](grammar.md) -- the formal KDL syntax.
+- [Grammar](grammar.md) — the formal KDL syntax.
 - Running in production: [unprivileged &
   containers](guide.md#running-unprivileged) and [reload &
   zero-downtime upgrade](guide.md#reloading-and-zero-downtime-upgrade).
@@ -202,16 +204,16 @@ podman stop hypershunt && podman rm hypershunt
 A few common snags are below; the [Troubleshooting](troubleshooting.md)
 page covers more, including reverse-proxy, auth, and rate-limit issues.
 
-**`bind: address already in use`** -- another process is on
+**`bind: address already in use`** — another process is on
 that port.  Either stop the conflicting service or change the
 host port (`-p 8080:80`).
 
-**SELinux denials on RHEL/Fedora** -- the `:Z` flag on the
+**SELinux denials on RHEL/Fedora** — the `:Z` flag on the
 volume mount relabels the bind-mount for container access.
 Skip the flag on Debian/Ubuntu (or Docker) where SELinux isn't
 enforced.
 
-**Permission denied reading mounted files** -- hypershunt runs as
+**Permission denied reading mounted files** — hypershunt runs as
 the in-container `hypershunt` user, a fixed **UID/GID 1000**.  Make
 sure your mounted directories are readable by it; a simple
 `chmod -R o+rX public` resolves most cases.  To instead align host
@@ -222,17 +224,17 @@ podman run ... --userns=keep-id:uid=1000,gid=1000 ...
 ```
 
 Caveat: `keep-id` starts the process as UID 1000 (not container-root),
-so it can no longer bind ports below 1024 -- combining it with
+so it can no longer bind ports below 1024 — combining it with
 `-p 80:80`/`-p 443:443` fails with `EACCES`.  Keep the default
 namespace for privileged ports, or publish to a high in-container
 port; see [Container
 twist](guide.md#container-twist) for the options.
 
-**ACME issuance fails** -- the `state-dir` volume must be
+**ACME issuance fails** — the `state-dir` volume must be
 writable, and Let's Encrypt must be able to reach your hypershunt on
 port 80 for the HTTP-01 challenge.  Hypershunt falls back to a
 self-signed certificate and retries hourly while the issuance
-is failing -- check the container logs for the ACME error.
+is failing — check the container logs for the ACME error.
 
 Validate any config file before running:
 

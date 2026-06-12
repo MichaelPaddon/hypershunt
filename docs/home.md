@@ -2,7 +2,7 @@
 
 HTTP and reverse-proxy server with TLS, virtual hosts, static
 files, reverse proxying, HTTP/3, JWT / OIDC, mTLS, rate
-limiting, WebSocket bridging, and L4 forwarding -- all driven
+limiting, WebSocket bridging, and L4 forwarding — all driven
 from a single KDL config file.
 
 <div class="cards">

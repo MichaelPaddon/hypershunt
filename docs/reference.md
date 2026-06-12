@@ -2,7 +2,7 @@
 
 Every directive hypershunt accepts in `hypershunt.kdl`, organised by the
 top-level node it appears under.  This document describes
-**semantics** -- what each directive controls, its default, and how
+**semantics** — what each directive controls, its default, and how
 it interacts with siblings.  For the formal KDL grammar (syntax
 only) see the [grammar](grammar.md).  For walkthrough-style "how do
 I X?" answers see the [configuration guide](guide.md).
@@ -19,7 +19,7 @@ the parent.
 The `server` node carries process-wide settings: privilege drop,
 state directory, global TLS defaults, the chosen authentication
 backend, GeoIP, named policies, custom error pages, access logging,
-and reload tuning.  It is optional -- a config without a `server`
+and reload tuning.  It is optional — a config without a `server`
 block runs as the calling user with defaults everywhere.
 
 ```kdl
@@ -78,7 +78,7 @@ creates subdirectories under it (`acme/`, `jwt/`) as needed.
 server state-dir="/var/lib/hypershunt"
 ```
 
-**Default:** none -- features that require it refuse to start.
+**Default:** none — features that require it refuse to start.
 **See also:** [`cert-key-mode`](#cert-key-mode),
 [`tls "acme"`](#tls-acme), [`auth "jwt"`](#auth-jwt).
 
@@ -90,7 +90,7 @@ Skip the `setgroups()` step of the privilege drop.  Useful inside
 containers launched with `podman --group-add keep-groups`, where
 supplementary groups have been deliberately propagated and hypershunt
 should leave them alone.  Outside containers this should remain
-`#false` -- the default `setgroups([gid])` is the safer choice.
+`#false` — the default `setgroups([gid])` is the safer choice.
 
 ```kdl
 server user="hypershunt" inherit-supplementary-groups=#true
@@ -320,7 +320,7 @@ tls "files" cert="server.pem" key="server.key" {
 **Repeated child** of [`mtls`](#mtls).  Required, at least one.
 
 PEM file containing one or more trust anchors used to verify
-client certificates.  Multiple `ca` children stack -- a client
+client certificates.  Multiple `ca` children stack — a client
 certificate is accepted if any anchor in any file signs it.
 
 ```kdl
@@ -336,7 +336,7 @@ mtls {
 
 `"required"` rejects connections that don't present a valid client
 certificate.  `"optional"` lets unauthenticated connections through
-but still validates a presented certificate -- the authenticated
+but still validates a presented certificate — the authenticated
 identity is then available to policy and the `auth-request`
 handler.
 
@@ -365,7 +365,7 @@ mtls {
 **Property** on [`mtls`](#mtls).  Optional integer.
 
 Seconds between automatic reloads of the [`revocation`](#revocation)
-CRL files.  `0` disables reloading -- hypershunt reads them once at
+CRL files.  `0` disables reloading — hypershunt reads them once at
 startup and never again.
 
 ```kdl
@@ -385,7 +385,7 @@ location that contains a [`basic-auth`](#basic-auth) directive.
 
 The positional argument names the backend kind: `"pam"`,
 `"ldap"`, `"file"`, `"subrequest"`, `"jwt"`, or `"oidc"`.  `"oidc"`
-is never used standalone -- it appears as the inner backend of
+is never used standalone — it appears as the inner backend of
 `auth "jwt" backend="oidc"`.
 
 ```kdl
@@ -622,12 +622,12 @@ Per-subrequest timeout (seconds).
 
 Two modes:
 
-- **Standalone** -- no `backend=` property.  Validates incoming
+- **Standalone** — no `backend=` property.  Validates incoming
   ES256 JWTs presented as a `Cookie:` (named by
   [`cookie-name`](#cookie-name)) or `Authorization: Bearer <jwt>`.
   No new tokens are issued; useful when a peer service does the
   issuing and hypershunt just verifies.
-- **Wrapped** -- `backend="pam" | "ldap" | "file" | "subrequest"
+- **Wrapped** — `backend="pam" | "ldap" | "file" | "subrequest"
   | "oidc"`.  Hypershunt runs the inner backend on credential requests,
   issues a fresh JWT cookie on success, and accepts that cookie
   for subsequent requests.  The inner backend's properties live on
@@ -1091,8 +1091,8 @@ still alive and must not be restarted.
 ```kdl
 server {
     health {
-        liveness-path "/livez"     # repeatable; overrides the defaults
-        readiness-path "/readyz"   # repeatable; overrides the defaults
+        liveness-path "/livez"     // repeatable; overrides the defaults
+        readiness-path "/readyz"   // repeatable; overrides the defaults
     }
 }
 ```
@@ -1127,8 +1127,8 @@ liveness/readiness aren't exposed to the internet), or `health=#true`
 to force them on.  Ignored on L4 proxy listeners.
 
 ```kdl
-listener "tcp://[::]:443" health=#false        # public: no health
-listener "tcp://10.0.0.1:9000"                 # admin: health on
+listener "tcp://[::]:443" health=#false        // public: no health
+listener "tcp://10.0.0.1:9000"                 // admin: health on
 ```
 
 **Default:** unset (inherits `server` `health enabled`).
@@ -1140,7 +1140,7 @@ listener "tcp://10.0.0.1:9000"                 # admin: health on
 Defines a *named* policy that can be re-used from any number of
 locations or stream listeners via `apply "<name>"`.  See the
 location-level [`policy`](#policy-location) entry for the
-predicate/action grammar -- the body is identical.
+predicate/action grammar — the body is identical.
 
 ```kdl
 server {
@@ -1150,7 +1150,7 @@ server {
     }
 }
 vhost "internal.example.com" {
-    location "/" { policy { apply "internal-only" } static root="/var/www/internal" }
+    location "/" { policy { apply "internal-only" }; static root="/var/www/internal" }
 }
 ```
 
@@ -1188,7 +1188,7 @@ Configures the access log.  The positional argument is the format
 non-`tracing` formats to.
 
 `"tracing"` emits structured `INFO`-level events through the
-`tracing` crate -- where they go is controlled by
+`tracing` crate — where they go is controlled by
 `RUST_LOG` and the tracing subscriber set up in `src/main.rs`; the
 `path=` property is ignored.  The other three formats are written
 to the named file (stderr if absent) with `O_APPEND` and a
@@ -1210,7 +1210,7 @@ server { access-log "combined" path="/var/log/hypershunt/access.log" }
 The `certificate` node defines a *named* TLS certificate that
 multiple listeners can share with [`tls "ref"`](#tls-ref).
 Required when two or more listeners would otherwise need identical
-[`tls "acme"`](#tls-acme) blocks -- a single ACME manager and
+[`tls "acme"`](#tls-acme) blocks — a single ACME manager and
 renewal loop runs for the shared cert, instead of each listener
 racing on the same on-disk slot.
 
@@ -1227,7 +1227,7 @@ certificate "edge" {
     }
 }
 listener "tcp://[::]:443" { tls "ref" name="edge" }
-listener "udp://[::]:443" { tls "ref" name="edge" }   # HTTP/3
+listener "udp://[::]:443" { tls "ref" name="edge" }   // HTTP/3
 ```
 
 ### tls (certificate)
@@ -1246,7 +1246,7 @@ kind is rejected.
 A `listener` accepts connections on one socket address and routes
 them through the protocol stack you wire up.  The positional
 argument is the bind URL (see [bind URL](#bind-url)); everything
-else -- TLS, alpn, timeouts, policy, the L4 proxy mode -- is
+else — TLS, alpn, timeouts, policy, the L4 proxy mode — is
 controlled by properties and children.
 
 The same listener has two **modes**: HTTP mode (when no
@@ -1255,10 +1255,10 @@ one is).  The two modes carry different sets of legal directives.
 Mixing them produces a parse-time error.
 
 ```kdl
-listener "tcp://[::]:80" { }                          # plain HTTP/1.1+h2
-listener "tcp://[::]:443" { tls "self-signed" }       # HTTPS
-listener "udp://[::]:443" { tls "self-signed" }       # HTTP/3
-listener "tcp://[::]:5432" { proxy "tcp://10.0.0.5:5432" } # L4 TCP proxy
+listener "tcp://[::]:80" { }                          // plain HTTP/1.1+h2
+listener "tcp://[::]:443" { tls "self-signed" }       // HTTPS
+listener "udp://[::]:443" { tls "self-signed" }       // HTTP/3
+listener "tcp://[::]:5432" { proxy "tcp://10.0.0.5:5432" } // L4 TCP proxy
 ```
 
 ### bind URL
@@ -1284,13 +1284,13 @@ paths must be absolute.
 ```kdl
 listener "tcp://0.0.0.0:80"
 listener "tcp://[::]:443"
-listener "udp://[::]:443"
+listener "udp://[::]:443" { tls "self-signed" }  // udp needs tls or proxy
 listener "unix-stream:/run/hypershunt.sock"
 ```
 
 The bind URL also determines what the encryption layer means:
 [`tls`](#tls-listener) selects HTTPS on a byte-stream socket, HTTP/3
-on `udp://`, and -- when paired with a `proxy` child -- a
+on `udp://`, and — when paired with a `proxy` child — a
 DTLS-terminating datagram proxy on `udp://` (reserved).  `tls` is
 rejected on `unix-dgram:` / `unix-seqpacket:` (QUIC/DTLS are
 UDP-only).
@@ -1348,16 +1348,20 @@ pattern.  Use [`reject-unknown-host`](#reject-unknown-host) to drop
 the default and return `404` instead.
 
 ```kdl
-# Per-port subsets, and a shared host with different content per port:
-vhost "example.com" name="lan" { location "/" { static root="/srv/lan" } }
+// Per-port subsets, and a shared host with different content per port.
+// "lan" is explicit-only so the shared host appears at most once in
+// any implicit set.
+vhost "example.com" name="lan" explicit-only=#true {
+    location "/" { static root="/srv/lan" }
+}
 vhost "example.com" name="pub" { location "/" { static root="/srv/pub" } }
 vhost "admin" explicit-only=#true {
     location "/" { proxy { upstream "http://127.0.0.1:9000" } }
 }
 
-listener "tcp://[::]:80"  { vhost "lan" "admin" }   # set [lan, admin]
+listener "tcp://[::]:80"  { vhost "lan" "admin" }   // set [lan, admin]
 listener "tcp://[::]:443" { tls "self-signed"; vhost "pub" }
-listener "tcp://[::]:8080"                           # implicit: all non-explicit-only
+listener "tcp://[::]:8080"                           // implicit: just "pub"
 ```
 
 **Default:** none (the listener serves the implicit set).
@@ -1405,7 +1409,7 @@ Cap on inbound request body size in bytes.  Bodies with a
 `Content-Length` larger than the cap return `413` before the
 handler runs; chunked bodies that exceed the cap mid-stream also
 return `413`.  When set on both `listener` and `location`, the
-location value wins (and can only be smaller in practice -- the
+location value wins (and can only be smaller in practice — the
 listener cap is enforced first, before routing).
 
 ```kdl
@@ -1428,7 +1432,7 @@ Byte-stream (`tcp://`, `unix-stream:`) or `udp://` listeners.
 
 Enables TLS termination.  On a byte-stream listener it serves
 HTTPS; on a `udp://` listener the very same block serves HTTP/3
-(QUIC's encryption layer *is* TLS 1.3) -- see
+(QUIC's encryption layer *is* TLS 1.3) — see
 [tls on udp:// (HTTP/3)](#tls-on-udp-http3).  It is rejected on
 `unix-dgram:` / `unix-seqpacket:` (QUIC is UDP-only).  The
 positional argument names the cert source kind; the rest of the
@@ -1613,7 +1617,7 @@ dns-provider "exec" program="/usr/local/bin/dns-update.sh" {
 **Variant** of [`tls`](#tls-listener) selected by the kind
 `"self-signed"`.  Generates an in-memory self-signed certificate
 on each start; useful only for development and CI.  Accepts no
-kind-specific properties or children -- adding `cert=`, `domain=`,
+kind-specific properties or children — adding `cert=`, `domain=`,
 or similar is a parse error so a misplaced cert path doesn't get
 silently ignored.
 
@@ -1665,15 +1669,15 @@ datagram proxy: the `tls` block supplies the server cert source, the
 `proxy` the datagram backend.  The presence of `proxy` is what
 distinguishes this from plain HTTP/3 (`tls` alone).
 
-DTLS termination is **not yet implemented** -- no DTLS-capable crate
-exists in the stack today -- so this combination is reserved and
+DTLS termination is **not yet implemented** — no DTLS-capable crate
+exists in the stack today — so this combination is reserved and
 startup fails with "not yet implemented".  (On byte-stream listeners
 `tls` + `proxy` is the unrelated, fully-supported TLS-terminating
 stream proxy.)
 
 ```kdl
 listener "udp://[::]:5684" {
-    tls "self-signed"            # DTLS cert source (reserved)
+    tls "self-signed"            // DTLS cert source (reserved)
     proxy "udp://10.0.0.5:5684"
 }
 ```
@@ -1700,7 +1704,7 @@ listener "tcp://[::]:443" {
     alpn "http/1.1"
 }
 vhost "legacy.example.com" {
-    alpn "http/1.1"   # disable h2 for this host
+    alpn "http/1.1"   // disable h2 for this host
 }
 ```
 
@@ -1746,7 +1750,7 @@ idle connections.  `0` disables keep-alives.
 **Property** on [`quic-transport`](#quic-transport).  Optional
 boolean.
 
-Allow 0-RTT early data.  Carries replay risk -- only enable for
+Allow 0-RTT early data.  Carries replay risk — only enable for
 endpoints whose handlers are idempotent.
 
 **Default:** `#false`.
@@ -1802,13 +1806,15 @@ block are rejected at parse time.  Cross-family pairings (e.g. a
 `udp://` listener with a `tcp://` upstream) are rejected too.
 
 The first positional argument is the upstream
-[bind URL](#bind-url).  Scalar attributes (`proxy-protocol=`,
+[bind URL](#bind-url); unlike listener bind URLs, the upstream
+host must be a **literal IP address** (hostnames are not
+resolved).  Scalar attributes (`proxy-protocol=`,
 `flow-idle-timeout=`) are properties on the node; structured
 attributes (`tls`, `dtls`, `policy`) live in the body.
 
 ```kdl
 listener "tcp://[::]:5432" {
-    proxy "tcp://db.internal:5432" proxy-protocol="v2" {
+    proxy "tcp://10.0.0.5:5432" proxy-protocol="v2" {
         tls skip-verify=#false
     }
 }
@@ -1821,7 +1827,7 @@ upstreams only.
 
 Wraps the upstream connection in TLS.  Properties:
 `skip-verify=` (boolean; default `#false`) disables certificate
-verification -- only useful with self-signed back-ends.
+verification — only useful with self-signed backends.
 
 #### dtls (upstream)
 
@@ -1903,7 +1909,7 @@ only.
 
 Same statement grammar as the location-level
 [`policy`](#policy-location), but only the `address` and `country`
-predicates are legal -- `authenticated`, `user`, and `group`
+predicates are legal — `authenticated`, `user`, and `group`
 require an HTTP authentication layer that L4 mode doesn't have.
 
 ```kdl
@@ -1934,7 +1940,7 @@ list order, then the listener's default (its first vhost, unless
 
 ```kdl
 vhost "example.com" { alpn "http/1.1"; location "/" { static root="/var/www" } }
-vhost ".+\.example\.com" regex=#true { location "/" { static root="/var/www" } }
+vhost #".+\.example\.com"# regex=#true { location "/" { static root="/var/www" } }
 ```
 
 ### name (vhost)
@@ -1953,6 +1959,9 @@ unique across all vhosts.
 ```kdl
 vhost "example.com" name="lan" { location "/" { static root="/srv/lan" } }
 vhost "example.com" name="pub" { location "/" { static root="/srv/pub" } }
+
+listener "tcp://10.0.0.1:80" { vhost "lan" }   // internal interface
+listener "tcp://[::]:80"     { vhost "pub" }   // public interface
 ```
 
 **Default:** the positional host pattern.
@@ -1982,7 +1991,7 @@ boolean.
 Treat the positional name as an anchored Perl-compatible regex
 instead of an exact literal.  Regexes are checked in declaration
 order, after all literal vhosts have failed.  Regex vhosts cannot
-participate in per-SNI ALPN selection -- they fall back to the
+participate in per-SNI ALPN selection — they fall back to the
 listener default.
 
 **Default:** `#false`.
@@ -1996,7 +2005,7 @@ Additional name (or regex) that maps to the same vhost.
 ```kdl
 vhost "example.com" {
     alias "www.example.com"
-    alias ".+\.example\.com" regex=#true
+    alias #".+\.example\.com"# regex=#true
 }
 ```
 
@@ -2065,17 +2074,17 @@ location "/admin/" {
 
 Each statement is one of:
 
-- `allow [<predicate>]` -- permit the request.
-- `deny [code=<integer>] [<predicate>]` -- reject with the given
+- `allow [<predicate>]` — permit the request.
+- `deny [code=<integer>] [<predicate>]` — reject with the given
   status (default `403`).
-- `redirect to=<url> [code=<integer>] [<predicate>]` -- 30x
+- `redirect to=<url> [code=<integer>] [<predicate>]` — 30x
   redirect (default `302`).
-- `apply "<name>"` -- splice the rules of a server-level named
+- `apply "<name>"` — splice the rules of a server-level named
   [`policy`](#policy-server) at this point.  First-match semantics
   continue across the inlined rules.  Cycles are rejected at
   startup.
 
-A statement with no predicate is unconditional -- it matches every
+A statement with no predicate is unconditional — it matches every
 request, useful as a catch-all at the end of a block.
 
 ##### Predicates
@@ -2085,15 +2094,15 @@ nothing at all.
 
 Predicate types:
 
-- `address "<cidr-or-ip>"+` -- source IP or CIDR; multiple values
+- `address "<cidr-or-ip>"+` — source IP or CIDR; multiple values
   are OR-combined.
-- `country "<iso2>"+` -- ISO 3166-1 alpha-2 country code; requires
+- `country "<iso2>"+` — ISO 3166-1 alpha-2 country code; requires
   [`geoip`](#geoip).
-- `user "<name>"+` -- authenticated username; requires an
+- `user "<name>"+` — authenticated username; requires an
   [`auth`](#auth) backend.
-- `group "<name>"+` -- authenticated group membership.
-- `authenticated` -- any authenticated request.
-- `not <pred-type> <values>*` -- negation of the inner predicate.
+- `group "<name>"+` — authenticated group membership.
+- `authenticated` — any authenticated request.
+- `not <pred-type> <values>*` — negation of the inner predicate.
 
 Inline form (one statement, one predicate):
 
@@ -2113,12 +2122,12 @@ allow {
 ```
 
 Auth predicates (`authenticated`, `user`, `group`) automatically
-return `401` for anonymous users -- no explicit `deny code=401`
+return `401` for anonymous users — no explicit `deny code=401`
 needed.  Wrapping them in `not` suppresses the auto-challenge.
 
 #### basic-auth
 
-**Guide:** [HTTP Basic auth](guide.md#http-basic-auth----htpasswd-file).
+**Guide:** [HTTP Basic auth](guide.md#http-basic-auth--htpasswd-file).
 
 **Child** of [`location`](#location).  Optional.
 
@@ -2249,7 +2258,7 @@ Window unit.  One of `"second"`, `"minute"`, `"hour"`.
 
 **Property** on [`rate-limit`](#rate-limit).  Optional integer.
 
-Bucket capacity -- maximum number of requests that can arrive
+Bucket capacity — maximum number of requests that can arrive
 back-to-back without being rate-limited, before the steady-state
 [`rate`](#rate) kicks in.
 
@@ -2336,7 +2345,10 @@ as [`header`](#header-match).
 
 **Child** of [`match`](#match).  One or more positional regex
 patterns matched against the request URI path.  OR within the
-list.  Patterns are anchored automatically.
+list.  Patterns are evaluated **unanchored** — a pattern matches
+anywhere in the path unless you write `^...$` yourself.  (Note
+the contrast with regex [`vhost`](#vhost) patterns, which *are*
+anchored automatically.)
 
 ##### not (match)
 
@@ -2349,12 +2361,12 @@ predicates.
 
 Rewrites the request URI and re-routes the request through the
 vhost.  Up to ten consecutive rewrites are allowed per request
-(cycle detection); the eleventh returns `500`.
+(cycle detection); the eleventh returns `404`.
 
 ```kdl
 location "/old/" {
     rewrite from="^/old/(.*)$" to="/new/$1"
-    static root="/never"          # placeholder; rewrite fires first
+    static root="/never"          // placeholder; rewrite fires first
 }
 ```
 
@@ -2363,7 +2375,7 @@ location "/old/" {
 **Property** on [`rewrite`](#rewrite).  Required string.
 
 PCRE regex matched against the request URI path.  The regex is
-compiled at parse time -- malformed patterns fail config load.
+compiled at parse time — malformed patterns fail config load.
 
 ##### to
 
@@ -2480,7 +2492,7 @@ Ordered list of candidate filename templates.  Each template may
 contain `{path}` (the request path with the location prefix
 stripped) and `{query}` (the query string).  The first existing
 regular file is served.  When no candidate exists, the response
-is `404` -- the [`index-file`](#index-file) flow is bypassed.
+is `404` — the [`index-file`](#index-file) flow is bypassed.
 Useful for SPA-style fallbacks.
 
 ```kdl
@@ -2499,7 +2511,7 @@ When set and a request resolves to a directory with no matching
 *and* [`directory-listing`](#directory-listing) is `#false`, the
 handler emits a `302 Found` to the named URL with
 `Cache-Control: no-store` instead of a `404`.  Requests to
-non-existent paths still produce `404` -- only the "directory
+non-existent paths still produce `404` — only the "directory
 with no index" case is redirected.
 
 The packaged default config uses this to point `/` at `/docs/`
@@ -2582,12 +2594,12 @@ request URI before forwarding.
 
 Forces a particular wire protocol to the upstream.  One of:
 
-- `"auto"` (default) -- the hyper-util client negotiates HTTP/1.1
+- `"auto"` (default) — the hyper-util client negotiates HTTP/1.1
   vs HTTP/2 via ALPN.
-- `"h2c"` -- HTTP/2 prior-knowledge over plaintext.  Requires
+- `"h2c"` — HTTP/2 prior-knowledge over plaintext.  Requires
   `http://` upstreams.  Used by the cross-protocol WebSocket
   bridge.
-- `"h3"` (alias `"http3"`) -- HTTP/3 over QUIC.  Requires
+- `"h3"` (alias `"http3"`) — HTTP/3 over QUIC.  Requires
   `https://` upstreams.
 
 ##### pool-idle-timeout
@@ -2627,12 +2639,12 @@ default `#false`) disables certificate verification.
 Selects the load-balancing algorithm.  Single positional argument:
 
 - `"round-robin"` (default)
-- `"least-conn"` -- pick the upstream with the fewest in-flight
+- `"least-conn"` — pick the upstream with the fewest in-flight
   requests.
 - `"random"`
-- `"ip-hash"` -- hash the client IP; the same client always lands
+- `"ip-hash"` — hash the client IP; the same client always lands
   on the same upstream (as long as the pool doesn't change).
-- `"header-hash"` -- hash a named request header (the
+- `"header-hash"` — hash a named request header (the
   `header=<name>` property is required); useful for session
   affinity by `Cookie` or `X-Session-Id`.
 
@@ -2722,7 +2734,7 @@ integer.
 
 Consecutive request failures before the upstream is ejected.
 
-**Default:** `4294967295` (i.e. never -- you must opt in).
+**Default:** `4294967295` (i.e. never — you must opt in).
 
 ###### eject-for
 
@@ -2750,7 +2762,7 @@ retry max=3 {
 ```
 
 When `max > 0`, hypershunt buffers the request body in memory so it
-can be replayed across attempts -- bear that in mind for large
+can be replayed across attempts — bear that in mind for large
 uploads.
 
 ###### max (retry)
@@ -2864,7 +2876,7 @@ rule overrides it.
 **Guide:** [CGI, FastCGI, SCGI](guide.md#cgi-fastcgi-scgi).
 
 **Handler** child of [`location`](#location).  Forwards to a
-FastCGI back-end.  Speaks the binary FastCGI protocol over a
+FastCGI backend.  Speaks the binary FastCGI protocol over a
 Unix-stream or TCP socket.
 
 ```kdl
@@ -2880,7 +2892,7 @@ location "/php/" {
 **Property** on [`fastcgi`](#fastcgi) and [`scgi`](#scgi).
 Required string.
 
-FastCGI/SCGI back-end address.  Use
+FastCGI/SCGI backend address.  Use
 `unix-stream:<absolute-path>` for a Unix socket or `host:port`
 for TCP.
 
@@ -2889,7 +2901,7 @@ for TCP.
 **Property** on [`fastcgi`](#fastcgi) and [`scgi`](#scgi).
 Required string.
 
-`DOCUMENT_ROOT` passed to the back-end.  Hypershunt also synthesises
+`DOCUMENT_ROOT` passed to the backend.  Hypershunt also synthesises
 `SCRIPT_FILENAME` from `root` + the request path.
 
 ##### index (fastcgi)
@@ -2903,7 +2915,7 @@ is computed (e.g. `"index.php"`).
 #### scgi
 
 **Handler** child of [`location`](#location).  Forwards to an
-SCGI back-end.  Same property set as [`fastcgi`](#fastcgi); the
+SCGI backend.  Same property set as [`fastcgi`](#fastcgi); the
 only difference is wire protocol.
 
 ```kdl
@@ -2954,7 +2966,7 @@ location "/.hypershunt/status" {
 }
 ```
 
-The status endpoint exposes operational detail -- gate it behind
+The status endpoint exposes operational detail — gate it behind
 a policy in production.
 
 #### auth-request

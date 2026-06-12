@@ -17,15 +17,15 @@ predictable: a reader who learns the rules can guess the shape of
 nodes they haven't seen.
 
 1. **Positional argument = identity.**  Used only when the value
-   is the node's primary "what" -- something a reader can spot by
+   is the node's primary "what" — something a reader can spot by
    position without a label.  Examples: `vhost "example.com"`,
    `location "/api"`, `error-page 404`, `auth "pam"`.
 2. **Property = attribute.**  Everything else uses `key=value`
-   property syntax.  A given attribute has exactly one home -- it
+   property syntax.  A given attribute has exactly one home — it
    is *never* also accepted as a positional or a child.
 3. **Child = structured subtree.**  A child node is used only
    when the thing has its own arguments or properties.  A child
-   whose body is a single scalar value is a smell -- promote it
+   whose body is a single scalar value is a smell — promote it
    to a property on the parent.
 4. **Lists = repeated single-arg children.**  When a node accepts
    a list of values, the list appears as repeated children with
@@ -48,14 +48,14 @@ grammar below shows each explicitly.
 
 Operators:
 
-- `x?` -- `x` is optional
-- `x*` -- zero or more repetitions of `x`
-- `x+` -- one or more repetitions of `x`
-- `x | y` -- either `x` or `y`
-- `( ... )` -- grouping
-- `{ ... }` -- KDL child block
-- `key=value` -- a KDL named property
-- `"literal"` -- literal KDL string or node name
+- `x?` — `x` is optional
+- `x*` — zero or more repetitions of `x`
+- `x+` — one or more repetitions of `x`
+- `x | y` — either `x` or `y`
+- `( ... )` — grouping
+- `{ ... }` — KDL child block
+- `key=value` — a KDL named property
+- `"literal"` — literal KDL string or node name
 
 ### `<string>`
 
@@ -380,7 +380,7 @@ On a byte-stream listener (`tcp://`, `unix-stream:`) a `tls` node
 selects HTTPS; on a `udp://` listener it selects HTTP/3 (QUIC's
 encryption layer *is* TLS 1.3, RFC 9001, so the same node serves
 both).  On `udp://`, a `tls` node alongside a `proxy` child selects a
-DTLS-terminating datagram proxy (reserved -- not yet implemented).
+DTLS-terminating datagram proxy (reserved — not yet implemented).
 `tls` is rejected on `unix-dgram:` / `unix-seqpacket:`.
 
 ### `tls-kind`
@@ -472,7 +472,8 @@ listed in [`<l4-proxy-opt>`](#l4-proxy-opt).
 
 ### `location`
 
-`"location"` [`<string>`](#string) `{`
+`"location"` [`<string>`](#string)
+( `max-request-body=`[`<integer>`](#integer) )? `{`
 [`<location-child>`](#location-child)* `}`
 
 ### `location-child`
@@ -482,7 +483,6 @@ listed in [`<l4-proxy-opt>`](#l4-proxy-opt).
 - [`<basic-auth-block>`](#basic-auth-block)
 - [`<request-headers-block>`](#request-headers-block)
 - [`<response-headers-block>`](#response-headers-block)
-- `"max-request-body"` [`<integer>`](#integer)
 - [`<rate-limit-block>`](#rate-limit-block)
 - [`<match-block>`](#match-block)
 - [`<rewrite-directive>`](#rewrite-directive)
@@ -492,14 +492,14 @@ listed in [`<l4-proxy-opt>`](#l4-proxy-opt).
 `"rate-limit"` `rate=`[`<integer>`](#integer)
 ( `per=`( `"second"` | `"minute"` | `"hour"` ) )?
 ( `burst=`[`<integer>`](#integer) )?
-`key=`[`<rate-limit-key>`](#rate-limit-key)
-( `header=`[`<string>`](#string) )?
 ( `name=`[`<string>`](#string) )?
+`{` [`<rate-limit-key>`](#rate-limit-key) `}`
 
 ### `rate-limit-key`
 
-`"client-ip"` | `"user"` | `"header"` (with `header=` property
-naming the HTTP header)
+- `"key"` `"client-ip"`
+- `"key"` `"user"`
+- `"key"` `"header"` [`<string>`](#string)
 
 ### `rewrite-directive`
 
