@@ -3,39 +3,75 @@
   <p>HTTP server and reverse proxy.<br>
   Simple configuration. Just works. No surprises.<br>
   Written in Rust for memory safety.</p>
+
+  <p>
+  <a href="https://github.com/MichaelPaddon/hypershunt/actions/workflows/build.yml"><img src="https://github.com/MichaelPaddon/hypershunt/actions/workflows/build.yml/badge.svg" alt="build"></a>
+  <a href="https://github.com/MichaelPaddon/hypershunt/releases"><img src="https://img.shields.io/github/v/release/MichaelPaddon/hypershunt?include_prereleases" alt="release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--2--Clause-blue" alt="license"></a>
+  </p>
 </div>
 
----
+> **Status:** release-candidate — approaching 1.0 (currently
+> 1.0.0-rc13).  The config format is stable; no breaking changes are
+> expected before 1.0.
+
+hypershunt puts the whole serving stack in one coherent place: a
+modern KDL configuration instead of accreted directive syntax,
+first-class operations (systemd socket activation, hot config reload,
+seamless binary upgrades with zero dropped connections), and
+batteries-included authentication — OIDC single sign-on, JWT sessions,
+PAM/LDAP/htpasswd — with no separate auth proxy to deploy.
+
+A static site and an API behind automatic TLS is this:
+
+```kdl
+server state-dir="/var/lib/hypershunt"   // ACME certificate storage
+
+listener "tcp://[::]:80"             // ACME challenges + redirects
+listener "tcp://[::]:443" {
+    tls "acme" email="you@example.com" {
+        domain "example.com"
+        domain "api.example.com"
+    }
+}
+
+vhost "example.com" {
+    location "/" { static root="/var/www/example" }
+}
+
+vhost "api.example.com" {
+    location "/" { proxy { upstream "http://127.0.0.1:8080" } }
+}
+```
+
+Or try it in one line — the container serves its own documentation out
+of the box:
+
+```sh
+podman run --rm -p 80:80 -p 443:443 ghcr.io/michaelpaddon/hypershunt:latest
+```
+
+Then walk through the [Quick start](docs/quickstart.md).
 
 ## Features
 
-- **Serving** --- static files (range, ETag, `try-files`, opt-in
-  directory listings, `~user/`), redirects, inline/file responses
-  (`respond`), custom error pages, per-location header injection.
-- **Routing** --- virtual hosts (literal + regex), per-location
-  matchers (method, header, query), URL rewrites with regex
-  captures, alias names, per-SNI ALPN.
-- **Reverse proxy** --- HTTP/1, HTTP/2, HTTP/3 upstreams with
-  connection pooling; multi-upstream load balancing (round-robin,
-  least-conn, ip-hash, header-hash, random); active and passive
-  health checks; retries; per-location rate limits and body caps;
-  FastCGI, SCGI, CGI.
-- **Layer-4 proxy** --- TCP, UDP, and `unix-stream` / `unix-dgram` /
-  `unix-seqpacket` forwarders with optional TLS termination.
-- **TLS** --- ACME (HTTP-01, DNS-01 via acme-dns / Cloudflare /
-  Route 53 / exec, TLS-ALPN-01), file-based PEM, ephemeral
-  self-signed; OCSP stapling on by default; mTLS with CRLs;
-  shared `certificate` blocks across listeners.
-- **Auth & access control** --- HTTP Basic (PAM, LDAP, htpasswd
-  with bcrypt / SHA-512 crypt / Argon2id), subrequest auth, JWT
-  session cookies (ES256, JWKS endpoint), OIDC SSO with PKCE and
-  back-channel logout, OAuth 2.0 bearer resource-server mode,
-  firewall-style policy blocks (IP / user / group / GeoIP country).
-- **Operations** --- gzip / brotli / zstd response compression,
-  structured access logs (NCSA Common/Combined, JSON), built-in
-  status page, health endpoints, hot config reload (`SIGHUP`),
-  seamless binary upgrade (`SIGUSR2`), socket activation,
-  `hypershunt --check-config`, systemd unit, `.deb` / `.rpm` / OCI image.
+- **Serving** --- static files (range, ETag, `try-files`), redirects,
+  inline responses, custom error pages.
+- **Routing** --- virtual hosts (literal + regex), request matchers,
+  URL rewrites with regex captures.
+- **Reverse proxy** --- HTTP/1, HTTP/2, HTTP/3 upstreams; load
+  balancing, health checks, retries; FastCGI, SCGI, CGI.
+- **Layer-4 proxy** --- TCP, UDP, and Unix-socket forwarders with
+  optional TLS termination.
+- **TLS** --- ACME (HTTP-01, DNS-01, TLS-ALPN-01), file-based PEM,
+  self-signed; OCSP stapling; mTLS with CRLs.
+- **Auth & access control** --- HTTP Basic (PAM, LDAP, htpasswd),
+  JWT sessions, OIDC SSO, firewall-style policy blocks.
+- **Operations** --- compression, structured access logs, status page,
+  health endpoints, hot reload, seamless binary upgrade, `.deb` /
+  `.rpm` / OCI image.
+
+…and more --- see the [configuration reference](docs/reference.md).
 
 ## Standards
 
@@ -63,9 +99,6 @@
 
 ## Install
 
-New here? The [Quick start](docs/quickstart.md) gets you serving in five
-minutes (container walkthrough).
-
 Every [release](https://github.com/MichaelPaddon/hypershunt/releases)
 ships `.deb` and `.rpm` packages:
 
@@ -83,9 +116,8 @@ sudo systemctl enable --now hypershunt
 Building from source (prerequisites, tests, and packaging) is covered in
 [BUILD.md](BUILD.md).
 
-A fresh install ships an empty `/var/www/hypershunt/` and redirects `/`
-to the bundled docs at `/docs/`; drop your own `index.html` into the
-webroot and the redirect stops firing.
+Next steps: the [Quick start](docs/quickstart.md), then the
+[configuration guide](docs/guide.md).
 
 ## fail2ban
 
@@ -94,6 +126,12 @@ jails for the [security signals](docs/guide.md#security-signals-fail2ban).
 For the container image they're bundled at
 `/usr/share/doc/hypershunt/fail2ban/` to copy onto the host — fail2ban
 runs on the host, not in the container.
+
+## Operations notes
+
+A fresh install ships an empty `/var/www/hypershunt/` and redirects `/`
+to the bundled docs at `/docs/`; drop your own `index.html` into the
+webroot and the redirect stops firing.
 
 ## License
 
