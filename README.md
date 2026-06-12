@@ -1,18 +1,17 @@
 <div align="center">
   <img src="docs/hs-logo.svg" alt="hypershunt" width="440">
   <p>HTTP server and reverse proxy.<br>
-  Simple configuration. Just works. No surprises.</p>
+  Simple configuration. Just works. No surprises.<br>
+  Written in Rust for memory safety.</p>
 </div>
 
 ---
 
-hypershunt is an HTTP server written in Rust for speed and memory safety.
-
 ## Features
 
 - **Serving** --- static files (range, ETag, `try-files`, opt-in
-  directory listings, `~user/`), redirects, custom error pages,
-  per-location header injection.
+  directory listings, `~user/`), redirects, inline/file responses
+  (`respond`), custom error pages, per-location header injection.
 - **Routing** --- virtual hosts (literal + regex), per-location
   matchers (method, header, query), URL rewrites with regex
   captures, alias names, per-SNI ALPN.
@@ -64,30 +63,37 @@ hypershunt is an HTTP server written in Rust for speed and memory safety.
 
 ## Install
 
+New here? The [Quick start](docs/quickstart.md) gets you serving in five
+minutes (container walkthrough).
+
+Every [release](https://github.com/MichaelPaddon/hypershunt/releases)
+ships `.deb` and `.rpm` packages:
+
+| Package | OS family | Architectures |
+|---|---|---|
+| `.deb` | Debian / Ubuntu | `amd64`, `arm64` |
+| `.rpm` | RHEL / Fedora | `x86_64`, `aarch64` |
+
 ```sh
-# From package
-sudo dpkg -i hypershunt_<version>_<arch>.deb        # or rpm -i
+sudo dpkg -i hypershunt_<version>_<arch>.deb    # Debian/Ubuntu
+sudo rpm -i  hypershunt-<version>.<arch>.rpm    # RHEL/Fedora
 sudo systemctl enable --now hypershunt
-
-# Container
-podman run --rm -p 80:80 -p 443:443 ghcr.io/michaelpaddon/hypershunt:latest
-
-# From source
-cargo build --release
 ```
 
 Building from source (prerequisites, tests, and packaging) is covered in
 [BUILD.md](BUILD.md).
 
-The `.deb`/`.rpm` packages install ready-to-use (disabled) fail2ban jails
-for the [security signals](docs/guide.md#security-signals-fail2ban); for
-the container image they're bundled at
-`/usr/share/doc/hypershunt/fail2ban/` to copy onto the host (fail2ban
-runs on the host, not in the container).
-
 A fresh install ships an empty `/var/www/hypershunt/` and redirects `/`
-to the bundled docs at `/docs/`; drop your own `index.html` into
-the webroot and the redirect stops firing.
+to the bundled docs at `/docs/`; drop your own `index.html` into the
+webroot and the redirect stops firing.
+
+## fail2ban
+
+The `.deb` / `.rpm` packages install ready-to-use (disabled) fail2ban
+jails for the [security signals](docs/guide.md#security-signals-fail2ban).
+For the container image they're bundled at
+`/usr/share/doc/hypershunt/fail2ban/` to copy onto the host — fail2ban
+runs on the host, not in the container.
 
 ## License
 
