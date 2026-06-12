@@ -230,12 +230,16 @@ suites plus a small TLS 1.2 set).
 **Property** on [`tls-options`](#tls-options) and
 [`tls`](#tls-listener).  Optional boolean.
 
-Master switch for OCSP stapling.  When `#true` (the default) hypershunt
-fetches an OCSP response from the issuer-published responder URL
-recorded in the certificate, caches it, and staples it to each
-TLS handshake until `nextUpdate`.  Set to `#false` to skip OCSP
-entirely -- useful with self-signed certificates that have no
-responder URL.
+Master switch for OCSP stapling, with *staple-when-available*
+semantics.  When `#true` (the default) and the certificate records an
+OCSP responder URL, hypershunt fetches an OCSP response from it,
+caches it, and staples it to each TLS handshake until `nextUpdate`.
+A certificate **without** a responder URL is served without a staple
+-- this is normal, not an error.  Public CAs have been dropping OCSP
+since the CA/Browser Forum made it optional in 2023; ACME CAs such as
+Let's Encrypt stopped publishing responder URLs in 2025, so stapling
+is simply unavailable for those certificates.  Set to `#false` to
+disable stapling entirely (the refresh task is never started).
 
 ```kdl
 tls "files" cert="cert.pem" key="key.pem" ocsp=#false
