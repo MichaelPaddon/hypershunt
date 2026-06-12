@@ -74,7 +74,7 @@ The [`server`](reference.md#server) block is optional but useful:
 `user=` drives the privilege drop after the low ports bind, and
 `state-dir=` is where ACME-issued certificates persist.
 
-**See also**: every top-level node in the
+**See also:** every top-level node in the
 [reference](reference.md#server).
 
 ## Serving static files
@@ -209,7 +209,7 @@ A request for `/assets/css/main.css` resolves to
 `/var/www/site/static/css/main.css`, not
 `/var/www/site/static/assets/css/main.css`.
 
-**See also**: [Locations and routing](#locations-and-routing) for
+**See also:** [Locations and routing](#locations-and-routing) for
 how locations are matched; [Reference — static
 handler](reference.md#static) for every knob.
 
@@ -338,7 +338,7 @@ Per-vhost ALPN only works on TCP/TLS listeners (hypershunt selects
 the right config from the SNI in the ClientHello).  Regex vhosts
 and QUIC listeners fall back to the listener default.
 
-**See also**: [Reference — vhost](reference.md#vhost),
+**See also:** [Reference — vhost](reference.md#vhost),
 [listener `vhost` list](reference.md#vhost-listener-child),
 [ALPN on a listener](reference.md#alpn).
 
@@ -431,7 +431,7 @@ The upstream sees `/users` for a request to `/api/v1/users`.
 The same flag exists on [`static`](reference.md#strip-prefix-static)
 for filesystem mounts that don't include the URL prefix.
 
-**See also**: [Reference — location](reference.md#location),
+**See also:** [Reference — location](reference.md#location),
 [Request matching](#request-matching),
 [`rewrite`](reference.md#rewrite).
 
@@ -493,16 +493,17 @@ A few things to know:
   [`retry-interval`](reference.md#retry-interval) seconds (1 hour
   by default).
 
-**Test against staging first.**  Let's Encrypt's production CA is
-[rate-limited](https://letsencrypt.org/docs/rate-limits/), and the
-limits are easy to exhaust during trial-and-error (wrong DNS, port
-80 unreachable, typo'd domain).  Set
-[`staging=#true`](reference.md#staging) to issue from the staging
-CA, which has far looser limits and exercises the identical flow;
-its certificates just aren't publicly trusted.  Without editing the
-config you can force staging by setting the
-[`HYPERSHUNT_ACME_STAGING`](reference.md#hypershunt_acme_staging)
-environment variable — handy in a container or CI.
+> [!WARNING]
+> **Test against staging first.**  Let's Encrypt's production CA is
+> [rate-limited](https://letsencrypt.org/docs/rate-limits/), and the
+> limits are easy to exhaust during trial-and-error (wrong DNS, port
+> 80 unreachable, typo'd domain).  Set
+> [`staging=#true`](reference.md#staging) to issue from the staging
+> CA, which has far looser limits and exercises the identical flow;
+> its certificates just aren't publicly trusted.  Without editing the
+> config you can force staging by setting the
+> [`HYPERSHUNT_ACME_STAGING`](reference.md#hypershunt_acme_staging)
+> environment variable — handy in a container or CI.
 
 When the staging issuance succeeds, switch to production: remove
 `staging=#true` (or unset the env var) **and delete the cached
@@ -631,7 +632,7 @@ mtls mode="required" refresh=600 {
 }
 ```
 
-**See also**: [Reference — listener TLS](reference.md#tls-listener),
+**See also:** [Reference — listener TLS](reference.md#tls-listener),
 [ACME providers](reference.md#dns-provider),
 [`tls-options`](reference.md#tls-options) for server-wide
 defaults like minimum protocol version.
@@ -685,7 +686,7 @@ listener "udp://[::]:443" {
 data — carries replay risk, only safe when every handler in the
 listener's vhosts is idempotent.
 
-**See also**: [Reference — tls on udp:// (HTTP/3)](reference.md#tls-on-udp-http3),
+**See also:** [Reference — tls on udp:// (HTTP/3)](reference.md#tls-on-udp-http3),
 [`quic-transport`](reference.md#quic-transport).
 
 ## Reverse proxy
@@ -767,7 +768,7 @@ location "/api/v1/" {
 }
 ```
 
-**See also**: [Load balancing](#load-balancing), [Health
+**See also:** [Load balancing](#load-balancing), [Health
 checks](#health-checks), [Retries](#retries),
 [Connection pooling and timeouts](#connection-pooling-and-timeouts).
 
@@ -805,7 +806,7 @@ Per-upstream `weight=0` parks an upstream (it stays in the pool
 but receives no traffic); useful for a warm standby you keep
 ready but don't actively use.
 
-**See also**: [Reference — lb-policy](reference.md#lb-policy),
+**See also:** [Reference — lb-policy](reference.md#lb-policy),
 [Health checks](#health-checks).
 
 ## Health checks
@@ -854,7 +855,7 @@ wedge real traffic.  Use both passive and active together: the
 prober is the canary, the passive ejection is the real-time
 guard for upstreams that fail fast.
 
-**See also**: [Reference — active-health](reference.md#active-health),
+**See also:** [Reference — active-health](reference.md#active-health),
 [`passive-health`](reference.md#passive-health).
 
 ## Retries
@@ -888,7 +889,7 @@ A few things to know:
   `connect-timeout` expiry) are *always* retried — they happen
   before the request is sent, so there's nothing to replay.
 
-**See also**: [Reference — retry](reference.md#retry).
+**See also:** [Reference — retry](reference.md#retry).
 
 ## Connection pooling and timeouts
 
@@ -939,7 +940,7 @@ listener "tcp://[::]:80" {
   HTTP/1.1 requests on the same connection.  `0` disables
   keep-alive entirely.
 
-**See also**: [Reference — timeouts](reference.md#timeouts).
+**See also:** [Reference — timeouts](reference.md#timeouts).
 
 ## Compression
 
@@ -1004,7 +1005,7 @@ Header rules apply in declaration order; mixing `add` and `set`
 on the same name lets you e.g. `set "X-Forwarded-For"` to the
 client IP and then `add` extra hops.
 
-**See also**: [Reference — request-headers](reference.md#request-headers).
+**See also:** [Reference — request-headers](reference.md#request-headers).
 
 ## URL redirects
 
@@ -1047,7 +1048,7 @@ same set available in [header rules](#header-manipulation)
 for temporary moves and `307`/`308` when the body must be
 preserved through a method-preserving redirect.
 
-**See also**: [Reference — redirect](reference.md#redirect).
+**See also:** [Reference — redirect](reference.md#redirect).
 
 ## Canned responses
 
@@ -1088,7 +1089,7 @@ Set any extra headers with the location's
 [`response-headers`](reference.md#response-headers) block — a
 `set "Content-Type" …` there overrides `content-type=`.
 
-**See also**: [Reference — respond](reference.md#respond).
+**See also:** [Reference — respond](reference.md#respond).
 
 ## Request matching
 
@@ -1137,7 +1138,7 @@ location "/dashboard/" {
 }
 ```
 
-**See also**: [Reference — match](reference.md#match),
+**See also:** [Reference — match](reference.md#match),
 [Locations and routing](#locations-and-routing).
 
 ## CGI, FastCGI, SCGI
@@ -1193,7 +1194,7 @@ outside [`root=`](reference.md#root-cgi).
 - **CGI** for one-shot scripts where the per-request fork cost
   is acceptable.
 
-**See also**: [Reference — fastcgi](reference.md#fastcgi),
+**See also:** [Reference — fastcgi](reference.md#fastcgi),
 [`scgi`](reference.md#scgi), [`cgi`](reference.md#cgi).
 
 ## HTTP Basic auth — htpasswd file
@@ -1257,7 +1258,7 @@ hash verification.  bcrypt and Argon2 verifications are
 deliberately slow; caching keeps the per-request cost low when
 the same client makes a burst of requests.
 
-**See also**: [Reference — auth "file"](reference.md#auth-file),
+**See also:** [Reference — auth "file"](reference.md#auth-file),
 [Access policies](#access-policies).
 
 ## HTTP Basic auth — PAM
@@ -1306,7 +1307,7 @@ After PAM authentication succeeds, hypershunt reads the user's POSIX
 group memberships and exposes them to the `group` predicate.  No
 extra config is needed.
 
-**See also**: [Reference — auth "pam"](reference.md#auth-pam),
+**See also:** [Reference — auth "pam"](reference.md#auth-pam),
 [Running unprivileged](#running-unprivileged).
 
 ## HTTP Basic auth — LDAP
@@ -1357,7 +1358,7 @@ Hypershunt doesn't do AD-specific paging today; for very large
 directories the group search may be capped by the server's
 default page size.
 
-**See also**: [Reference — auth "ldap"](reference.md#auth-ldap).
+**See also:** [Reference — auth "ldap"](reference.md#auth-ldap).
 
 ## JWT sessions
 
@@ -1437,7 +1438,7 @@ Manual rotation: stop hypershunt, replace
 invalidated; clients re-authenticate on next request.  There's
 no built-in rotation schedule today.
 
-**See also**: [Reference — auth "jwt"](reference.md#auth-jwt),
+**See also:** [Reference — auth "jwt"](reference.md#auth-jwt),
 [`backend`](reference.md#backend),
 [`state-dir`](reference.md#state-dir).
 
@@ -1524,7 +1525,7 @@ hypershunt re-runs OIDC discovery every
 seconds (default 1 hour) and atomically swaps the cached JWKS.
 Set to `0` to disable.
 
-**See also**: [Reference — auth "oidc"](reference.md#auth-oidc),
+**See also:** [Reference — auth "oidc"](reference.md#auth-oidc),
 [Bearer-token resource server](#bearer-token-resource-server) for
 exposing the same protected endpoints to non-browser clients.
 
@@ -1566,7 +1567,7 @@ Single configuration thus serves two clients:
 Both populate the same authenticated identity used by
 [`policy`](reference.md#policy-location).
 
-**See also**: [Reference — auth "oidc"](reference.md#auth-oidc),
+**See also:** [Reference — auth "oidc"](reference.md#auth-oidc),
 [JWT sessions](#jwt-sessions).
 
 ## Subrequest auth
@@ -1634,7 +1635,7 @@ authentication service close (same host, Unix socket if you can)
 and the [`timeout=`](reference.md#timeout-subrequest) tight (1-2
 seconds).
 
-**See also**: [Reference — auth "subrequest"](reference.md#auth-subrequest),
+**See also:** [Reference — auth "subrequest"](reference.md#auth-subrequest),
 [`auth-request` handler](reference.md#auth-request).
 
 ## Access policies
@@ -1739,7 +1740,7 @@ vhost "y.example.com" {
 first-match semantics continue across the inlined rules.  Cycles
 are rejected at startup.
 
-**See also**: [Reference — policy on a location](reference.md#policy-location),
+**See also:** [Reference — policy on a location](reference.md#policy-location),
 [named policies](reference.md#policy-server).
 
 ## Rate limiting
@@ -1797,7 +1798,7 @@ location, per key value) with the current bucket level.  Set
 [`name=`](reference.md#name) on the rate-limit block to give it
 a friendly label.
 
-**See also**: [Reference — rate-limit](reference.md#rate-limit),
+**See also:** [Reference — rate-limit](reference.md#rate-limit),
 [Status, health, metrics](#status-health-metrics).
 
 ## Custom error pages
@@ -1820,7 +1821,7 @@ emits — a `404` because no location matched, a `403` from a
 policy, a `502` from an upstream failure.  Errors produced by a
 proxy *upstream* are passed through unchanged.
 
-**See also**: [Reference — error-page](reference.md#error-page).
+**See also:** [Reference — error-page](reference.md#error-page).
 
 ## WebSocket and HTTP-Upgrade proxying
 
@@ -1867,11 +1868,11 @@ backend's protocol requires, while upstream→client frames (always
 unmasked) pass through verbatim.  Real WS round-trips work across
 the bridge; generic non-WS byte tunnels work too.
 
-### h2/h3 native WebSocket
+Native h2/h3 WebSocket termination (an h2 or h3 *downstream*
+speaking RFC 8441 extended CONNECT directly to hypershunt) is
+planned for a future release once `h3` crate support lands.
 
-Coming in a future release once `h3` crate support lands.
-
-**See also**: [Reference — proxy scheme](reference.md#scheme),
+**See also:** [Reference — proxy scheme](reference.md#scheme),
 [Reference — proxy upstream](reference.md#upstream).
 
 ## Layer-4 proxy
@@ -1970,7 +1971,7 @@ rejected at load time with "not yet implemented".  To DTLS-encrypt the *upstream
 see the reserved [`dtls`](reference.md#dtls-upstream) child of
 `proxy`.
 
-**See also**: [Reference — L4 proxy](reference.md#proxy-listener),
+**See also:** [Reference — L4 proxy](reference.md#proxy-listener),
 [PROXY protocol on receive](#proxy-protocol-on-the-receive-side).
 
 ## PROXY protocol on the receive side
@@ -1990,10 +1991,14 @@ listener "tcp://0.0.0.0:8080" accept-proxy-protocol="v2" {
 [`accept-proxy-protocol`](reference.md#accept-proxy-protocol)
 requires every inbound connection to start with a v1 or v2
 header; connections without one are dropped.
-[`trusted-proxies`](reference.md#trusted-proxies) limits which
-peer IPs may send PROXY headers in the first place — without
-the allowlist, anyone who can reach the listener can claim any
-client IP.
+
+> [!WARNING]
+> Always pair `accept-proxy-protocol` with
+> [`trusted-proxies`](reference.md#trusted-proxies), which limits
+> which peer IPs may send PROXY headers.  Without the allowlist,
+> anyone who can reach the listener can forge a header and claim
+> any client IP — defeating every IP-based policy and rate limit
+> downstream.
 
 After the header is parsed, the carried source address becomes
 the peer IP used by access policies, rate-limit buckets, and
@@ -2005,7 +2010,7 @@ When the upstream LB also writes `X-Forwarded-For`, hypershunt
 appends the carried PROXY-protocol address to the chain so the
 backend sees one consistent view.
 
-**See also**: [Reference — accept-proxy-protocol](reference.md#accept-proxy-protocol),
+**See also:** [Reference — accept-proxy-protocol](reference.md#accept-proxy-protocol),
 [Behind another reverse proxy](#behind-another-reverse-proxy).
 
 ## Status, health, metrics
@@ -2045,12 +2050,16 @@ Kubernetes-style probes, intercepted before routing so they work
 without a `Host` header:
 
 - **liveness** `/healthz`, `/livez` — `200` JSON while the process
-  runs.  Point a `livenessProbe` here; it must NOT fail during a
-  graceful drain, or the kubelet would restart a pod that's cleanly
-  shutting down.
+  runs.
 - **readiness** `/readyz` — `200` normally, `503` while draining.
   Point a `readinessProbe` here so the pod is removed from Service
   endpoints as soon as it starts shutting down.
+
+> [!WARNING]
+> Do not point a `livenessProbe` at `/readyz`.  Liveness must NOT
+> fail during a graceful drain — the kubelet would kill and restart
+> a pod that's cleanly shutting down.  Liveness goes to `/livez`,
+> readiness to `/readyz`.
 
 ```yaml
 # Kubernetes pod spec
@@ -2085,7 +2094,7 @@ authenticated identity) in production.  (Health probes are
 intentionally exempt from policy — restrict them via per-listener
 `health=#false` instead.)
 
-**See also**: [Reference — status](reference.md#status),
+**See also:** [Reference — status](reference.md#status),
 [`health`](reference.md#health),
 [`lame-duck-timeout`](reference.md#lame-duck-timeout).
 
@@ -2123,7 +2132,7 @@ kill -HUP $(cat /var/run/hypershunt.pid)
 
 logrotate's stock postrotate of `kill -HUP` handles this.
 
-**See also**: [Reference — access-log](reference.md#access-log).
+**See also:** [Reference — access-log](reference.md#access-log).
 
 ## Security signals (fail2ban)
 
@@ -2306,7 +2315,7 @@ setcap cap_net_bind_service=+ep /usr/bin/hypershunt
 `server user=` becomes a no-op in that case (hypershunt logs a
 warning that the current user already matches).
 
-**See also**: [Reference — user](reference.md#user),
+**See also:** [Reference — user](reference.md#user),
 [`group`](reference.md#group),
 [`inherit-supplementary-groups`](reference.md#inherit-supplementary-groups).
 
@@ -2413,7 +2422,7 @@ What doesn't:
 - WebSocket and other long-lived upgrade tunnels under SIGUSR2
   — they're capped by `graceful-drain-timeout`.
 
-**See also**: [Reference — server](reference.md#server),
+**See also:** [Reference — server](reference.md#server),
 [`graceful-drain-timeout`](reference.md#graceful-drain-timeout),
 [`upgrade-startup-timeout`](reference.md#upgrade-startup-timeout).
 
@@ -2467,7 +2476,7 @@ they apply consistently regardless of LB config.
 When the LB does TCP-mode pass-through (sniproxy), hypershunt owns
 the TLS termination and runs as normal.
 
-**See also**: [PROXY protocol on the receive
+**See also:** [PROXY protocol on the receive
 side](#proxy-protocol-on-the-receive-side),
 [Reference — trusted-proxies](reference.md#trusted-proxies).
 
@@ -2522,4 +2531,4 @@ list:
 Run `hypershunt --check-config /etc/hypershunt.kdl` in CI to catch typos
 before they ship.
 
-**See also**: every reference section above.
+**See also:** every reference section above.
