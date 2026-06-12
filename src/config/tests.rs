@@ -1073,7 +1073,9 @@ fn scgi_handler_parses() {
         index,
     } = &cfg.vhosts[0].locations[0].handler
     {
-        assert_eq!(socket, "unix-stream:/run/myapp.sock");
+        // `unix-stream:` is normalised to the connector's `unix:`
+        // form at parse time.
+        assert_eq!(socket, "unix:/run/myapp.sock");
         assert_eq!(root, "/var/www/html");
         assert_eq!(index.as_deref(), Some("index.py"));
     }
@@ -1343,6 +1345,30 @@ fn fastcgi_property_form_parses() {
         assert_eq!(socket, "unix:/run/php.sock");
         assert_eq!(root, "/var/www");
         assert_eq!(index.as_deref(), Some("index.php"));
+    } else {
+        panic!("expected FastCgi handler");
+    }
+}
+
+#[test]
+fn fastcgi_unix_stream_scheme_normalised() {
+    // `unix-stream:` (the listener bind-URL spelling) is accepted
+    // and normalised to the short `unix:` form the connector uses.
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/php/" {
+                fastcgi socket="unix-stream:/run/php.sock" root="/var/www"
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    if let HandlerConfig::FastCgi { socket, .. } =
+        &cfg.vhosts[0].locations[0].handler
+    {
+        assert_eq!(socket, "unix:/run/php.sock");
     } else {
         panic!("expected FastCgi handler");
     }

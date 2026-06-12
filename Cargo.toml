@@ -60,7 +60,9 @@ tokio              = { version = "1",    features = ["full"] }
 # Used by the HTTP/3 outbound proxy to stream upstream response bodies
 # back to the downstream client without buffering them in memory.
 tokio-stream       = "0.1"
-kdl                = "6"
+# 6.7.1 minimum: 6.5.x mis-parses a node whose inline children block
+# is followed by a trailing `//` comment, swallowing the next node.
+kdl                = "6.7.1"
 miette             = { version = "7", default-features = false }
 regex              = "1"
 anyhow             = "1"

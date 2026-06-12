@@ -68,6 +68,13 @@ fn parse_socket_handler(
              socket=\"<unix-stream:/... | host:port>\""
         )
     })?;
+    // The runtime connector recognises the short `unix:` prefix;
+    // accept the listener bind-URL spelling `unix-stream:` too and
+    // normalise it here so the docs can use one scheme everywhere.
+    let socket = match socket.strip_prefix("unix-stream:") {
+        Some(path) => format!("unix:{path}"),
+        None => socket,
+    };
     let root = prop_str(node, "root").ok_or_else(|| {
         anyhow!("{name}:{line}: {variant} handler requires root=\"...\"")
     })?;
