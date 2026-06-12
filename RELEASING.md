@@ -51,20 +51,22 @@ Markdown mirror is stale and was not rebuilt + committed.
 
 1. Edit `Cargo.toml` — set the new `version`.
 2. Update the date in `docs/hypershunt.1` (`.TH ... "YYYY-MM-DD" ...`).
-3. Regenerate the man page and manual:
+3. Update the version in the `README.md` status line (`> **Status:**
+   ... (currently X.Y.Z)`).
+4. Regenerate the man page and manual:
 
    ```sh
    cargo build
    ```
 
-4. Commit the bump (include all three files):
+5. Commit the bump (include all four files):
 
    ```sh
-   git add Cargo.toml docs/hypershunt.1 docs/manual.md
+   git add Cargo.toml docs/hypershunt.1 docs/manual.md README.md
    git commit -m "release: bump version to X.Y.Z"
    ```
 
-5. Tag and push:
+6. Tag and push:
 
    ```sh
    git tag vX.Y.Z
