@@ -70,7 +70,7 @@ certificates and JWT signing keys, authentication back-end, and global
 TLS defaults.
 .TP
 .B listener
-Opens a TCP socket (via
+Opens a TCP, UDP (HTTP/3), or Unix socket (via
 .B bind
 or an inherited file descriptor via
 .BR fd )
@@ -100,8 +100,13 @@ Maps a URL path prefix to a handler:
 .BR static ,
 .BR proxy ,
 .BR redirect ,
+.BR respond ,
+.BR fastcgi ,
+.BR scgi ,
+.BR cgi ,
+.BR status ,
 or
-.BR fastcgi .
+.BR auth\-request .
 .RE
 .PP
 See the configuration reference for the full directive list:

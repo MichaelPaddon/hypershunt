@@ -30,17 +30,17 @@ Read top to bottom:
 
 - [`listener "tcp://[::]:80"`](reference.md#listener) binds an
   IPv6 (and dual-stack) TCP socket on port 80.  The string is a
-  [bind URL](reference.md#bind-url) -- the scheme picks the
+  [bind URL](reference.md#bind-url) — the scheme picks the
   socket family.
 - `vhost "example.com"` claims the HTTP `Host: example.com`
   header.  Vhosts are matched literally first, then by regex
   (when [`regex=#true`](reference.md#regex) is set), then by the
-  listener's default (its first vhost) -- see
+  listener's default (its first vhost) — see
   [Per-listener vhost scoping](#per-listener-vhost-scoping).
 - `location "/"` matches every request path inside the vhost.
   Multiple locations are matched by **longest prefix**, so a
   more specific `/api/` would win over the `/` catch-all.
-- `static root=...` is the handler -- exactly one handler per
+- `static root=...` is the handler — exactly one handler per
   location.  The other handlers are [`proxy`](reference.md#proxy-handler),
   [`redirect`](reference.md#redirect),
   [`fastcgi`](reference.md#fastcgi), [`scgi`](reference.md#scgi),
@@ -51,7 +51,7 @@ KDL comments are `//` (to end of line) or `/* ... */`.  Block
 nodes use `{ ... }` and properties are written `key=value` on
 the node line.
 
-A more realistic shape -- privilege drop, HTTPS, multiple vhosts:
+A more realistic shape — privilege drop, HTTPS, multiple vhosts:
 
 ```kdl
 server user="hypershunt" state-dir="/var/lib/hypershunt"
@@ -93,7 +93,7 @@ The handler resolves the request path under
 [`root`](reference.md#root-static), checks it's a regular file,
 and streams it back with the right `Content-Type` (derived from
 the file extension), `Content-Length`, and an ETag for
-conditional GETs.  Range requests are honoured -- hypershunt supports
+conditional GETs.  Range requests are honoured — hypershunt supports
 single-range `Range: bytes=N-M` for download resume.
 
 ### Directory requests and index files
@@ -108,7 +108,7 @@ static root="/var/www/site" {
 }
 ```
 
-The defaults are exactly those two names -- specify the block
+The defaults are exactly those two names — specify the block
 only when you want something different.
 
 ### Single-page apps and `try-files`
@@ -132,7 +132,7 @@ Hypershunt walks the list in order, substituting `{path}` with the
 request path (location prefix stripped if
 [`strip-prefix=#true`](reference.md#strip-prefix-static)).  The
 first existing regular file wins.  When no candidate exists, the
-response is `404` -- the [`index-file`](reference.md#index-file)
+response is `404` — the [`index-file`](reference.md#index-file)
 flow is bypassed.
 
 ### Directory listing
@@ -170,7 +170,7 @@ location "/" {
 The redirect fires only when the resolved path is a directory
 with no matching index file.  As soon as the operator drops an
 `index.html` into `/var/www/hypershunt/`, that file is served and the
-redirect stops -- no config edit required.  Random-path `404`s
+redirect stops — no config edit required.  Random-path `404`s
 (e.g. `/typo`) are unaffected; the property is intentionally
 narrow.
 
@@ -210,7 +210,7 @@ A request for `/assets/css/main.css` resolves to
 `/var/www/site/static/assets/css/main.css`.
 
 **See also**: [Locations and routing](#locations-and-routing) for
-how locations are matched; [Reference -- static
+how locations are matched; [Reference — static
 handler](reference.md#static) for every knob.
 
 ## Virtual hosts
@@ -248,18 +248,22 @@ vhost "example.com" {
 
 ### Regex vhosts
 
-For wildcard ranges -- staging environments, multi-tenant
-subdomains -- set `regex=#true`:
+For wildcard ranges — staging environments, multi-tenant
+subdomains — set `regex=#true`:
 
 ```kdl
-vhost "(?:\w+\.)?example\.com" regex=#true {
+vhost #"(?:\w+\.)?example\.com"# regex=#true {
     location "/" { static root="/var/www/example" }
 }
 ```
 
+Use a KDL *raw string* (`#"..."#`) for the pattern — inside a
+plain `"..."` string, regex escapes like `\.` and `\w` are
+invalid KDL escapes and the config will not parse.
+
 The pattern is anchored automatically (`^...$`); you don't need
 to add the anchors yourself.  Regex vhosts cost more per request
-than literal ones -- list literals first and use regex as a
+than literal ones — list literals first and use regex as a
 fallback or for genuinely variable subdomains.
 
 ### Per-listener vhost scoping
@@ -271,7 +275,7 @@ fallback served when a request `Host` matches nothing:
 ```kdl
 listener "tcp://[::]:80"
 
-vhost "example.com" {            # first declared -> the default
+vhost "example.com" {            // first declared -> the default
     location "/" { static root="/var/www/example" }
 }
 vhost "api.example.com" {
@@ -290,12 +294,12 @@ vhost "admin.example.com"   name="admin" explicit-only=#true {
     location "/" { proxy { upstream "http://127.0.0.1:9000" } }
 }
 
-listener "tcp://[::]:80"   { vhost "public" }            # public only
+listener "tcp://[::]:80"   { vhost "public" }            // public only
 listener "tcp://[::]:8443" { tls "self-signed"; vhost "public" "admin" }
 ```
 
 Two vhosts may even share a `Host` and serve **different content per
-port** -- give them distinct [`name`](reference.md#name-vhost) handles and
+port** — give them distinct [`name`](reference.md#name-vhost) handles and
 list a different one on each listener:
 
 ```kdl
@@ -334,7 +338,7 @@ Per-vhost ALPN only works on TCP/TLS listeners (hypershunt selects
 the right config from the SNI in the ClientHello).  Regex vhosts
 and QUIC listeners fall back to the listener default.
 
-**See also**: [Reference -- vhost](reference.md#vhost),
+**See also**: [Reference — vhost](reference.md#vhost),
 [listener `vhost` list](reference.md#vhost-listener-child),
 [ALPN on a listener](reference.md#alpn).
 
@@ -353,7 +357,7 @@ vhost "example.com" {
 a request to `/api/v1/users` reaches the `api-v1` upstream; one
 to `/api/products` reaches `api`; one to `/about` lands on the
 static handler.  Order in the file does not matter for prefix
-matching -- the parser sorts locations by prefix length.
+matching — the parser sorts locations by prefix length.
 
 ### Matching beyond prefix
 
@@ -376,7 +380,7 @@ location "/upload/" {
 
 Predicates inside the block are AND-evaluated.  When the predicate
 is false, the router skips this location and continues with the
-next shorter-prefix candidate -- here, the GET case lands on the
+next shorter-prefix candidate — here, the GET case lands on the
 HTML form served from disk.
 
 Predicate types:
@@ -427,7 +431,7 @@ The upstream sees `/users` for a request to `/api/v1/users`.
 The same flag exists on [`static`](reference.md#strip-prefix-static)
 for filesystem mounts that don't include the URL prefix.
 
-**See also**: [Reference -- location](reference.md#location),
+**See also**: [Reference — location](reference.md#location),
 [Request matching](#request-matching),
 [`rewrite`](reference.md#rewrite).
 
@@ -446,7 +450,7 @@ listener "tcp://[::]:443" { tls "self-signed" }
 ```
 
 hypershunt generates a fresh keypair in memory on each start.  The
-certificate is **not** publicly trusted -- use this only locally
+certificate is **not** publicly trusted — use this only locally
 or in CI.
 
 ### PEM files
@@ -498,7 +502,7 @@ CA, which has far looser limits and exercises the identical flow;
 its certificates just aren't publicly trusted.  Without editing the
 config you can force staging by setting the
 [`HYPERSHUNT_ACME_STAGING`](reference.md#hypershunt_acme_staging)
-environment variable -- handy in a container or CI.
+environment variable — handy in a container or CI.
 
 When the staging issuance succeeds, switch to production: remove
 `staging=#true` (or unset the env var) **and delete the cached
@@ -572,7 +576,7 @@ listener "tcp://[::]:443" { tls "ref" name="edge" }
 listener "udp://[::]:443" { tls "ref" name="edge" }
 ```
 
-That second listener also turns on HTTP/3 -- on a `udp://`
+That second listener also turns on HTTP/3 — on a `udp://`
 listener a `tls` block selects HTTP/3 (see the next chapter).
 
 ### OCSP stapling
@@ -627,7 +631,7 @@ mtls mode="required" refresh=600 {
 }
 ```
 
-**See also**: [Reference -- listener TLS](reference.md#tls-listener),
+**See also**: [Reference — listener TLS](reference.md#tls-listener),
 [ACME providers](reference.md#dns-provider),
 [`tls-options`](reference.md#tls-options) for server-wide
 defaults like minimum protocol version.
@@ -635,7 +639,7 @@ defaults like minimum protocol version.
 ## HTTP/3
 
 HTTP/3 runs over QUIC on a UDP listener.  The shape mirrors
-TCP/TLS exactly -- a [`tls`](reference.md#tls-on-udp-http3) block
+TCP/TLS exactly — a [`tls`](reference.md#tls-on-udp-http3) block
 on a `udp://` listener *is* the HTTP/3 cert source.  Because
 QUIC's encryption *is* TLS 1.3 (RFC 9001), the cert plumbing is
 identical to HTTPS; the only difference is the socket scheme:
@@ -656,7 +660,7 @@ listener "udp://[::]:443" { tls "ref" name="edge" }
 When a TCP/TLS listener and a UDP listener share the same port,
 hypershunt injects `Alt-Svc: h3=":<port>"; ma=86400` into HTTP/1.1
 and HTTP/2 responses.  Browsers see it on the first hit and
-upgrade subsequent requests to HTTP/3 themselves -- no extra
+upgrade subsequent requests to HTTP/3 themselves — no extra
 config required.  Override the auto-injected value with a
 [`response-headers`](reference.md#response-headers) `set` rule
 in the relevant location or vhost, or remove it with `remove
@@ -678,10 +682,10 @@ listener "udp://[::]:443" {
 ```
 
 [`zero-rtt=#true`](reference.md#zero-rtt) enables 0-RTT early
-data -- carries replay risk, only safe when every handler in the
+data — carries replay risk, only safe when every handler in the
 listener's vhosts is idempotent.
 
-**See also**: [Reference -- tls on udp:// (HTTP/3)](reference.md#tls-on-udp-http3),
+**See also**: [Reference — tls on udp:// (HTTP/3)](reference.md#tls-on-udp-http3),
 [`quic-transport`](reference.md#quic-transport).
 
 ## Reverse proxy
@@ -720,23 +724,23 @@ proxy scheme="h3" { upstream "https://api.example.com" }
 By default hypershunt adds:
 
 - `X-Forwarded-For: <client_ip>` (appended to any existing list)
-- `X-Forwarded-Proto: <http|https>`
-- `X-Forwarded-Host: <Host header>`
 - `X-Real-IP: <client_ip>`
-- `Forwarded: by=...;for=...;host=...;proto=...` (RFC 7239)
 
 The client IP is the post-PROXY-protocol peer address when
 [`accept-proxy-protocol`](reference.md#accept-proxy-protocol) is
 set on the listener, otherwise the raw socket peer.
 
-Replace, append, or remove arbitrary headers with the
+If the upstream needs more (`X-Forwarded-Proto`,
+`X-Forwarded-Host`, …), add them yourself — and replace, append,
+or remove arbitrary headers — with the
 [`request-headers`](reference.md#request-headers) block:
 
 ```kdl
 location "/api/" {
     proxy { upstream "http://api:9000" }
     request-headers {
-        set "X-Real-IP" "{client_ip}"
+        set "X-Forwarded-Proto" "{scheme}"
+        set "X-Forwarded-Host" "{host}"
         set "X-Tenant" "{user}"
         remove "Cookie"
     }
@@ -744,7 +748,7 @@ location "/api/" {
 ```
 
 Hypershunt automatically strips hop-by-hop headers (`Connection`,
-`Keep-Alive`, `Transfer-Encoding`, etc.) -- the upstream sees a
+`Keep-Alive`, `Transfer-Encoding`, etc.) — the upstream sees a
 clean HTTP/1.1+ message.
 
 ### Path handling
@@ -784,16 +788,16 @@ location "/api/" {
 
 The policies:
 
-- `round-robin` (default) -- evenly spread across healthy
+- `round-robin` (default) — evenly spread across healthy
   upstreams, weighted by [`weight=`](reference.md#upstream).
-- `least-conn` -- pick the healthy upstream with the fewest
+- `least-conn` — pick the healthy upstream with the fewest
   in-flight requests.  Best when request latency varies.
-- `random` -- weighted random pick.  Hash-free, no shared
+- `random` — weighted random pick.  Hash-free, no shared
   state.
-- `ip-hash` -- hash the client IP.  Stable affinity, no cookies
+- `ip-hash` — hash the client IP.  Stable affinity, no cookies
   needed.  Pool changes (additions, removals) reshuffle some
   clients.
-- `header-hash` -- hash a named request header.  Provide
+- `header-hash` — hash a named request header.  Provide
   `header=<name>`.  Common for session affinity via
   `Cookie` or `X-Session-Id`.
 
@@ -801,7 +805,7 @@ Per-upstream `weight=0` parks an upstream (it stays in the pool
 but receives no traffic); useful for a warm standby you keep
 ready but don't actively use.
 
-**See also**: [Reference -- lb-policy](reference.md#lb-policy),
+**See also**: [Reference — lb-policy](reference.md#lb-policy),
 [Health checks](#health-checks).
 
 ## Health checks
@@ -823,7 +827,7 @@ proxy {
 
 Five real-request failures in a row eject the upstream for thirty
 seconds, after which it re-enters rotation.  Default
-[`eject-after`](reference.md#eject-after) is `u32::MAX` -- the
+[`eject-after`](reference.md#eject-after) is `u32::MAX` — the
 feature is opt-in.
 
 ### Active
@@ -850,7 +854,7 @@ wedge real traffic.  Use both passive and active together: the
 prober is the canary, the passive ejection is the real-time
 guard for upstreams that fail fast.
 
-**See also**: [Reference -- active-health](reference.md#active-health),
+**See also**: [Reference — active-health](reference.md#active-health),
 [`passive-health`](reference.md#passive-health).
 
 ## Retries
@@ -874,17 +878,17 @@ proxy {
 A few things to know:
 
 - Listing the codes explicitly is mandatory.  Hypershunt does not
-  retry "any 5xx" by default -- that would catch
+  retry "any 5xx" by default — that would catch
   application-level failures like `503 Service Busy` or `500
   Validation Error` that don't benefit from retry.
 - When `max > 0`, hypershunt buffers the request body in memory so it
   can be replayed on each attempt.  Don't enable retries for
   large-upload endpoints; the buffer cost adds up.
 - Connection-level failures (TCP reset, TLS handshake error,
-  `connect-timeout` expiry) are *always* retried -- they happen
+  `connect-timeout` expiry) are *always* retried — they happen
   before the request is sent, so there's nothing to replay.
 
-**See also**: [Reference -- retry](reference.md#retry).
+**See also**: [Reference — retry](reference.md#retry).
 
 ## Connection pooling and timeouts
 
@@ -904,7 +908,7 @@ proxy \
 - [`pool-idle-timeout`](reference.md#pool-idle-timeout): seconds
   an idle connection lingers in the pool.  Defaults to 90.
   Setting `0` disables reuse entirely (every request opens a
-  fresh TCP connection -- only ever do this to work around
+  fresh TCP connection — only ever do this to work around
   upstream bugs).
 - [`pool-max-idle`](reference.md#pool-max-idle): cap on idle
   connections per host.  HTTP/1.1 and HTTP/2 only.  Defaults to
@@ -935,7 +939,7 @@ listener "tcp://[::]:80" {
   HTTP/1.1 requests on the same connection.  `0` disables
   keep-alive entirely.
 
-**See also**: [Reference -- timeouts](reference.md#timeouts).
+**See also**: [Reference — timeouts](reference.md#timeouts).
 
 ## Compression
 
@@ -1000,7 +1004,7 @@ Header rules apply in declaration order; mixing `add` and `set`
 on the same name lets you e.g. `set "X-Forwarded-For"` to the
 client IP and then `add` extra hops.
 
-**See also**: [Reference -- request-headers](reference.md#request-headers).
+**See also**: [Reference — request-headers](reference.md#request-headers).
 
 ## URL redirects
 
@@ -1018,9 +1022,11 @@ vhost "www.example.com" {
     location "/" { redirect to="https://{host}{path_and_query}" code=301 }
 }
 
-// Legacy URL retirement
-location "/old-section/" {
-    redirect to="/new-section/" code=301
+// Legacy URL retirement (inside whichever vhost owns the path)
+vhost "docs.example.com" {
+    location "/old-section/" {
+        redirect to="/new-section/" code=301
+    }
 }
 ```
 
@@ -1041,12 +1047,12 @@ same set available in [header rules](#header-manipulation)
 for temporary moves and `307`/`308` when the body must be
 preserved through a method-preserving redirect.
 
-**See also**: [Reference -- redirect](reference.md#redirect).
+**See also**: [Reference — redirect](reference.md#redirect).
 
 ## Canned responses
 
 Use [`respond`](reference.md#respond) when a location should return a
-fixed answer with no back-end: health/ack endpoints, custom block
+fixed answer with no backend: health/ack endpoints, custom block
 messages, fixed tokens, tiny stubs, and maintenance pages.
 
 ```kdl
@@ -1082,7 +1088,7 @@ Set any extra headers with the location's
 [`response-headers`](reference.md#response-headers) block — a
 `set "Content-Type" …` there overrides `content-type=`.
 
-**See also**: [Reference -- respond](reference.md#respond).
+**See also**: [Reference — respond](reference.md#respond).
 
 ## Request matching
 
@@ -1117,7 +1123,7 @@ multiple predicates):
   full URI path (auto-anchored).
 - [`not`](reference.md#not-match) negation.
 
-A worked example -- gate a location on cookie presence:
+A worked example — gate a location on cookie presence:
 
 ```kdl
 location "/dashboard/" {
@@ -1131,14 +1137,14 @@ location "/dashboard/" {
 }
 ```
 
-**See also**: [Reference -- match](reference.md#match),
+**See also**: [Reference — match](reference.md#match),
 [Locations and routing](#locations-and-routing).
 
 ## CGI, FastCGI, SCGI
 
-Three gateway protocols for hand-off to a back-end process pool.
+Three gateway protocols for hand-off to a backend process pool.
 
-### FastCGI -- e.g. PHP-FPM
+### FastCGI — e.g. PHP-FPM
 
 ```kdl
 location "/php/" {
@@ -1164,7 +1170,7 @@ location "/" {
 Same property set as `fastcgi`; only the wire protocol differs.
 Common in older Python / Ruby deployments.
 
-### CGI -- one process per request
+### CGI — one process per request
 
 ```kdl
 location "/cgi-bin/" {
@@ -1182,15 +1188,15 @@ outside [`root=`](reference.md#root-cgi).
 ### Which to use
 
 - **FastCGI** for stable language runtimes (PHP-FPM, mod_wsgi
-  alternatives) -- highest throughput, lowest overhead.
-- **SCGI** for legacy back-ends already speaking it.
+  alternatives) — highest throughput, lowest overhead.
+- **SCGI** for legacy backends already speaking it.
 - **CGI** for one-shot scripts where the per-request fork cost
   is acceptable.
 
-**See also**: [Reference -- fastcgi](reference.md#fastcgi),
+**See also**: [Reference — fastcgi](reference.md#fastcgi),
 [`scgi`](reference.md#scgi), [`cgi`](reference.md#cgi).
 
-## HTTP Basic auth -- htpasswd file
+## HTTP Basic auth — htpasswd file
 
 The [`auth "file"`](reference.md#auth-file) backend validates
 HTTP Basic credentials against an htpasswd-style file:
@@ -1216,7 +1222,7 @@ its mtime changes.
 
 hypershunt accepts bcrypt (`$2y$`, `$2b$`, `$2a$`), SHA-512 crypt
 (`$6$`), and Argon2id (`$argon2id$`).  Plain, MD5-crypt, DES, and
-SHA-1 are rejected at parse time -- the parser exits with an
+SHA-1 are rejected at parse time — the parser exits with an
 error rather than silently accepting a weak hash.
 
 Generate hashes with:
@@ -1251,10 +1257,10 @@ hash verification.  bcrypt and Argon2 verifications are
 deliberately slow; caching keeps the per-request cost low when
 the same client makes a burst of requests.
 
-**See also**: [Reference -- auth "file"](reference.md#auth-file),
+**See also**: [Reference — auth "file"](reference.md#auth-file),
 [Access policies](#access-policies).
 
-## HTTP Basic auth -- PAM
+## HTTP Basic auth — PAM
 
 The [`auth "pam"`](reference.md#auth-pam) backend reuses the
 host's PAM stack:
@@ -1272,7 +1278,7 @@ vhost "private.example.com" {
 ```
 
 [`service=`](reference.md#service) names the file under
-`/etc/pam.d/`.  Don't reuse `login` -- that stack expects a TTY
+`/etc/pam.d/`.  Don't reuse `login` — that stack expects a TTY
 and will fail in a no-TTY environment.  Drop a minimal
 `/etc/pam.d/hypershunt`:
 
@@ -1292,7 +1298,7 @@ PAM authentication via `pam_unix.so` requires read access to
   capability.
 
 Test from the command line first with `pamtester hypershunt username
-authenticate` -- if that fails, hypershunt will too.
+authenticate` — if that fails, hypershunt will too.
 
 ### Group resolution
 
@@ -1300,10 +1306,10 @@ After PAM authentication succeeds, hypershunt reads the user's POSIX
 group memberships and exposes them to the `group` predicate.  No
 extra config is needed.
 
-**See also**: [Reference -- auth "pam"](reference.md#auth-pam),
+**See also**: [Reference — auth "pam"](reference.md#auth-pam),
 [Running unprivileged](#running-unprivileged).
 
-## HTTP Basic auth -- LDAP
+## HTTP Basic auth — LDAP
 
 The [`auth "ldap"`](reference.md#auth-ldap) backend performs a
 simple bind against an LDAP directory:
@@ -1319,7 +1325,7 @@ server {
 }
 ```
 
-[`bind-dn`](reference.md#bind-dn) is a template -- hypershunt replaces
+[`bind-dn`](reference.md#bind-dn) is a template — hypershunt replaces
 `{user}` with the LDAP-escaped username from HTTP Basic before
 binding.  After a successful bind, hypershunt searches under
 [`base-dn`](reference.md#base-dn) with
@@ -1329,10 +1335,10 @@ to populate the group list.
 
 ### URL schemes
 
-- `ldaps://host:port` -- TLS from the start.
-- `ldap://host:port` -- plaintext; add
+- `ldaps://host:port` — TLS from the start.
+- `ldap://host:port` — plaintext; add
   [`starttls=#true`](reference.md#starttls) to upgrade.
-- `ldapi://%2Fvar%2Frun%2Fslapd%2Fldapi` -- Unix-socket
+- `ldapi://%2Fvar%2Frun%2Fslapd%2Fldapi` — Unix-socket
   (URL-encoded path).  Useful for trusted-localhost setups.
 
 ### Active Directory
@@ -1351,7 +1357,7 @@ Hypershunt doesn't do AD-specific paging today; for very large
 directories the group search may be capped by the server's
 default page size.
 
-**See also**: [Reference -- auth "ldap"](reference.md#auth-ldap).
+**See also**: [Reference — auth "ldap"](reference.md#auth-ldap).
 
 ## JWT sessions
 
@@ -1359,7 +1365,7 @@ default page size.
 credential-backend login for a signed cookie that's valid for
 the next request without re-authenticating.  The wrapped backend
 runs once (Basic auth login); subsequent requests are validated
-by ES256 signature check alone -- no PAM/LDAP/file lookup per
+by ES256 signature check alone — no PAM/LDAP/file lookup per
 request.
 
 ```kdl
@@ -1402,7 +1408,7 @@ with [`validity=`](reference.md#validity).
 
 ### Standalone validator
 
-Omit `backend=` and hypershunt won't issue tokens -- it'll only
+Omit `backend=` and hypershunt won't issue tokens — it'll only
 validate incoming JWTs (cookie or `Authorization: Bearer`):
 
 ```kdl
@@ -1431,7 +1437,7 @@ Manual rotation: stop hypershunt, replace
 invalidated; clients re-authenticate on next request.  There's
 no built-in rotation schedule today.
 
-**See also**: [Reference -- auth "jwt"](reference.md#auth-jwt),
+**See also**: [Reference — auth "jwt"](reference.md#auth-jwt),
 [`backend`](reference.md#backend),
 [`state-dir`](reference.md#state-dir).
 
@@ -1462,20 +1468,20 @@ server state-dir="/var/lib/hypershunt" {
 Once OIDC is configured, hypershunt owns four paths on every vhost
 (rename via the corresponding `oidc-*-path` properties):
 
-- `/oidc/login` -- starts the flow; redirects to the IdP
+- `/oidc/login` — starts the flow; redirects to the IdP
   with PKCE.
-- `/oidc/callback` -- receives the code, exchanges it for
+- `/oidc/callback` — receives the code, exchanges it for
   tokens, issues the JWT cookie.
-- `/oidc/logout` -- clears local cookies and (when
+- `/oidc/logout` — clears local cookies and (when
   [`oidc-idp-logout=#true`](reference.md#idp-logout)) bounces
   through the IdP's `end_session_endpoint`.
-- `/oidc/backchannel-logout` -- accepts IdP-pushed
+- `/oidc/backchannel-logout` — accepts IdP-pushed
   `logout_token` POSTs for server-side state teardown.
 
 Browsers hitting a protected URL with no cookie are automatically
 redirected to `/oidc/login?next=<original>`.  Hypershunt
 detects browsers via `Accept: text/html` and the absence of an
-`Authorization:` header -- API clients still get the
+`Authorization:` header — API clients still get the
 `401` + `WWW-Authenticate: Bearer` challenge.
 
 ### UserInfo
@@ -1508,7 +1514,7 @@ When the IdP supports it, [`oidc-backchannel-logout=#true`](reference.md#backcha
 (on by default) accepts pushed `logout_token` POSTs and drops
 the server-side refresh state.  The user's in-flight JWT cookie
 remains valid until its own [`validity`](reference.md#validity)
-expires -- keep `validity` short (a few minutes) if fast
+expires — keep `validity` short (a few minutes) if fast
 revocation matters.
 
 ### IdP key rotation
@@ -1518,7 +1524,7 @@ hypershunt re-runs OIDC discovery every
 seconds (default 1 hour) and atomically swaps the cached JWKS.
 Set to `0` to disable.
 
-**See also**: [Reference -- auth "oidc"](reference.md#auth-oidc),
+**See also**: [Reference — auth "oidc"](reference.md#auth-oidc),
 [Bearer-token resource server](#bearer-token-resource-server) for
 exposing the same protected endpoints to non-browser clients.
 
@@ -1560,7 +1566,7 @@ Single configuration thus serves two clients:
 Both populate the same authenticated identity used by
 [`policy`](reference.md#policy-location).
 
-**See also**: [Reference -- auth "oidc"](reference.md#auth-oidc),
+**See also**: [Reference — auth "oidc"](reference.md#auth-oidc),
 [JWT sessions](#jwt-sessions).
 
 ## Subrequest auth
@@ -1602,7 +1608,7 @@ subrequest's *response*.  Anything other than `200` denies.
 ### Pairing with `auth-request` on a peer hypershunt
 
 The natural counterpart on the *server* side is the
-[`auth-request`](reference.md#auth-request) handler -- it
+[`auth-request`](reference.md#auth-request) handler — it
 serves `200 OK` plus the identity headers that
 `auth "subrequest"` reads:
 
@@ -1628,7 +1634,7 @@ authentication service close (same host, Unix socket if you can)
 and the [`timeout=`](reference.md#timeout-subrequest) tight (1-2
 seconds).
 
-**See also**: [Reference -- auth "subrequest"](reference.md#auth-subrequest),
+**See also**: [Reference — auth "subrequest"](reference.md#auth-subrequest),
 [`auth-request` handler](reference.md#auth-request).
 
 ## Access policies
@@ -1684,7 +1690,7 @@ location "/admin/" {
 ```
 
 Identity predicates (`authenticated`, `user`, `group`)
-automatically return `401` for anonymous users -- no explicit
+automatically return `401` for anonymous users — no explicit
 `deny code=401` needed.  Wrap them in `not` to suppress the
 auto-challenge when you want a different status.
 
@@ -1733,7 +1739,7 @@ vhost "y.example.com" {
 first-match semantics continue across the inlined rules.  Cycles
 are rejected at startup.
 
-**See also**: [Reference -- policy on a location](reference.md#policy-location),
+**See also**: [Reference — policy on a location](reference.md#policy-location),
 [named policies](reference.md#policy-server).
 
 ## Rate limiting
@@ -1776,12 +1782,12 @@ regardless of which IP they're calling from.
 
 [`key`](reference.md#key) accepts three forms:
 
-- `"client-ip"` -- bucket per peer IP.  Use with
+- `"client-ip"` — bucket per peer IP.  Use with
   [`accept-proxy-protocol`](reference.md#accept-proxy-protocol)
   for accurate IPs when fronted by an LB.
-- `"user"` -- bucket per authenticated username.  Anonymous
+- `"user"` — bucket per authenticated username.  Anonymous
   requests share the empty-string bucket.
-- `"header" "X-API-Key"` -- bucket per value of a named header.
+- `"header" "X-API-Key"` — bucket per value of a named header.
   Useful for API-key throttling.
 
 ### Surfacing on `/status`
@@ -1791,7 +1797,7 @@ location, per key value) with the current bucket level.  Set
 [`name=`](reference.md#name) on the rate-limit block to give it
 a friendly label.
 
-**See also**: [Reference -- rate-limit](reference.md#rate-limit),
+**See also**: [Reference — rate-limit](reference.md#rate-limit),
 [Status, health, metrics](#status-health-metrics).
 
 ## Custom error pages
@@ -1810,11 +1816,11 @@ disk, served as `Content-Type: text/html`) or `html=` (inline
 literal) is required.  The file is read once at startup.
 
 Error pages are returned for status codes the *hypershunt* runtime
-emits -- a `404` because no location matched, a `403` from a
+emits — a `404` because no location matched, a `403` from a
 policy, a `502` from an upstream failure.  Errors produced by a
 proxy *upstream* are passed through unchanged.
 
-**See also**: [Reference -- error-page](reference.md#error-page).
+**See also**: [Reference — error-page](reference.md#error-page).
 
 ## WebSocket and HTTP-Upgrade proxying
 
@@ -1837,7 +1843,7 @@ bidirectional byte pump until either side closes.
 Authentication, [`policy`](reference.md#policy-location), and
 [`rate-limit`](reference.md#rate-limit) run *before* the upgrade
 completes.  Retries and load-balancer picks happen at
-upgrade-request time only -- once the tunnel is open, retries
+upgrade-request time only — once the tunnel is open, retries
 are off.
 
 ### Cross-protocol bridge (h1 ↔ h2c)
@@ -1853,20 +1859,20 @@ Hypershunt translates the inbound h1 `Upgrade:` into an h2 extended
 CONNECT (RFC 8441), receives the 200 response, and synthesises
 the 101 + `Sec-WebSocket-Accept` back to the h1 client.
 
-**Caveat for WebSocket specifically**: h1 WS frames carry a
+**WebSocket framing across the bridge**: h1 WS frames carry a
 client-side mask (RFC 6455 §5.3), h2 WS frames do not (RFC 8441
-§5.5).  Hypershunt's bridge today does not unmask/remask per frame --
-the handshake succeeds, but a real WS round-trip fails the
-upstream's framing check.  Generic non-WS byte tunnels work
-fine.
+§5.5).  Hypershunt translates the masking at the protocol
+boundary: client→upstream frames are unmasked or re-masked as the
+backend's protocol requires, while upstream→client frames (always
+unmasked) pass through verbatim.  Real WS round-trips work across
+the bridge; generic non-WS byte tunnels work too.
 
 ### h2/h3 native WebSocket
 
-Coming in a future release once `h3` crate support lands;
-tracked in the project README.
+Coming in a future release once `h3` crate support lands.
 
-**See also**: [Reference -- proxy scheme](reference.md#scheme),
-[Reference -- proxy upstream](reference.md#upstream).
+**See also**: [Reference — proxy scheme](reference.md#scheme),
+[Reference — proxy upstream](reference.md#upstream).
 
 ## Layer-4 proxy
 
@@ -1891,7 +1897,7 @@ upstream) are rejected at parse time.
 
 L4 bind URLs are resolved at parse time and require **literal IP
 addresses** (`127.0.0.1`, `[::1]`, `10.0.0.5`) rather than
-hostnames -- hypershunt doesn't do DNS for L4 because flows are
+hostnames — hypershunt doesn't do DNS for L4 because flows are
 established outside the HTTP request lifecycle.
 
 ### Plain TCP forwarder
@@ -1916,7 +1922,7 @@ listener "tcp://0.0.0.0:5432" {
 }
 ```
 
-The `tls skip-verify=#true` knob exists for back-ends with
+The `tls skip-verify=#true` knob exists for backends with
 self-signed certificates; never use it across networks you don't
 control.
 
@@ -1942,15 +1948,16 @@ listener "tcp://0.0.0.0:5432" {
 ```
 
 [`proxy-protocol`](reference.md#proxy-protocol) prepends a
-HAProxy header so the back-end sees the original client IP.
+HAProxy header so the backend sees the original client IP.
 
 ### DTLS (reserved)
 
 A DTLS-terminating datagram proxy is spelled by adding a `tls`
-cert block to a `udp://` proxy listener -- the presence of `proxy`
+cert block to a `udp://` proxy listener — the presence of `proxy`
 distinguishes it from plain HTTP/3 (`tls` alone):
 
 ```kdl
+// Reserved spelling -- rejected by --check-config today.
 listener "udp://[::]:5684" {
     tls "self-signed"
     proxy "udp://10.0.0.5:5684"
@@ -1958,12 +1965,12 @@ listener "udp://[::]:5684" {
 ```
 
 DTLS is **not yet implemented** (no DTLS-capable crate exists in the
-stack today), so this combination is reserved and startup fails with
-"not yet implemented".  To DTLS-encrypt the *upstream* leg instead,
+stack today), so this combination is reserved and the config is
+rejected at load time with "not yet implemented".  To DTLS-encrypt the *upstream* leg instead,
 see the reserved [`dtls`](reference.md#dtls-upstream) child of
 `proxy`.
 
-**See also**: [Reference -- L4 proxy](reference.md#proxy-listener),
+**See also**: [Reference — L4 proxy](reference.md#proxy-listener),
 [PROXY protocol on receive](#proxy-protocol-on-the-receive-side).
 
 ## PROXY protocol on the receive side
@@ -1984,7 +1991,7 @@ listener "tcp://0.0.0.0:8080" accept-proxy-protocol="v2" {
 requires every inbound connection to start with a v1 or v2
 header; connections without one are dropped.
 [`trusted-proxies`](reference.md#trusted-proxies) limits which
-peer IPs may send PROXY headers in the first place -- without
+peer IPs may send PROXY headers in the first place — without
 the allowlist, anyone who can reach the listener can claim any
 client IP.
 
@@ -1996,16 +2003,16 @@ the peer IP used by access policies, rate-limit buckets, and
 
 When the upstream LB also writes `X-Forwarded-For`, hypershunt
 appends the carried PROXY-protocol address to the chain so the
-back-end sees one consistent view.
+backend sees one consistent view.
 
-**See also**: [Reference -- accept-proxy-protocol](reference.md#accept-proxy-protocol),
+**See also**: [Reference — accept-proxy-protocol](reference.md#accept-proxy-protocol),
 [Behind another reverse proxy](#behind-another-reverse-proxy).
 
 ## Status, health, metrics
 
 hypershunt exposes two operational endpoints.
 
-### `/status` -- the built-in dashboard
+### `/status` — the built-in dashboard
 
 Mount the [`status`](reference.md#status) handler on any
 location:
@@ -2026,7 +2033,7 @@ The page shows:
 - Active rate-limit buckets with current levels.
 - Certificate status (issuer, SAN list, `notAfter`, OCSP
   freshness).
-- Upstream pool stats (active connections, idle, ejected).
+- Upstream pool stats (in-flight requests, ejection status).
 
 HTML by default; `Accept: application/json` switches to JSON for
 scraping.
@@ -2066,8 +2073,8 @@ globally with `health enabled=#false`, or keep them off a public
 listener with [`health=#false`](reference.md#health-listener):
 
 ```kdl
-listener "tcp://[::]:443" health=#false   # public: no probes exposed
-listener "tcp://10.0.0.1:9000"            # internal: probes on
+listener "tcp://[::]:443" health=#false   // public: no probes exposed
+listener "tcp://10.0.0.1:9000"            // internal: probes on
 ```
 
 ### Restricting access
@@ -2078,7 +2085,7 @@ authenticated identity) in production.  (Health probes are
 intentionally exempt from policy — restrict them via per-listener
 `health=#false` instead.)
 
-**See also**: [Reference -- status](reference.md#status),
+**See also**: [Reference — status](reference.md#status),
 [`health`](reference.md#health),
 [`lame-duck-timeout`](reference.md#lame-duck-timeout).
 
@@ -2093,14 +2100,14 @@ server { access-log "combined" path="/var/log/hypershunt/access.log" }
 
 ### Formats
 
-- `"tracing"` (default) -- structured events through the
+- `"tracing"` (default) — structured events through the
   `tracing` crate.  Goes wherever the runtime's tracing
   subscriber sends it (stderr in containers, typically); the
   [`path=`](reference.md#path-access-log) property is ignored.
-- `"common"` -- NCSA Common Log Format.  One CLF line per
+- `"common"` — NCSA Common Log Format.  One CLF line per
   request.
-- `"combined"` -- CLF plus `Referer` and `User-Agent` fields.
-- `"json"` -- one JSON object per line (ndjson).  Easy to feed
+- `"combined"` — CLF plus `Referer` and `User-Agent` fields.
+- `"json"` — one JSON object per line (ndjson).  Easy to feed
   into Loki, Elasticsearch, or jq.
 
 ### Log rotation
@@ -2116,7 +2123,7 @@ kill -HUP $(cat /var/run/hypershunt.pid)
 
 logrotate's stock postrotate of `kill -HUP` handles this.
 
-**See also**: [Reference -- access-log](reference.md#access-log).
+**See also**: [Reference — access-log](reference.md#access-log).
 
 ## Security signals (fail2ban)
 
@@ -2202,7 +2209,7 @@ podman cp hypershunt:/usr/share/doc/hypershunt/fail2ban/jail.d/hypershunt.conf \
 
 (They're also in the source tree under `packaging/fail2ban/`.)  Then, on
 the host, point the jails at the container's journal instead of the
-systemd unit -- change `journalmatch` in each jail to:
+systemd unit — change `journalmatch` in each jail to:
 
 ```ini
 journalmatch = CONTAINER_NAME=hypershunt
@@ -2239,7 +2246,7 @@ server user="hypershunt" inherit-supplementary-groups=#true
 ```
 
 The container's `hypershunt` user and group are a **fixed UID/GID
-1000** -- identical, and stable across releases, so it is safe to
+1000** — identical, and stable across releases, so it is safe to
 hardcode in tooling.  To align host file ownership for bind mounts
 (so the container can read/write your mounted directories without a
 `chmod`), map your host user onto it:
@@ -2261,29 +2268,29 @@ so hypershunt's privilege drop doesn't strip them.
 rootless namespace the process runs as container-root (mapped to
 your host user), binds 80/443, then drops to `hypershunt`.  But
 `--userns=keep-id:uid=1000,gid=1000` starts the process *as* UID
-1000 -- it can no longer bind low ports, and hypershunt fails the
+1000 — it can no longer bind low ports, and hypershunt fails the
 bind with `EACCES`.  Pick one:
 
 - **Keep the default namespace** when you need 80/443 directly;
   align file ownership with `--group-add keep-groups` or by
   `chown`ing your mounted volumes instead of `keep-id`.
-- **Listen high, publish low** -- bind `:8080` inside the container
+- **Listen high, publish low** — bind `:8080` inside the container
   and map it with `-p 80:8080`; nothing inside touches a
   privileged port.
 - **Hand in a pre-bound socket** with
   [`--preserve-fds`](#inherited-sockets-and-socket-activation): a
   privileged socket bound outside the container, adopted by
   hypershunt with no `bind()` of its own.
-- **Lift the kernel limit** -- `--sysctl
+- **Lift the kernel limit** — `--sysctl
   net.ipv4.ip_unprivileged_port_start=0` lets UID 1000 bind low
   ports directly.
 
 **On Docker.**  The model differs: there is no `keep-groups` (pass
 explicit numeric GIDs with `--group-add <gid>`), and `keep-id` is
-podman-only -- Docker remaps users daemon-wide via `userns-remap`
+podman-only — Docker remaps users daemon-wide via `userns-remap`
 in `/etc/docker/daemon.json`, or you run as your host identity with
 `--user $(id -u):$(id -g)` (which, like `keep-id`, forfeits
-privileged-port binding -- use a workaround above).  Docker also
+privileged-port binding — use a workaround above).  Docker also
 has no `--preserve-fds`, so socket hand-in is unavailable.
 
 ### Capability shortcuts
@@ -2299,7 +2306,7 @@ setcap cap_net_bind_service=+ep /usr/bin/hypershunt
 `server user=` becomes a no-op in that case (hypershunt logs a
 warning that the current user already matches).
 
-**See also**: [Reference -- user](reference.md#user),
+**See also**: [Reference — user](reference.md#user),
 [`group`](reference.md#group),
 [`inherit-supplementary-groups`](reference.md#inherit-supplementary-groups).
 
@@ -2307,7 +2314,7 @@ warning that the current user already matches).
 
 hypershunt supports two distinct restart shapes.
 
-### SIGHUP -- config reload
+### SIGHUP — config reload
 
 ```sh
 kill -HUP $(cat /var/run/hypershunt.pid)
@@ -2329,7 +2336,7 @@ Reload-rejected edits: changing the `server.auth` backend
 (authenticator state is process-lifetime), changing the user
 running the process.
 
-### SIGUSR2 -- binary hand-off
+### SIGUSR2 — binary hand-off
 
 ```sh
 kill -USR2 $(cat /var/run/hypershunt.pid)
@@ -2344,7 +2351,7 @@ and then drains its own connections (capped by
 
 The child picks up where the parent left off without dropping a
 single connection.  Use SIGUSR2 to upgrade the *binary* (not the
-config) -- replace `/usr/bin/hypershunt`, then signal.
+config) — replace `/usr/bin/hypershunt`, then signal.
 
 ### Inherited sockets and socket activation
 
@@ -2353,18 +2360,18 @@ hypershunt scans its already-open file descriptors and, for any
 *listening* socket whose address matches a configured listener,
 adopts that descriptor instead of calling `bind()`.  Descriptors
 no listener claims are closed (and logged).  This is *implicit*
-socket activation -- hypershunt never reads `LISTEN_FDS`; it simply
+socket activation — hypershunt never reads `LISTEN_FDS`; it simply
 uses whatever listening sockets it is handed.
 
-- **Starting** -- with nothing inherited, every listener binds a
-  fresh socket.  When a supervisor hands sockets in -- systemd
+- **Starting** — with nothing inherited, every listener binds a
+  fresh socket.  When a supervisor hands sockets in — systemd
   `ListenStream=`/`ListenDatagram=` socket units, or
-  `podman --preserve-fds` -- the matching listeners adopt them and
+  `podman --preserve-fds` — the matching listeners adopt them and
   skip the bind.
-- **Reload (SIGHUP)** -- the same process throughout; unchanged
+- **Reload (SIGHUP)** — the same process throughout; unchanged
   listeners keep their open sockets untouched, so there is nothing
   to inherit.  Only added listeners bind; only removed ones close.
-- **Upgrade (SIGUSR2)** -- the child inherits the parent's listening
+- **Upgrade (SIGUSR2)** — the child inherits the parent's listening
   sockets across `fork()` + `exec()` and adopts them by address.
   The socket is never closed, so even connections waiting in the
   kernel accept queue survive the swap.
@@ -2375,8 +2382,8 @@ to the exact address its listener declares.
 **`--preserve-fds` in containers.**  `podman run --preserve-fds=N`
 passes N extra descriptors (starting at fd 3) from the launcher
 into the container.  Use it to hand hypershunt a socket bound
-*outside* the container -- typically a privileged port opened by a
-systemd `.socket` unit -- so an in-container process running as the
+*outside* the container — typically a privileged port opened by a
+systemd `.socket` unit — so an in-container process running as the
 unprivileged UID 1000 can serve 80/443 without ever binding it
 itself (the `keep-id` gotcha from [Container
 twist](#container-twist)).  Declare a listener on the same address
@@ -2384,7 +2391,7 @@ the socket is bound to and hypershunt adopts it.
 
 Because the SIGUSR2 fork/exec happens *inside* the container and
 images are read-only, an in-place binary swap isn't the usual
-container upgrade -- you roll a new image and a new container
+container upgrade — you roll a new image and a new container
 instead.  `--preserve-fds` socket activation is what keeps the
 listening socket (and its accept queue) alive across that swap.
 Docker has no `--preserve-fds` equivalent and cannot pass listening
@@ -2404,9 +2411,9 @@ What doesn't:
 - Active health-check probe schedules (resume from the new
   process's startup).
 - WebSocket and other long-lived upgrade tunnels under SIGUSR2
-  -- they're capped by `graceful-drain-timeout`.
+  — they're capped by `graceful-drain-timeout`.
 
-**See also**: [Reference -- server](reference.md#server),
+**See also**: [Reference — server](reference.md#server),
 [`graceful-drain-timeout`](reference.md#graceful-drain-timeout),
 [`upgrade-startup-timeout`](reference.md#upgrade-startup-timeout).
 
@@ -2440,12 +2447,12 @@ vhost "example.com" {
 ```
 
 After the PROXY header is parsed, the carried source address
-becomes the peer hypershunt sees -- access policies, rate-limit
+becomes the peer hypershunt sees — access policies, rate-limit
 buckets, and access logs all reflect the real client IP.
 
 When the LB writes `X-Forwarded-For` instead, hypershunt appends the
 new hop to the existing chain.  Don't trust an inbound
-`X-Forwarded-For` from untrusted peers -- pair the listener
+`X-Forwarded-For` from untrusted peers — pair the listener
 with a [`policy`](reference.md#policy-location) that requires
 the connection to come from your LB subnet.
 
@@ -2462,7 +2469,7 @@ the TLS termination and runs as normal.
 
 **See also**: [PROXY protocol on the receive
 side](#proxy-protocol-on-the-receive-side),
-[Reference -- trusted-proxies](reference.md#trusted-proxies).
+[Reference — trusted-proxies](reference.md#trusted-proxies).
 
 ## Production checklist
 
@@ -2484,7 +2491,7 @@ list:
       unless legacy clients require 1.2.
 - [ ] [`ocsp`](reference.md#ocsp) is on (the default) so
       revocations propagate.
-- [ ] HTTP/3 is paired with HTTP/1.1+h2 on the same port -- the
+- [ ] HTTP/3 is paired with HTTP/1.1+h2 on the same port — the
       Alt-Svc auto-injection only fires when both exist.
 - [ ] [`response-headers`](reference.md#response-headers) sets
       `Strict-Transport-Security`, `Content-Security-Policy`,

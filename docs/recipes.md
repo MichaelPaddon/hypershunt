@@ -55,26 +55,26 @@ listener) and serve the real site on 443:
 ```kdl
 server user="hypershunt" state-dir="/var/lib/hypershunt"
 
-# Port 80 serves ONLY the redirect vhost.  ACME HTTP-01 challenges are
-# answered before the redirect fires, so renewals keep working.
+// Port 80 serves ONLY the redirect vhost.  ACME HTTP-01 challenges are
+// answered before the redirect fires, so renewals keep working.
 listener "tcp://[::]:80" { vhost "to-https" }
 
-# Port 443 serves the real site.  Because the redirect vhost is
-# explicit-only, the implicit set here is just "site" -- HTTPS never
-# redirects to itself.
+// Port 443 serves the real site.  Because the redirect vhost is
+// explicit-only, the implicit set here is just "site" -- HTTPS never
+// redirects to itself.
 listener "tcp://[::]:443" {
     tls "acme" email="ops@example.com" { domain "example.com" }
 }
 
-# Redirect-only vhost: explicit-only keeps it off every listener except
-# the one that names it (port 80).  Preserves the original path + query.
+// Redirect-only vhost: explicit-only keeps it off every listener except
+// the one that names it (port 80).  Preserves the original path + query.
 vhost "example.com" name="to-https" explicit-only=#true {
     location "/" {
         redirect to="https://{host}{path_and_query}" code=301
     }
 }
 
-# The real site, served on 443.
+// The real site, served on 443.
 vhost "example.com" name="site" {
     location "/" { static root="/var/www/example" }
 }
@@ -101,7 +101,7 @@ vhost "app.example.com" {
             upstream "http://10.0.0.11:9000" weight=2
             upstream "http://10.0.0.12:9000" weight=1
             lb-policy "least-conn"
-            passive-health { eject-after 3; eject-for 30 }
+            passive-health eject-after=3 eject-for=30
         }
     }
 }
@@ -180,7 +180,7 @@ Require both a trusted source network **and** valid credentials — two
 independent gates, either of which can refuse the request.
 
 ```kdl
-server user="hypershunt" {
+server user="hypershunt" state-dir="/var/lib/hypershunt" {
     auth "file" path="/etc/hypershunt/htpasswd" cache=60
 }
 
@@ -318,7 +318,10 @@ Cloudflare Spectrum), enable PROXY protocol so it learns the real
 client IP — and restrict who may send those headers.
 
 ```kdl
-server user="hypershunt"
+server user="hypershunt" {
+    // Required by the `country` predicate below.
+    geoip db="/usr/share/GeoIP/GeoLite2-Country.mmdb"
+}
 
 listener "tcp://0.0.0.0:8080" accept-proxy-protocol="v2" {
     trusted-proxies "10.0.0.0/8"
