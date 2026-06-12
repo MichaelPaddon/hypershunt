@@ -1,6 +1,6 @@
 [package]
 name = "hypershunt"
-version = "1.0.0-rc13"
+version = "1.0.0-rc14"
 edition = "2024"
 rust-version = "1.87"
 description = "HTTP server and reverse proxy"
