@@ -10,8 +10,8 @@
 ## Features
 
 - **Serving** --- static files (range, ETag, `try-files`, opt-in
-  directory listings, `~user/`), redirects, custom error pages,
-  per-location header injection.
+  directory listings, `~user/`), redirects, inline/file responses
+  (`respond`), custom error pages, per-location header injection.
 - **Routing** --- virtual hosts (literal + regex), per-location
   matchers (method, header, query), URL rewrites with regex
   captures, alias names, per-SNI ALPN.
