@@ -1064,11 +1064,13 @@ file.
 
 **Child** of [`server`](#server).  Optional.
 
-Enables the built-in Kubernetes-style health endpoints, intercepted
-before vhost routing so they work without a `Host` header and cannot
-be shadowed by a user `location`.  Two classes, both answering
-`GET`/`HEAD` with a small JSON body and `Cache-Control: no-cache,
-no-store`:
+The built-in Kubernetes-style health endpoints are **served by
+default** — no configuration is required.  This block only *tunes*
+them: override the paths, or disable them server-wide with
+`enabled=#false`.  They are intercepted before vhost routing so they
+work without a `Host` header and cannot be shadowed by a user
+`location`.  Two classes, both answering `GET`/`HEAD` with a small
+JSON body and `Cache-Control: no-cache, no-store`:
 
 - **liveness** (`/healthz`, `/livez` by default) — always `200`
   (`{"status":"ok","check":"livez"}`) while the process runs.
@@ -1098,7 +1100,8 @@ default; a listener's [`health=`](#health-listener) overrides it per
 listener.  Bare `health` (no properties) is equivalent to `health
 enabled=#true`.
 
-**Default:** `#true` (when the `health` node is present).
+**Default:** `#true` — the endpoints are served even when no `health`
+block is present; set `enabled=#false` to turn them off server-wide.
 
 ##### liveness-path / readiness-path
 
