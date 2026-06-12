@@ -44,14 +44,16 @@ vhost "api.example.com" {
 }
 ```
 
-Or try it in one line — the container serves its own documentation out
-of the box:
+Or try it in one line, no root required — the container serves its own
+documentation out of the box:
 
 ```sh
-podman run --rm -p 80:80 -p 443:443 ghcr.io/michaelpaddon/hypershunt:latest
+podman run --rm -p 8080:80 -p 8443:443 ghcr.io/michaelpaddon/hypershunt:latest
 ```
 
-Then walk through the [Quick start](docs/quickstart.md).
+Open <http://localhost:8080> (or <https://localhost:8443> with the
+ephemeral self-signed certificate), then walk through the
+[Quick start](docs/quickstart.md).
 
 ## Features
 
