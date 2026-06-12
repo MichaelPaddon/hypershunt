@@ -15,10 +15,15 @@
 //     republishes the latest staple through the CertPair watch channel
 //     so the existing `VhostAlpnMap` rebuild path picks it up.
 //
-// Failure semantics throughout: best-effort.  A cert with no AIA, an
-// unreachable responder, or a malformed response logs WARN, increments
+// Failure semantics throughout: best-effort.  An unreachable responder
+// or a malformed response logs WARN, increments
 // `ocsp_refresh_failures`, and leaves the listener serving without a
-// staple.  Stapling is an optimisation; it must never break TLS.
+// staple.  A cert with no OCSP responder URL is NOT a failure: the
+// semantic of `ocsp=#true` is "staple when available", and CAs have
+// been dropping OCSP since the CA/B Forum made it optional in 2023
+// (Let's Encrypt stopped publishing responder URLs in May 2025), so
+// URL-less certs are the normal case for ACME.  Stapling is an
+// optimisation; it must never break TLS or spam the logs.
 
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
@@ -192,16 +197,17 @@ pub fn parse_response(der: &[u8]) -> Result<Staple> {
     Ok(Staple { der: der.to_vec(), next_update })
 }
 
-/// One-shot OCSP fetch: parse the AIA URL, build the request, POST it
-/// to the responder over hyper, and parse the result.  Honors
-/// `fetch_timeout_secs`.
+/// One-shot OCSP fetch: build the request, POST it to the responder
+/// at `url` over hyper, and parse the result.  Honors
+/// `fetch_timeout_secs`.  The caller extracts the responder URL (see
+/// `staple_source`) so that "this cert offers no OCSP" can be handled
+/// upstream as a non-error.
 pub async fn fetch_staple(
+    url: &str,
     leaf_der: &[u8],
     issuer_der: &[u8],
     cfg: &OcspConfig,
 ) -> Result<Staple> {
-    let url = extract_ocsp_url(leaf_der)?
-        .ok_or_else(|| anyhow!("cert has no AIA OCSP responder URL"))?;
     let body = build_request(leaf_der, issuer_der)?;
     let uri: hyper::Uri = url
         .parse()
@@ -295,6 +301,28 @@ fn staple_cache_path(
     state_dir.join("ocsp").join(name)
 }
 
+/// Whether a leaf certificate offers OCSP at all.  Distinguishes
+/// "no responder URL" (the normal case for ACME certs since CAs
+/// began dropping OCSP in 2025 — serve unstapled, not an error)
+/// from a malformed certificate (a genuine failure).
+#[derive(Debug, PartialEq)]
+pub enum StapleSource {
+    /// The cert names an OCSP responder; fetch from this URL.
+    Url(String),
+    /// The cert has no OCSP responder URL; stapling is simply not
+    /// available for it.
+    NotOffered,
+}
+
+/// Classify a leaf cert for the refresh task: responder URL,
+/// not-offered, or parse error.
+pub fn staple_source(leaf_der: &[u8]) -> Result<StapleSource> {
+    Ok(match extract_ocsp_url(leaf_der)? {
+        Some(url) => StapleSource::Url(url),
+        None => StapleSource::NotOffered,
+    })
+}
+
 /// Long-running task that fetches an OCSP staple, publishes it via
 /// `cert_tx`, persists it to disk if a `state_dir` is configured, and
 /// then refreshes shortly before the staple's `nextUpdate`.  The task
@@ -330,13 +358,69 @@ pub fn spawn_refresh_task(
                     continue;
                 }
             };
+            // If the cert just rotated, drop the on-disk cache for the
+            // previous leaf so we don't serve a stale staple if a
+            // restart races against a fresh fetch.
+            let leaf_changed = prior_leaf.as_ref() != Some(&leaf_der);
+            if leaf_changed
+                && prior_leaf.is_some()
+                && let Some(sd) = &state_dir
+            {
+                let prev = prior_leaf.as_ref().expect("checked is_some");
+                let _ = std::fs::remove_file(staple_cache_path(sd, prev));
+            }
+            prior_leaf = Some(leaf_der.clone());
+
+            // "Staple when available": a cert without a responder URL
+            // is served unstapled.  Log once per leaf, leave the
+            // failure counter alone, and park until a renewal might
+            // change the answer.  Only a malformed cert falls through
+            // to the failure path below.
+            let url = match staple_source(&leaf_der) {
+                Ok(StapleSource::Url(url)) => url,
+                Ok(StapleSource::NotOffered) => {
+                    if leaf_changed {
+                        tracing::info!(
+                            listener = %label,
+                            "OCSP: certificate has no responder URL; \
+                             serving without a staple (normal for \
+                             ACME CAs since 2025)"
+                        );
+                    }
+                    let mut rx = cert_rx.clone();
+                    let _ = rx.changed().await;
+                    continue;
+                }
+                Err(e) => {
+                    metrics.ocsp_refresh_failures.fetch_add(
+                        1,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    tracing::warn!(
+                        listener = %label,
+                        "OCSP: parsing certificate: {e:#}"
+                    );
+                    tokio::time::sleep(Duration::from_secs(
+                        cfg.failure_backoff_secs,
+                    ))
+                    .await;
+                    continue;
+                }
+            };
+
+            // The cert offers OCSP, so a fetch needs the issuer cert
+            // to hash into the request.  A chain without one is a
+            // genuine misconfiguration (the URL is unusable), unlike
+            // the self-signed case which is caught above as
+            // NotOffered (self-signed certs carry no responder URL).
             let issuer_der = match pair.chain.get(1) {
                 Some(c) => c.as_ref().to_vec(),
                 None => {
                     tracing::warn!(
                         listener = %label,
-                        "OCSP: cert chain has no issuer; cannot staple \
-                         (chain length < 2)"
+                        "OCSP: cert names a responder but the chain \
+                         has no issuer; cannot staple (chain length \
+                         < 2)"
                     );
                     // Wait for a renewal that might bring an issuer.
                     let mut rx = cert_rx.clone();
@@ -344,19 +428,9 @@ pub fn spawn_refresh_task(
                     continue;
                 }
             };
-            // If the cert just rotated, drop the on-disk cache for the
-            // previous leaf so we don't serve a stale staple if a
-            // restart races against a fresh fetch.
-            if let Some(prev) = &prior_leaf
-                && prev != &leaf_der
-                && let Some(sd) = &state_dir
-            {
-                let _ = std::fs::remove_file(staple_cache_path(sd, prev));
-            }
-            prior_leaf = Some(leaf_der.clone());
 
             let next_delay = match fetch_staple(
-                &leaf_der, &issuer_der, &cfg,
+                &url, &leaf_der, &issuer_der, &cfg,
             )
             .await
             {
@@ -521,6 +595,32 @@ mod tests {
         let (leaf, _) = make_chain(None);
         let url = extract_ocsp_url(&leaf).unwrap();
         assert!(url.is_none(), "expected no AIA, got {url:?}");
+    }
+
+    #[test]
+    fn staple_source_classifies_url_cert() {
+        let (leaf, _) = make_chain(Some("http://ocsp.example.com/"));
+        assert_eq!(
+            staple_source(&leaf).unwrap(),
+            StapleSource::Url("http://ocsp.example.com/".into())
+        );
+    }
+
+    #[test]
+    fn staple_source_treats_missing_url_as_not_offered() {
+        // "Staple when available": a cert with no responder URL is
+        // NotOffered, not an error -- the normal case for ACME certs
+        // since CAs began dropping OCSP.
+        let (leaf, _) = make_chain(None);
+        assert_eq!(
+            staple_source(&leaf).unwrap(),
+            StapleSource::NotOffered
+        );
+    }
+
+    #[test]
+    fn staple_source_errors_on_garbage_cert() {
+        assert!(staple_source(b"not a certificate").is_err());
     }
 
     #[test]
