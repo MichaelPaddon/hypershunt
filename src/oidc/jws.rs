@@ -15,32 +15,29 @@ use openidconnect::core::CoreJwsSigningAlgorithm;
 /// Used for `sid` which is genuinely optional on the ID token.
 pub(super) fn extract_optional_string_claim(
     name: &str,
-    extra: &openidconnect::EmptyAdditionalClaims,
+    claims: &serde_json::Value,
 ) -> Option<String> {
-    let json = serde_json::to_value(extra).ok()?;
-    match json.get(name).and_then(|v| v.as_str()) {
+    match claims.get(name).and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => Some(s.to_owned()),
         _ => None,
     }
 }
 
-/// Look up `name` in the ID token's additional-claims JSON object;
-/// return its string value when present.  Falls back to `default`
-/// when the claim is missing, not a string, or empty.
+/// Look up `name` in the serialised claims document; return its
+/// string value when present.  Falls back to `default` when the
+/// claim is missing, not a string, or empty.
+///
+/// Callers serialise the whole `IdTokenClaims` (standard claims plus
+/// the `ExtraClaims` catch-all) so a configured claim name works
+/// whether it is an OIDC standard claim (`preferred_username`,
+/// `email`, ...) or a custom one -- openidconnect routes those to
+/// different places at deserialisation time.
 pub(super) fn extract_string_claim(
     name: &str,
-    extra: &openidconnect::EmptyAdditionalClaims,
+    claims: &serde_json::Value,
     default: &str,
 ) -> String {
-    // EmptyAdditionalClaims (the default) is opaque -- serialise it
-    // to JSON and read the requested field.  This keeps the type
-    // parameters trivial without having to plumb a custom claims
-    // type through the whole library.
-    let json = match serde_json::to_value(extra) {
-        Ok(v) => v,
-        Err(_) => return default.to_owned(),
-    };
-    match json.get(name).and_then(|v| v.as_str()) {
+    match claims.get(name).and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s.to_owned(),
         _ => default.to_owned(),
     }
@@ -142,13 +139,9 @@ pub(super) fn parse_compact_jws(token: &str) -> Result<ParsedJws> {
 /// the claim is missing or has neither shape.
 pub(super) fn extract_groups_claim(
     name: &str,
-    extra: &openidconnect::EmptyAdditionalClaims,
+    claims: &serde_json::Value,
 ) -> Vec<String> {
-    let json = match serde_json::to_value(extra) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    extract_groups_claim_from_json(name, &json)
+    extract_groups_claim_from_json(name, claims)
 }
 
 /// Same as `extract_groups_claim` but reads directly from a
@@ -159,12 +152,23 @@ pub(super) fn extract_groups_claim_from_json(
     json: &serde_json::Value,
 ) -> Vec<String> {
     match json.get(name) {
-        Some(serde_json::Value::Array(items)) => items
+        Some(v) => extract_groups_claim_from_value(v),
+        None => Vec::new(),
+    }
+}
+
+/// Decode one groups value: JSON array of strings or a single
+/// space-delimited string.
+fn extract_groups_claim_from_value(
+    v: &serde_json::Value,
+) -> Vec<String> {
+    match v {
+        serde_json::Value::Array(items) => items
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_owned()))
             .filter(|s| !s.is_empty())
             .collect(),
-        Some(serde_json::Value::String(s)) => s
+        serde_json::Value::String(s) => s
             .split_whitespace()
             .map(|w| w.to_owned())
             .collect(),

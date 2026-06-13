@@ -13,7 +13,7 @@ mod bearer;
 // OIDC single sign-on back-end.
 //
 // On startup `OidcProvider::discover` runs OIDC discovery against the
-// configured issuer and caches the resulting `CoreClient`.  Two hooks
+// configured issuer and caches the resulting `OidcClient`.  Two hooks
 // drive the login flow:
 //
 //   * `begin_login(return_to)` -- builds the authorisation URL,
@@ -36,19 +36,24 @@ use crate::metrics::Metrics;
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use openidconnect::core::{
-    CoreAuthDisplay, CoreAuthenticationFlow, CoreClaimName, CoreClaimType,
-    CoreClient, CoreClientAuthMethod, CoreGrantType,
+    CoreAuthDisplay, CoreAuthPrompt, CoreAuthenticationFlow,
+    CoreClaimName, CoreClaimType, CoreClientAuthMethod,
+    CoreErrorResponseType, CoreGenderClaim, CoreGrantType,
     CoreJsonWebKey, CoreJsonWebKeyType, CoreJsonWebKeyUse,
     CoreJweContentEncryptionAlgorithm, CoreJweKeyManagementAlgorithm,
     CoreJwsSigningAlgorithm, CoreResponseMode, CoreResponseType,
-    CoreSubjectIdentifierType,
+    CoreRevocableToken, CoreRevocationErrorResponse,
+    CoreSubjectIdentifierType, CoreTokenIntrospectionResponse,
+    CoreTokenType,
 };
 use openidconnect::reqwest::async_http_client;
 use openidconnect::{
     AccessToken, AdditionalProviderMetadata, AuthorizationCode, ClientId,
-    ClientSecret, CsrfToken, IssuerUrl, Nonce, OAuth2TokenResponse,
-    PkceCodeChallenge, PkceCodeVerifier, ProviderMetadata, RedirectUrl,
-    RefreshToken, Scope, TokenResponse, UserInfoClaims,
+    ClientSecret, CsrfToken, EmptyExtraTokenFields, IdTokenFields,
+    IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
+    PkceCodeVerifier, ProviderMetadata, RedirectUrl, RefreshToken, Scope,
+    StandardErrorResponse, StandardTokenResponse, TokenResponse,
+    UserInfoClaims,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -91,6 +96,50 @@ type HypershuntProviderMetadata = ProviderMetadata<
     CoreResponseMode,
     CoreResponseType,
     CoreSubjectIdentifierType,
+>;
+
+/// Catch-all additional-claims type for ID tokens.  Captures every
+/// non-standard claim as raw JSON so operator-configured
+/// `username-claim` / `groups-claim` lookups can read them straight
+/// off the ID token.  (openidconnect's default,
+/// `EmptyAdditionalClaims`, silently discards extra claims at
+/// deserialisation — which made those lookups dead code on the
+/// ID-token path; only the UserInfo merge ever saw the values.)
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ExtraClaims(
+    pub(crate) serde_json::Map<String, serde_json::Value>,
+);
+impl openidconnect::AdditionalClaims for ExtraClaims {}
+
+// Mirror `CoreClient` / `CoreTokenResponse` exactly, swapping the
+// additional-claims slot for `ExtraClaims` — same pattern as
+// `HypershuntProviderMetadata` above.
+type HsIdTokenFields = IdTokenFields<
+    ExtraClaims,
+    EmptyExtraTokenFields,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+    CoreJsonWebKeyType,
+>;
+type HsTokenResponse =
+    StandardTokenResponse<HsIdTokenFields, CoreTokenType>;
+pub(crate) type OidcClient = openidconnect::Client<
+    ExtraClaims,
+    CoreAuthDisplay,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+    CoreJsonWebKeyType,
+    CoreJsonWebKeyUse,
+    CoreJsonWebKey,
+    CoreAuthPrompt,
+    StandardErrorResponse<CoreErrorResponseType>,
+    HsTokenResponse,
+    CoreTokenType,
+    CoreTokenIntrospectionResponse,
+    CoreRevocableToken,
+    CoreRevocationErrorResponse,
 >;
 
 /// Standard OIDC login-flow hints the relying party may forward to
@@ -175,7 +224,7 @@ struct RefreshEntry {
 /// completed (or has not yet succeeded), `client` is `None` and the
 /// hot-path methods return a "not ready" error.
 pub struct OidcProvider {
-    client: ArcSwap<Option<Arc<CoreClient>>>,
+    client: ArcSwap<Option<Arc<OidcClient>>>,
     cfg: OidcConfig,
     metrics: Arc<Metrics>,
     states: Mutex<HashMap<String, StateEntry>>,
@@ -213,7 +262,7 @@ struct BearerCacheEntry {
     expires_at: u64,
 }
 
-/// Single discovery attempt: build a fresh `CoreClient`, the
+/// Single discovery attempt: build a fresh `OidcClient`, the
 /// optional `end_session_endpoint`, and a copy of the JWKS.
 /// Factored out so the bootstrap path and the periodic-refresh path
 /// share exactly the same construction logic.  The JWKS is returned
@@ -223,7 +272,7 @@ struct BearerCacheEntry {
 async fn run_discovery(
     cfg: &OidcConfig,
 ) -> Result<(
-    CoreClient,
+    OidcClient,
     Option<url::Url>,
     Option<url::Url>,
     openidconnect::core::CoreJsonWebKeySet,
@@ -244,9 +293,9 @@ async fn run_discovery(
     let jwks = metadata.jwks().clone();
 
     // Build the client from individual endpoints rather than
-    // CoreClient::from_provider_metadata so we stay independent of
+    // OidcClient::from_provider_metadata so we stay independent of
     // any future Core/Hypershunt-metadata divergence.
-    let mut client = CoreClient::new(
+    let mut client = OidcClient::new(
         ClientId::new(cfg.client_id.clone()),
         cfg.client_secret.clone().map(ClientSecret::new),
         metadata.issuer().clone(),
@@ -427,7 +476,7 @@ impl OidcProvider {
     /// Current OIDC client, if discovery has completed.  Hot-path
     /// methods bail with a "not ready" error when this returns
     /// `None`; the listener turns that into a 503 + `Retry-After`.
-    pub fn client(&self) -> Option<Arc<CoreClient>> {
+    pub fn client(&self) -> Option<Arc<OidcClient>> {
         self.client.load().as_ref().clone()
     }
 
@@ -445,7 +494,7 @@ impl OidcProvider {
     /// login still succeeds.
     async fn merge_userinfo(
         &self,
-        client: &CoreClient,
+        client: &OidcClient,
         access_token: &AccessToken,
         id_token_username: &str,
         id_token_groups: Vec<String>,
@@ -468,8 +517,11 @@ impl OidcProvider {
                 return (id_token_username.to_owned(), id_token_groups);
             }
         };
+        // ExtraClaims (not EmptyAdditionalClaims) so non-standard
+        // claims like `groups` survive deserialisation and are
+        // visible to the JSON round-trip below.
         let info: UserInfoClaims<
-            openidconnect::EmptyAdditionalClaims,
+            ExtraClaims,
             openidconnect::core::CoreGenderClaim,
         > = match request.request_async(async_http_client).await {
             Ok(c) => c,
@@ -666,7 +718,7 @@ impl OidcProvider {
         // RevocationRequest borrow is local to the spawned future.
         let metrics = self.metrics.clone();
         crate::task::spawn_supervised("oidc.revocation", async move {
-            // The CoreClient only knows how to build a revocation
+            // The OidcClient only knows how to build a revocation
             // request when set_revocation_uri was called at
             // construction time, which we do iff discovery surfaced
             // the endpoint.
@@ -756,22 +808,24 @@ impl OidcProvider {
         // The OIDC `sub` claim is always present and uniquely
         // identifies the user at this issuer.  When the operator
         // configures a different username claim (e.g.
-        // `preferred_username`), we look it up via the additional
-        // claims map — falling back to `sub` if absent.
-        let extra = claims.additional_claims();
+        // `preferred_username`), we look it up in the serialised
+        // claims document — standard and custom claims alike —
+        // falling back to `sub` if absent.
+        let claims_json = serde_json::to_value(claims)
+            .context("serialising ID token claims")?;
         let id_username = extract_string_claim(
             &self.cfg.username_claim,
-            extra,
+            &claims_json,
             claims.subject().as_str(),
         );
         let id_groups =
-            extract_groups_claim(&self.cfg.groups_claim, extra);
+            extract_groups_claim(&self.cfg.groups_claim, &claims_json);
         // Capture the OIDC subject and session id (if any) for use by
         // the back-channel logout endpoint, which keys session lookups
         // on these.  `sub` is always present; `sid` is sent by IdPs
         // that support back-channel logout but is otherwise optional.
         let subject = claims.subject().as_str().to_owned();
-        let idp_sid = extract_optional_string_claim("sid", extra);
+        let idp_sid = extract_optional_string_claim("sid", &claims_json);
 
         // UserInfo merge -- noop when the feature is off.  When on,
         // /userinfo claims take precedence on non-empty values.
@@ -870,16 +924,18 @@ impl OidcProvider {
             .claims(&client.id_token_verifier(), |_: Option<&Nonce>| Ok(()))
             .context("refreshed ID token validation failed")?;
 
-        let extra = claims.additional_claims();
+        let claims_json = serde_json::to_value(claims)
+            .context("serialising refreshed ID token claims")?;
         let id_username = extract_string_claim(
             &self.cfg.username_claim,
-            extra,
+            &claims_json,
             claims.subject().as_str(),
         );
         let id_groups =
-            extract_groups_claim(&self.cfg.groups_claim, extra);
+            extract_groups_claim(&self.cfg.groups_claim, &claims_json);
         let new_subject = claims.subject().as_str().to_owned();
-        let new_idp_sid = extract_optional_string_claim("sid", extra);
+        let new_idp_sid =
+            extract_optional_string_claim("sid", &claims_json);
 
         // UserInfo merge against the freshly-issued access token.
         let (username, groups) = self
@@ -980,18 +1036,17 @@ pub(crate) mod tests {
     use sha2::Digest;
     use std::time::SystemTime;
 
-    fn empty() -> openidconnect::EmptyAdditionalClaims {
-        openidconnect::EmptyAdditionalClaims {}
-    }
-
     #[test]
     fn missing_groups_claim_returns_empty() {
-        assert!(extract_groups_claim("groups", &empty()).is_empty());
+        let claims = serde_json::json!({});
+        assert!(extract_groups_claim("groups", &claims).is_empty());
     }
 
     #[test]
     fn missing_username_claim_falls_back_to_default() {
-        let s = extract_string_claim("preferred_username", &empty(), "alice");
+        let claims = serde_json::json!({});
+        let s =
+            extract_string_claim("preferred_username", &claims, "alice");
         assert_eq!(s, "alice");
     }
 
@@ -1011,7 +1066,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn provider_for_store(ttl: Duration) -> Arc<OidcProvider> {
-        // Use a minimal CoreClient that won't be invoked: the refresh
+        // Use a minimal OidcClient that won't be invoked: the refresh
         // tests below only insert/inspect entries and verify
         // eviction.  Building a real client requires discovery, which
         // we intentionally avoid in unit tests.
@@ -1047,7 +1102,7 @@ pub(crate) mod tests {
             require_iss: false,
             resources: vec![],
         };
-        let client = CoreClient::new(
+        let client = OidcClient::new(
             ClientId::new(cfg.client_id.clone()),
             None,
             IssuerUrl::new(cfg.issuer.clone()).unwrap(),
@@ -1076,6 +1131,420 @@ pub(crate) mod tests {
                 NonZeroUsize::new(16).unwrap(),
             )),
         })
+    }
+
+    // -- Mock IdP -------------------------------------------------
+    //
+    // A minimal in-process OpenID Provider speaking just enough of
+    // the protocol for run_discovery / complete_login / refresh /
+    // revoke_refresh_token to complete over plain HTTP on loopback:
+    // discovery document, ES256 JWKS, token endpoint, revocation
+    // endpoint.  The authorization endpoint is never contacted (the
+    // test plays the browser and jumps straight to the callback).
+
+    pub(crate) struct MockIdpState {
+        /// Nonce the next id_token must echo; the test extracts it
+        /// from the begin_login URL, exactly as a real IdP would
+        /// receive it in the authorization request.
+        pub(crate) nonce: Option<String>,
+        /// When true the token endpoint rotates the refresh token on
+        /// every grant; when false it omits the refresh_token field
+        /// on refresh grants (the "TTL slide" arm).
+        pub(crate) rotate_refresh: bool,
+        /// Count of /revoke hits.
+        pub(crate) revocations: u32,
+        /// Monotonic counter for minted refresh tokens.
+        pub(crate) token_seq: u32,
+    }
+
+    pub(crate) struct MockIdp {
+        pub(crate) issuer: String,
+        pub(crate) state: Arc<std::sync::Mutex<MockIdpState>>,
+    }
+
+    impl MockIdp {
+        pub(crate) async fn spawn() -> MockIdp {
+            use base64::Engine as _;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use rsa::traits::PublicKeyParts as _;
+
+            let listener =
+                tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .unwrap();
+            let issuer =
+                format!("http://{}", listener.local_addr().unwrap());
+
+            // RS256: the only algorithm openidconnect's default
+            // id_token_verifier accepts.  Keygen is slow, so share
+            // one key across all tests in the process.
+            static RSA_KEY: std::sync::OnceLock<rsa::RsaPrivateKey> =
+                std::sync::OnceLock::new();
+            let private = RSA_KEY
+                .get_or_init(|| {
+                    rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048)
+                        .unwrap()
+                })
+                .clone();
+            let signing_key = Arc::new(
+                rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(
+                    private.clone(),
+                ),
+            );
+            let public = private.to_public_key();
+            let jwks = serde_json::json!({
+                "keys": [{
+                    "kty": "RSA", "alg": "RS256",
+                    "use": "sig", "kid": "test-key",
+                    "n": URL_SAFE_NO_PAD
+                        .encode(public.n().to_bytes_be()),
+                    "e": URL_SAFE_NO_PAD
+                        .encode(public.e().to_bytes_be()),
+                }]
+            })
+            .to_string();
+
+            let state = Arc::new(std::sync::Mutex::new(MockIdpState {
+                nonce: None,
+                rotate_refresh: true,
+                revocations: 0,
+                token_seq: 0,
+            }));
+
+            let iss = issuer.clone();
+            let st = state.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await
+                    else {
+                        return;
+                    };
+                    let iss = iss.clone();
+                    let st = st.clone();
+                    let jwks = jwks.clone();
+                    let key = signing_key.clone();
+                    tokio::spawn(async move {
+                        let svc = hyper::service::service_fn(
+                            move |req: hyper::Request<
+                                hyper::body::Incoming,
+                            >| {
+                                let iss = iss.clone();
+                                let st = st.clone();
+                                let jwks = jwks.clone();
+                                let key = key.clone();
+                                async move {
+                                    let path = req.uri().path().to_owned();
+                                    let body = match path.as_str() {
+                                        "/.well-known/openid-configuration" => {
+                                            serde_json::json!({
+                                                "issuer": iss,
+                                                "authorization_endpoint":
+                                                    format!("{iss}/authorize"),
+                                                "token_endpoint":
+                                                    format!("{iss}/token"),
+                                                "jwks_uri":
+                                                    format!("{iss}/jwks"),
+                                                "end_session_endpoint":
+                                                    format!("{iss}/logout"),
+                                                "revocation_endpoint":
+                                                    format!("{iss}/revoke"),
+                                                "response_types_supported":
+                                                    ["code"],
+                                                "subject_types_supported":
+                                                    ["public"],
+                                                "id_token_signing_alg_values_supported":
+                                                    ["ES256"],
+                                            })
+                                            .to_string()
+                                        }
+                                        "/jwks" => jwks,
+                                        "/token" => {
+                                            let (nonce, seq, rotate, is_refresh);
+                                            {
+                                                use http_body_util::BodyExt as _;
+                                                let form = req
+                                                    .into_body()
+                                                    .collect()
+                                                    .await
+                                                    .unwrap()
+                                                    .to_bytes();
+                                                let form = String::from_utf8_lossy(&form)
+                                                    .into_owned();
+                                                is_refresh = form
+                                                    .contains("grant_type=refresh_token");
+                                                let mut s = st.lock().unwrap();
+                                                s.token_seq += 1;
+                                                nonce = s.nonce.clone();
+                                                seq = s.token_seq;
+                                                rotate = s.rotate_refresh;
+                                            }
+                                            let now = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_secs() as i64;
+                                            let mut claims = serde_json::json!({
+                                                "iss": iss,
+                                                "aud": "client-1",
+                                                "sub": "alice",
+                                                "iat": now,
+                                                "exp": now + 3600,
+                                                "preferred_username": "alice-pref",
+                                                "groups": ["devs"],
+                                                "sid": "idp-sess-1",
+                                            });
+                                            // Echo the nonce only on the
+                                            // initial code grant; refresh
+                                            // responses carry none, like
+                                            // real IdPs.
+                                            if !is_refresh
+                                                && let Some(n) = nonce
+                                            {
+                                                claims["nonce"] =
+                                                    n.into();
+                                            }
+                                            use base64::Engine as _;
+                                            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+                                            use rsa::signature::{
+                                                SignatureEncoding as _,
+                                                Signer as _,
+                                            };
+                                            let header = URL_SAFE_NO_PAD.encode(
+                                                br#"{"alg":"RS256","kid":"test-key"}"#,
+                                            );
+                                            let payload = URL_SAFE_NO_PAD
+                                                .encode(claims.to_string());
+                                            let signing_input =
+                                                format!("{header}.{payload}");
+                                            let sig = key
+                                                .sign(signing_input.as_bytes());
+                                            let id_token = format!(
+                                                "{signing_input}.{}",
+                                                URL_SAFE_NO_PAD
+                                                    .encode(sig.to_bytes())
+                                            );
+                                            let mut resp = serde_json::json!({
+                                                "access_token":
+                                                    format!("at-{seq}"),
+                                                "token_type": "Bearer",
+                                                "expires_in": 3600,
+                                                "id_token": id_token,
+                                            });
+                                            if !is_refresh || rotate {
+                                                resp["refresh_token"] =
+                                                    format!("rt-{seq}").into();
+                                            }
+                                            resp.to_string()
+                                        }
+                                        "/revoke" => {
+                                            st.lock().unwrap().revocations += 1;
+                                            String::new()
+                                        }
+                                        _ => String::new(),
+                                    };
+                                    Ok::<_, std::convert::Infallible>(
+                                        hyper::Response::builder()
+                                            .header(
+                                                "content-type",
+                                                "application/json",
+                                            )
+                                            .body(
+                                                http_body_util::Full::new(
+                                                    bytes::Bytes::from(body),
+                                                ),
+                                            )
+                                            .unwrap(),
+                                    )
+                                }
+                            },
+                        );
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(
+                                hyper_util::rt::TokioIo::new(stream),
+                                svc,
+                            )
+                            .await;
+                    });
+                }
+            });
+
+            MockIdp { issuer, state }
+        }
+    }
+
+    pub(crate) fn mock_cfg(issuer: &str) -> crate::config::OidcConfig {
+        let mut cfg = provider_for_store(Duration::from_secs(60))
+            .cfg
+            .clone();
+        cfg.issuer = issuer.to_owned();
+        cfg.client_id = "client-1".into();
+        cfg.username_claim = "preferred_username".into();
+        cfg.refresh = true;
+        cfg.refresh_ttl_secs = 60;
+        cfg
+    }
+
+    /// Poll until background discovery completes.
+    async fn await_ready(p: &Arc<OidcProvider>) {
+        for _ in 0..200 {
+            if p.is_ready() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("provider never became ready against the mock IdP");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_login_refresh_revoke_flow_against_mock_idp() {
+        let idp = MockIdp::spawn().await;
+        let metrics = Arc::new(Metrics::new());
+        let p = OidcProvider::new(mock_cfg(&idp.issuer), metrics.clone());
+        await_ready(&p).await;
+
+        // Discovery surfaced the optional endpoints.
+        assert!(p.end_session_url().is_some());
+        assert_eq!(
+            metrics
+                .oidc_discoveries
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // Browser leg: begin_login mints state + nonce; hand the
+        // nonce to the IdP the way the authorization request would.
+        let (auth_url, state_id) = p
+            .begin_login("/after".into(), IdpHints::default())
+            .expect("ready provider must build a login URL");
+        let nonce = auth_url
+            .query_pairs()
+            .find(|(k, _)| k == "nonce")
+            .map(|(_, v)| v.into_owned())
+            .expect("auth URL must carry a nonce");
+        idp.state.lock().unwrap().nonce = Some(nonce);
+
+        // Callback leg.
+        let (ident, return_to, sid) = p
+            .complete_login("any-code".into(), &state_id)
+            .await
+            .expect("token exchange against mock IdP");
+        assert_eq!(ident.username, "alice-pref");
+        assert_eq!(ident.groups, vec!["devs".to_string()]);
+        assert_eq!(return_to, "/after");
+        let sid = sid.expect("refresh enabled -> sid cookie value");
+
+        // State is single-use: replaying the callback fails.
+        let err = p
+            .complete_login("any-code".into(), &state_id)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown or expired"), "got: {err}");
+
+        // Refresh with rotation: the IdP returns a new refresh
+        // token, so the session is re-keyed under a new sid.
+        let (ident2, sid2) = p.refresh(&sid).await.unwrap();
+        assert_eq!(ident2.username, "alice-pref");
+        assert_ne!(sid2, sid, "rotation must re-key the session");
+        assert_eq!(p.refresh_count(), 1, "old sid replaced, not added");
+
+        // Refresh without rotation: same sid slides forward.
+        idp.state.lock().unwrap().rotate_refresh = false;
+        let (_, sid3) = p.refresh(&sid2).await.unwrap();
+        assert_eq!(sid3, sid2, "no rotation -> sid unchanged");
+
+        // Unknown sid is rejected.
+        assert!(p.refresh("no-such-sid").await.is_err());
+
+        // Best-effort revocation: openidconnect refuses to build a
+        // revocation request against a plain-http endpoint
+        // (InsecureUrl), which is exactly what the loopback mock
+        // serves -- so this exercises the documented graceful-skip
+        // arm: no panic, no failure metric, logout never blocked on
+        // the IdP.  The https success path stays integration-only.
+        p.revoke_refresh_token(RefreshToken::new("rt-1".into()));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(idp.state.lock().unwrap().revocations, 0);
+        assert_eq!(
+            metrics
+                .oidc_revocation_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "skip must not be recorded as a failure"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_state_is_rejected_at_callback() {
+        let idp = MockIdp::spawn().await;
+        let mut cfg = mock_cfg(&idp.issuer);
+        cfg.state_ttl_secs = 0; // every state is born expired
+        let p = OidcProvider::new(cfg, Arc::new(Metrics::new()));
+        await_ready(&p).await;
+
+        let (_, state_id) = p
+            .begin_login("/".into(), IdpHints::default())
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let err = p
+            .complete_login("code".into(), &state_id)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("state expired"), "got: {err}");
+    }
+
+    #[test]
+    fn evict_expired_drops_stale_states_and_refreshes() {
+        let p = provider_for_store(Duration::from_secs(60));
+        // One live and one expired entry in each store.  StateEntry
+        // freshness is judged from `created` against state_ttl (60s
+        // in this fixture); RefreshEntry from its absolute deadline.
+        let (_, live_state) = {
+            // begin_login needs no IdP: the dummy client is enough
+            // to mint a state entry.
+            p.begin_login("/x".into(), IdpHints::default()).unwrap()
+        };
+        p.states.lock().unwrap().insert(
+            "stale".into(),
+            StateEntry {
+                pkce_verifier: openidconnect::PkceCodeVerifier::new(
+                    "v".repeat(43),
+                ),
+                nonce: Nonce::new("n".into()),
+                return_to: "/".into(),
+                created: Instant::now() - Duration::from_secs(3600),
+            },
+        );
+        p.refreshes.lock().unwrap().insert(
+            "live".into(),
+            RefreshEntry {
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: Instant::now() + Duration::from_secs(60),
+                id_token: String::new(),
+                subject: "alice".into(),
+                idp_sid: None,
+            },
+        );
+        p.refreshes.lock().unwrap().insert(
+            "dead".into(),
+            RefreshEntry {
+                refresh_token: RefreshToken::new("rt".into()),
+                expires_at: Instant::now() - Duration::from_secs(1),
+                id_token: String::new(),
+                subject: "alice".into(),
+                idp_sid: None,
+            },
+        );
+
+        p.evict_expired();
+
+        let states = p.states.lock().unwrap();
+        assert!(states.contains_key(&live_state));
+        assert!(!states.contains_key("stale"));
+        drop(states);
+        let refreshes = p.refreshes.lock().unwrap();
+        assert!(refreshes.contains_key("live"));
+        assert!(!refreshes.contains_key("dead"));
     }
 
     #[test]
@@ -1135,7 +1604,7 @@ pub(crate) mod tests {
     #[test]
     fn userinfo_merge_disabled_returns_id_token_values() {
         // With userinfo off, the helper must short-circuit before
-        // touching the network -- the dummy CoreClient stored on
+        // touching the network -- the dummy OidcClient stored on
         // provider_for_store would fail any real call.
         let p = provider_for_store(Duration::from_secs(60));
         let client = p.client().expect("test provider has a client");
@@ -1372,3 +1841,4 @@ pub(crate) mod tests {
         assert_eq!(p.refresh_count(), 1);
     }
 }
+

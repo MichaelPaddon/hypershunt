@@ -141,6 +141,11 @@ features = ["behavior-version-latest", "rustls", "rt-tokio"]
 
 [dev-dependencies]
 tempfile          = "3"
+# RS256 signing for the in-process mock IdP in the OIDC tests; the
+# production verifier (openidconnect's default) only accepts RS256,
+# so the mock must mint RSA-signed ID tokens.  Already in the
+# dependency graph via openidconnect.
+rsa               = { version = "0.9", features = ["sha2"] }
 time              = "0.3"
 # WebSocket client + server for the proxy upgrade-bridge tests.
 # We only need the protocol + handshake helpers; no TLS features
