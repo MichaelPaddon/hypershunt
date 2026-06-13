@@ -1034,6 +1034,49 @@ mod tests {
     // -- AcmeConfig helpers ---------------------------------------
 
     #[test]
+    fn cert_expiry_timestamp_reads_not_after() {
+        let (pem, _) = make_cert_pem(&["a.example".into()], 90);
+        let expiry = cert_expiry_timestamp(pem.as_bytes()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let expected = now + 90 * 24 * 3600;
+        assert!(
+            (expiry - expected).abs() < 120,
+            "expiry {expiry} not within 2 min of {expected}"
+        );
+    }
+
+    #[test]
+    fn cert_not_before_timestamp_reads_not_before() {
+        let (pem, _) = make_cert_pem(&["a.example".into()], 90);
+        let not_before =
+            cert_not_before_timestamp(pem.as_bytes()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // rcgen backdates notBefore (or uses "now"); either way a
+        // freshly minted cert must already be valid.
+        assert!(not_before <= now, "notBefore {not_before} > now {now}");
+    }
+
+    #[test]
+    fn cert_timestamp_helpers_reject_garbage() {
+        assert!(cert_expiry_timestamp(b"not pem").is_err());
+        assert!(cert_not_before_timestamp(b"not pem").is_err());
+    }
+
+    #[test]
+    fn warn_if_not_yet_valid_tolerates_garbage_and_valid_pem() {
+        // Pure smoke: must not panic on either input shape.
+        warn_if_not_yet_valid(b"not pem");
+        let (pem, _) = make_cert_pem(&["a.example".into()], 1);
+        warn_if_not_yet_valid(pem.as_bytes());
+    }
+
+    #[test]
     fn cert_name_defaults_to_first_domain() {
         let cfg = AcmeConfig {
             domains: vec!["example.com".into(), "www.example.com".into()],

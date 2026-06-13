@@ -670,6 +670,193 @@ mod tests {
     }
 
     #[test]
+    fn schedule_next_uses_floor_without_next_update() {
+        let cfg = OcspConfig::default();
+        let staple = Staple { der: vec![], next_update: None };
+        assert_eq!(
+            schedule_next(&staple, &cfg),
+            Duration::from_secs(cfg.min_refresh_secs)
+        );
+    }
+
+    #[test]
+    fn schedule_next_backs_off_when_staple_expired() {
+        let cfg = OcspConfig::default();
+        let staple = Staple {
+            der: vec![],
+            next_update: Some(UNIX_EPOCH), // long past
+        };
+        assert_eq!(
+            schedule_next(&staple, &cfg),
+            Duration::from_secs(cfg.failure_backoff_secs)
+        );
+    }
+
+    #[test]
+    fn schedule_next_picks_midpoint_of_long_window() {
+        let cfg = OcspConfig { min_refresh_secs: 60, ..Default::default() };
+        let staple = Staple {
+            der: vec![],
+            next_update: Some(
+                SystemTime::now() + Duration::from_secs(10_000),
+            ),
+        };
+        let d = schedule_next(&staple, &cfg).as_secs();
+        // Midpoint of ~10000s; allow slack for test runtime.
+        assert!((4_990..=5_000).contains(&d), "got {d}");
+    }
+
+    #[test]
+    fn schedule_next_leaves_expiry_headroom() {
+        // 400s window: midpoint 200s would leave only 200s headroom;
+        // the 5-minute margin caps the delay at ~100s instead.
+        let cfg = OcspConfig { min_refresh_secs: 1, ..Default::default() };
+        let staple = Staple {
+            der: vec![],
+            next_update: Some(
+                SystemTime::now() + Duration::from_secs(400),
+            ),
+        };
+        let d = schedule_next(&staple, &cfg).as_secs();
+        assert!((90..=100).contains(&d), "got {d}");
+    }
+
+    #[test]
+    fn schedule_next_never_drops_below_floor() {
+        // Tiny window: cap is 0, but the configured floor wins.
+        let cfg = OcspConfig::default(); // floor 3600
+        let staple = Staple {
+            der: vec![],
+            next_update: Some(
+                SystemTime::now() + Duration::from_secs(10),
+            ),
+        };
+        assert_eq!(
+            schedule_next(&staple, &cfg),
+            Duration::from_secs(cfg.min_refresh_secs)
+        );
+    }
+
+    #[test]
+    fn chrono_to_systemtime_clamps_pre_epoch() {
+        use chrono::TimeZone as _;
+        let pre = chrono::FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(1960, 1, 1, 0, 0, 0)
+            .unwrap();
+        assert_eq!(chrono_to_systemtime(&pre), UNIX_EPOCH);
+        let post = chrono::FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2030, 1, 1, 0, 0, 0)
+            .unwrap();
+        assert_eq!(
+            chrono_to_systemtime(&post),
+            UNIX_EPOCH + Duration::from_secs(post.timestamp() as u64)
+        );
+    }
+
+    /// Wrap DER chains in a CertPair for refresh-task tests.
+    fn test_pair(chain_der: Vec<Vec<u8>>) -> Arc<CertPair> {
+        use rustls::pki_types::{
+            CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer,
+        };
+        let kp = rcgen::KeyPair::generate().unwrap();
+        Arc::new(CertPair {
+            chain: chain_der
+                .into_iter()
+                .map(|d| CertificateDer::from(d))
+                .collect(),
+            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                kp.serialize_der(),
+            )),
+            alpn_store: None,
+            ocsp: Vec::new(),
+        })
+    }
+
+    /// Spawn the refresh task over `pair` and assert that after a
+    /// settling delay it has neither recorded a failure nor fetched a
+    /// staple — the quiet "park" contract for unstapleable certs.
+    async fn assert_task_parks(pair: Arc<CertPair>) {
+        let metrics = Arc::new(Metrics::new());
+        let (tx, rx) = tokio::sync::watch::channel(pair.clone());
+        let tx = Arc::new(ArcSwap::from_pointee(tx));
+        let handle = spawn_refresh_task(
+            "test".into(),
+            OcspConfig::default(),
+            None,
+            rx,
+            tx.clone(),
+            metrics.clone(),
+        )
+        .expect("enabled config must spawn the task");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            metrics
+                .ocsp_refresh_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "parked task must not count failures"
+        );
+        assert_eq!(
+            metrics
+                .ocsp_refreshes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(!handle.is_finished(), "task must stay parked, not exit");
+
+        // A renewal that still cannot staple re-parks quietly.
+        tx.load().send(pair).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            metrics
+                .ocsp_refresh_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_task_parks_on_cert_without_responder_url() {
+        // Chain of two, but the leaf carries no AIA OCSP URL: the
+        // staple-when-available semantics from the OCSP deprecation
+        // work — serve unstapled, log once, touch no failure metric.
+        let (leaf, issuer) = make_chain(None);
+        assert_task_parks(test_pair(vec![leaf, issuer])).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_task_parks_on_self_signed_chain() {
+        // Single-cert chain (self-signed): no issuer, no URL; same
+        // quiet park.
+        let (leaf, _) = make_chain(None);
+        assert_task_parks(test_pair(vec![leaf])).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_task_not_spawned_when_disabled() {
+        let cfg = OcspConfig { enabled: false, ..Default::default() };
+        let (leaf, issuer) = make_chain(None);
+        let pair = test_pair(vec![leaf, issuer]);
+        let (tx, rx) = tokio::sync::watch::channel(pair);
+        let tx = Arc::new(ArcSwap::from_pointee(tx));
+        assert!(
+            spawn_refresh_task(
+                "test".into(),
+                cfg,
+                None,
+                rx,
+                tx,
+                Arc::new(Metrics::new()),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn staple_cache_path_is_stable_and_hashed() {
         let tmp = std::env::temp_dir();
         let p1 = staple_cache_path(&tmp, b"hello world");
