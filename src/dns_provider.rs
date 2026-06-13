@@ -485,6 +485,98 @@ mod tests {
         assert!(build(&cfg).is_ok());
     }
 
+    #[test]
+    fn cloudflare_auth_header_is_bearer_token() {
+        let p = CloudflareProvider {
+            zone_id: "Z".into(),
+            api_token: "tok-123".into(),
+        };
+        assert_eq!(p.auth_header(), "Bearer tok-123");
+    }
+
+    /// Write an executable stub script that records its action and
+    /// environment to `out`, exiting with `code`.
+    fn stub_hook(dir: &std::path::Path, code: i32) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = dir.join("hook.sh");
+        let out = dir.join("out.txt");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$1 $HYPERSHUNT_DNS_ACTION \
+                 $HYPERSHUNT_DNS_FQDN $HYPERSHUNT_DNS_VALUE\" \
+                 >> {}\nexit {}\n",
+                out.display(),
+                code
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &script,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        script.display().to_string()
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("hypershunt-dns-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn exec_provider_passes_action_env_and_args() {
+        let dir = temp_dir("ok");
+        let p = ExecProvider {
+            program: stub_hook(&dir, 0),
+            args: vec!["positional".into()],
+        };
+        p.set_txt("_acme-challenge.example.com", "v1").await.unwrap();
+        p.clear_txt("_acme-challenge.example.com", "v1").await.unwrap();
+        let out =
+            std::fs::read_to_string(dir.join("out.txt")).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "positional set _acme-challenge.example.com v1",
+                "positional clear _acme-challenge.example.com v1",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn exec_provider_maps_nonzero_exit_to_error() {
+        let dir = temp_dir("fail");
+        let p = ExecProvider { program: stub_hook(&dir, 3), args: vec![] };
+        let err = p
+            .set_txt("f", "v")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exited with status"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn exec_provider_maps_missing_program_to_spawn_error() {
+        let p = ExecProvider {
+            program: "/no/such/hypershunt-hook".into(),
+            args: vec![],
+        };
+        let err = p
+            .set_txt("f", "v")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("spawning DNS exec hook"), "got: {err}");
+    }
+
     #[cfg(not(feature = "dns-route53"))]
     #[test]
     fn build_route53_without_feature_errors() {
