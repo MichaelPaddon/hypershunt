@@ -2,7 +2,7 @@
 name = "hypershunt"
 version = "1.0.0-rc15"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.96"
 description = "HTTP server and reverse proxy"
 authors = ["Michael Paddon <michael@paddon.org>"]
 license = "BSD-2-Clause"
@@ -60,9 +60,12 @@ tokio              = { version = "1",    features = ["full"] }
 # Used by the HTTP/3 outbound proxy to stream upstream response bodies
 # back to the downstream client without buffering them in memory.
 tokio-stream       = "0.1"
-# 6.7.1 minimum: 6.5.x mis-parses a node whose inline children block
-# is followed by a trailing `//` comment, swallowing the next node.
-kdl                = "6.7.1"
+# 6.5.x mis-parses a node whose inline children block is followed by a
+# trailing `//` comment, swallowing the next node.  With rust-version at
+# 1.96 the MSRV-aware resolver selects the newest 6.x (well past the
+# bug), so a plain major floor suffices; the exact pin lives in the
+# tracked Cargo.lock.
+kdl                = "6"
 miette             = { version = "7", default-features = false }
 regex              = "1"
 anyhow             = "1"
@@ -79,9 +82,9 @@ webpki-roots       = "1"
 tower-service      = "0.3"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
 base64             = "0.22"
-ldap3      = { version = "0.12.1", default-features = false, features = ["sync", "tls-rustls-aws-lc-rs"] }
+ldap3      = { version = "0.12", default-features = false, features = ["sync", "tls-rustls-aws-lc-rs"] }
 maxminddb  = "0.28"
 zeroize    = "1"
 p256       = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
