@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "hypershunt"
-version = "1.0.0-rc15"
+version = "1.0.0-rc16"
 dependencies = [
  "anyhow",
  "arc-swap",
