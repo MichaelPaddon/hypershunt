@@ -46,7 +46,8 @@ use openidconnect::core::{
     CoreTokenType,
 };
 use openidconnect::{
-    AccessToken, AdditionalProviderMetadata, AuthorizationCode, ClientId,
+    AccessToken, AdditionalProviderMetadata, AsyncHttpClient,
+    AuthorizationCode, ClientId,
     ClientSecret, CsrfToken, EmptyExtraTokenFields, EndpointMaybeSet,
     EndpointNotSet, EndpointSet, IdTokenFields, IssuerUrl, Nonce,
     OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier,
@@ -327,15 +328,30 @@ fn build_http_client() -> Result<openidconnect::reqwest::Client> {
         .context("building OIDC HTTP client")
 }
 
-async fn run_discovery(
-    cfg: &OidcConfig,
-    http_client: &openidconnect::reqwest::Client,
+// Generic over the HTTP client so the production caller can pass the
+// concrete `reqwest::Client` while tests substitute an in-memory async
+// closure (openidconnect 4.0 provides a blanket `AsyncHttpClient` impl
+// for any `Fn(HttpRequest) -> Future<Result<HttpResponse, E>>`).  The
+// `'c` lifetime and the `C: AsyncHttpClient<'c>` bound mirror
+// `discover_async`'s own signature: the metadata future borrows the
+// client for `'c`, and the client must be borrowable for that span.
+async fn run_discovery<'c, C>(
+    cfg: &'c OidcConfig,
+    http_client: &'c C,
 ) -> Result<(
     OidcClient,
     Option<url::Url>,
     Option<url::Url>,
     openidconnect::core::CoreJsonWebKeySet,
-)> {
+)>
+where
+    C: AsyncHttpClient<'c>,
+    // `anyhow::Context::with_context` requires the source error to be
+    // `Send + Sync + 'static`.  `AsyncHttpClient::Error` is only bounded
+    // `Error + 'static`, so we restate the stronger bound here; the
+    // concrete production client (`reqwest::Client`) satisfies it.
+    <C as AsyncHttpClient<'c>>::Error: Send + Sync,
+{
     let issuer_url = IssuerUrl::new(cfg.issuer.clone())
         .with_context(|| format!("invalid OIDC issuer URL: {}", cfg.issuer))?;
 
@@ -1141,6 +1157,181 @@ pub(crate) mod tests {
     // referenced fully-qualified there.
     use sha2::Digest;
     use std::time::SystemTime;
+
+    // ---- Server-less discovery tests ----------------------------------
+    //
+    // openidconnect 4.0 ships a blanket `AsyncHttpClient` impl for any
+    // async closure `Fn(HttpRequest) -> Future<Result<HttpResponse, E>>`
+    // (`E: Error + 'static`).  These tests exercise the generic
+    // `run_discovery` seam with an in-memory closure keyed on request
+    // path, so no TCP socket is bound and the tests stay deterministic.
+
+    /// Minimal error type for the fake HTTP client.  `AsyncHttpClient`
+    /// requires `Error: std::error::Error + 'static`; we additionally
+    /// derive `Send + Sync` so it satisfies `run_discovery`'s restated
+    /// bound (anyhow's `with_context` needs `Send + Sync`).
+    #[derive(Debug)]
+    struct FakeHttpError(String);
+
+    impl std::fmt::Display for FakeHttpError {
+        fn fmt(
+            &self,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "fake http error: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for FakeHttpError {}
+
+    /// Build an `AsyncHttpClient` closure that answers from a fixed map
+    /// of request-path → (status, JSON body).  Discovery fetches
+    /// `/.well-known/openid-configuration` first, then `jwks_uri`; both
+    /// must be present for a successful flow.  An unknown path yields a
+    /// 404 so a misconfigured fixture fails loudly rather than hanging.
+    fn fake_client(
+        routes: std::collections::HashMap<String, (u16, String)>,
+    ) -> impl for<'c> AsyncHttpClient<'c, Error = FakeHttpError> {
+        move |req: openidconnect::HttpRequest| {
+            // Key only on the path: fixtures construct absolute URLs
+            // from the issuer, but matching the path keeps the helper
+            // independent of the (arbitrary) issuer host.
+            let path = req.uri().path().to_owned();
+            let routes = routes.clone();
+            async move {
+                let (status, body) = routes
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or((404, "{}".to_owned()));
+                openidconnect::http::Response::builder()
+                    .status(status)
+                    .header(
+                        openidconnect::http::header::CONTENT_TYPE,
+                        "application/json",
+                    )
+                    .body(body.into_bytes())
+                    .map_err(|e| FakeHttpError(e.to_string()))
+            }
+        }
+    }
+
+    /// A well-formed OIDC discovery document for `issuer`, optionally
+    /// advertising the `end_session_endpoint` / `revocation_endpoint`
+    /// extension fields that hypershunt's `LogoutMetadata` parses.
+    fn discovery_doc(issuer: &str, with_logout: bool) -> String {
+        let mut doc = serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        });
+        if with_logout {
+            doc["end_session_endpoint"] =
+                format!("{issuer}/logout").into();
+            doc["revocation_endpoint"] =
+                format!("{issuer}/revoke").into();
+        }
+        doc.to_string()
+    }
+
+    /// An (empty-keys) JWKS document; discovery fetches `jwks_uri` and
+    /// deserialises it, but the keys themselves aren't exercised here.
+    fn empty_jwks() -> String {
+        serde_json::json!({ "keys": [] }).to_string()
+    }
+
+    /// Standard route map: discovery doc + JWKS, keyed by their paths.
+    fn discovery_routes(
+        issuer: &str,
+        with_logout: bool,
+    ) -> std::collections::HashMap<String, (u16, String)> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "/.well-known/openid-configuration".to_owned(),
+            (200, discovery_doc(issuer, with_logout)),
+        );
+        m.insert("/jwks".to_owned(), (200, empty_jwks()));
+        m
+    }
+
+    #[tokio::test]
+    async fn run_discovery_parses_logout_extension_endpoints() {
+        let issuer = "https://idp.example";
+        let cfg = mock_cfg(issuer);
+        let client = fake_client(discovery_routes(issuer, true));
+        let (_oidc, end_session, revocation, _jwks) =
+            run_discovery(&cfg, &client)
+                .await
+                .expect("discovery should succeed");
+        // The extension fields must round-trip through hypershunt's
+        // custom `LogoutMetadata` additional-metadata type.
+        assert_eq!(
+            end_session.map(|u| u.to_string()),
+            Some("https://idp.example/logout".to_owned()),
+        );
+        assert_eq!(
+            revocation.map(|u| u.to_string()),
+            Some("https://idp.example/revoke".to_owned()),
+        );
+    }
+
+    #[tokio::test]
+    async fn run_discovery_missing_logout_endpoints_yields_none() {
+        let issuer = "https://idp.example";
+        let cfg = mock_cfg(issuer);
+        let client = fake_client(discovery_routes(issuer, false));
+        let (_oidc, end_session, revocation, _jwks) =
+            run_discovery(&cfg, &client)
+                .await
+                .expect("discovery should succeed");
+        assert!(end_session.is_none());
+        assert!(revocation.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_discovery_http_error_is_err() {
+        let issuer = "https://idp.example";
+        let cfg = mock_cfg(issuer);
+        // Discovery endpoint returns 500: the metadata fetch must fail.
+        let mut routes = discovery_routes(issuer, true);
+        routes.insert(
+            "/.well-known/openid-configuration".to_owned(),
+            (500, "{}".to_owned()),
+        );
+        let client = fake_client(routes);
+        assert!(run_discovery(&cfg, &client).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_discovery_malformed_json_is_err() {
+        let issuer = "https://idp.example";
+        let cfg = mock_cfg(issuer);
+        let mut routes = discovery_routes(issuer, true);
+        routes.insert(
+            "/.well-known/openid-configuration".to_owned(),
+            (200, "{ this is not json".to_owned()),
+        );
+        let client = fake_client(routes);
+        assert!(run_discovery(&cfg, &client).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_discovery_issuer_mismatch_is_err() {
+        // OIDC requires the discovery doc's `issuer` to equal the
+        // requested issuer URL; a mismatch must be rejected.
+        let issuer = "https://idp.example";
+        let cfg = mock_cfg(issuer);
+        let mut routes = discovery_routes(issuer, true);
+        routes.insert(
+            "/.well-known/openid-configuration".to_owned(),
+            (200, discovery_doc("https://evil.example", true)),
+        );
+        let client = fake_client(routes);
+        assert!(run_discovery(&cfg, &client).await.is_err());
+    }
 
     #[test]
     fn missing_groups_claim_returns_empty() {

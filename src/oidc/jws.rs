@@ -301,5 +301,41 @@ mod tests {
         let json = serde_json::json!({"g": 42});
         assert!(extract_groups_claim_from_json("g", &json).is_empty());
     }
+
+    #[test]
+    fn groups_from_space_delimited_string_splits_on_whitespace() {
+        // SAML-style IdPs emit a single space-delimited string; each
+        // run of whitespace is one separator.
+        let json = serde_json::json!({"g": "a  b\tc"});
+        assert_eq!(
+            extract_groups_claim_from_json("g", &json),
+            ["a", "b", "c"],
+        );
+    }
+
+    #[test]
+    fn groups_from_single_bare_string_yields_one_group() {
+        let json = serde_json::json!({"g": "solo"});
+        assert_eq!(
+            extract_groups_claim_from_json("g", &json),
+            ["solo"],
+        );
+    }
+
+    #[test]
+    fn groups_from_empty_string_returns_empty() {
+        // `split_whitespace` on an empty / all-whitespace string yields
+        // no items, so the result is empty rather than `[""]`.
+        let json = serde_json::json!({"g": "   "});
+        assert!(extract_groups_claim_from_json("g", &json).is_empty());
+    }
+
+    #[test]
+    fn groups_from_bool_value_returns_empty() {
+        // A boolean is neither array nor string: the wrong-JSON-type
+        // arm returns empty.
+        let json = serde_json::json!({"g": true});
+        assert!(extract_groups_claim_from_json("g", &json).is_empty());
+    }
 }
 
