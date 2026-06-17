@@ -39,19 +39,18 @@ use openidconnect::core::{
     CoreAuthDisplay, CoreAuthPrompt, CoreAuthenticationFlow,
     CoreClaimName, CoreClaimType, CoreClientAuthMethod,
     CoreErrorResponseType, CoreGenderClaim, CoreGrantType,
-    CoreJsonWebKey, CoreJsonWebKeyType, CoreJsonWebKeyUse,
-    CoreJweContentEncryptionAlgorithm, CoreJweKeyManagementAlgorithm,
-    CoreJwsSigningAlgorithm, CoreResponseMode, CoreResponseType,
+    CoreJsonWebKey, CoreJweContentEncryptionAlgorithm,
+    CoreJweKeyManagementAlgorithm, CoreResponseMode, CoreResponseType,
     CoreRevocableToken, CoreRevocationErrorResponse,
     CoreSubjectIdentifierType, CoreTokenIntrospectionResponse,
     CoreTokenType,
 };
-use openidconnect::reqwest::async_http_client;
 use openidconnect::{
     AccessToken, AdditionalProviderMetadata, AuthorizationCode, ClientId,
-    ClientSecret, CsrfToken, EmptyExtraTokenFields, IdTokenFields,
-    IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
-    PkceCodeVerifier, ProviderMetadata, RedirectUrl, RefreshToken, Scope,
+    ClientSecret, CsrfToken, EmptyExtraTokenFields, EndpointMaybeSet,
+    EndpointNotSet, EndpointSet, IdTokenFields, IssuerUrl, Nonce,
+    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier,
+    ProviderMetadata, RedirectUrl, RefreshToken, Scope,
     StandardErrorResponse, StandardTokenResponse, TokenResponse,
     UserInfoClaims,
 };
@@ -80,6 +79,11 @@ impl AdditionalProviderMetadata for LogoutMetadata {}
 // metadata slot.  This lets discovery deserialise our extra field
 // while preserving every other Core type, so the rest of the OIDC
 // pipeline keeps working unchanged.
+// v4 consolidated the three JWK-related generics (key type, key use,
+// signing alg) into a single `JsonWebKey` slot, dropping the arity from
+// 15 to 12.  Order: <Additional, AuthDisplay, ClientAuthMethod,
+// ClaimName, ClaimType, GrantType, JweContentEnc, JweKeyMgmt,
+// JsonWebKey, ResponseMode, ResponseType, SubjectIdentifierType>.
 type HypershuntProviderMetadata = ProviderMetadata<
     LogoutMetadata,
     CoreAuthDisplay,
@@ -89,9 +93,6 @@ type HypershuntProviderMetadata = ProviderMetadata<
     CoreGrantType,
     CoreJweContentEncryptionAlgorithm,
     CoreJweKeyManagementAlgorithm,
-    CoreJwsSigningAlgorithm,
-    CoreJsonWebKeyType,
-    CoreJsonWebKeyUse,
     CoreJsonWebKey,
     CoreResponseMode,
     CoreResponseType,
@@ -114,32 +115,74 @@ impl openidconnect::AdditionalClaims for ExtraClaims {}
 // Mirror `CoreClient` / `CoreTokenResponse` exactly, swapping the
 // additional-claims slot for `ExtraClaims` — same pattern as
 // `HypershuntProviderMetadata` above.
+// v4: IdTokenFields lost its trailing key-type generic (now 5 params):
+// <AdditionalClaims, ExtraTokenFields, GenderClaim, JweContentEnc,
+// JwsSigningAlgorithm>.
 type HsIdTokenFields = IdTokenFields<
     ExtraClaims,
     EmptyExtraTokenFields,
     CoreGenderClaim,
     CoreJweContentEncryptionAlgorithm,
-    CoreJwsSigningAlgorithm,
-    CoreJsonWebKeyType,
+    openidconnect::core::CoreJwsSigningAlgorithm,
 >;
 type HsTokenResponse =
     StandardTokenResponse<HsIdTokenFields, CoreTokenType>;
+
+// v4: `Client` now carries 11 content generics plus 6 typestate
+// markers tracking which endpoints have been configured.  Mirrors
+// `CoreClient` but substitutes our `ExtraClaims` and `HsTokenResponse`.
+//
+// Endpoint markers reflect how `run_discovery` builds the client:
+//   * auth URL    -> EndpointSet      (always present after discovery)
+//   * token URL   -> EndpointMaybeSet (from_provider_metadata sets this)
+//   * userinfo    -> EndpointMaybeSet (optional in discovery)
+//   * revocation  -> EndpointSet      (we ALWAYS call set_revocation_url
+//                                      so revoke_token type-checks; the
+//                                      actual call is guarded on whether
+//                                      discovery surfaced a real endpoint)
+//   * introspection / device -> EndpointNotSet (unused)
 pub(crate) type OidcClient = openidconnect::Client<
     ExtraClaims,
     CoreAuthDisplay,
     CoreGenderClaim,
     CoreJweContentEncryptionAlgorithm,
-    CoreJwsSigningAlgorithm,
-    CoreJsonWebKeyType,
-    CoreJsonWebKeyUse,
     CoreJsonWebKey,
     CoreAuthPrompt,
     StandardErrorResponse<CoreErrorResponseType>,
     HsTokenResponse,
-    CoreTokenType,
     CoreTokenIntrospectionResponse,
     CoreRevocableToken,
     CoreRevocationErrorResponse,
+    EndpointSet,    // HasAuthUrl
+    EndpointNotSet, // HasDeviceAuthUrl
+    EndpointNotSet, // HasIntrospectionUrl
+    EndpointSet,    // HasRevocationUrl
+    EndpointMaybeSet, // HasTokenUrl
+    EndpointMaybeSet, // HasUserInfoUrl
+>;
+
+// Typestate produced directly by `from_provider_metadata` (before we
+// flip the revocation marker via `set_revocation_url`).  Only used as
+// the receiver type for the constructor call; the builder chain then
+// yields `OidcClient`.
+type OidcClientFromMetadata = openidconnect::Client<
+    ExtraClaims,
+    CoreAuthDisplay,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJsonWebKey,
+    CoreAuthPrompt,
+    StandardErrorResponse<CoreErrorResponseType>,
+    HsTokenResponse,
+    CoreTokenIntrospectionResponse,
+    CoreRevocableToken,
+    CoreRevocationErrorResponse,
+    EndpointSet,      // HasAuthUrl
+    EndpointNotSet,   // HasDeviceAuthUrl
+    EndpointNotSet,   // HasIntrospectionUrl
+    EndpointNotSet,   // HasRevocationUrl (flipped by set_revocation_url)
+    EndpointMaybeSet, // HasTokenUrl
+    EndpointMaybeSet, // HasUserInfoUrl
 >;
 
 /// Standard OIDC login-flow hints the relying party may forward to
@@ -254,6 +297,12 @@ pub struct OidcProvider {
     // claim so a cache hit can skip the (RSA-heavy) signature
     // verification.  Empty when bearer mode is disabled.
     bearer_cache: Mutex<lru::LruCache<[u8; 32], BearerCacheEntry>>,
+    // Shared reqwest client for every OIDC network call.  v4 no longer
+    // ships a built-in `async_http_client`; the relying party owns the
+    // client and passes it by reference.  Redirects are disabled on it
+    // as an SSRF guard (see `build_http_client`).  Cheap to clone and
+    // reuse, so we build it once and hold it for the provider's life.
+    http_client: openidconnect::reqwest::Client,
 }
 
 #[derive(Clone)]
@@ -269,8 +318,18 @@ struct BearerCacheEntry {
 /// separately so the back-channel logout endpoint can verify
 /// signatures without going through the (more constrained) ID-token
 /// verifier path.
+/// Build the shared reqwest client used for every OIDC network call.
+/// Redirects are disabled as an SSRF guard (see `run_discovery`).
+fn build_http_client() -> Result<openidconnect::reqwest::Client> {
+    openidconnect::reqwest::ClientBuilder::new()
+        .redirect(openidconnect::reqwest::redirect::Policy::none())
+        .build()
+        .context("building OIDC HTTP client")
+}
+
 async fn run_discovery(
     cfg: &OidcConfig,
+    http_client: &openidconnect::reqwest::Client,
 ) -> Result<(
     OidcClient,
     Option<url::Url>,
@@ -279,9 +338,10 @@ async fn run_discovery(
 )> {
     let issuer_url = IssuerUrl::new(cfg.issuer.clone())
         .with_context(|| format!("invalid OIDC issuer URL: {}", cfg.issuer))?;
+
     let metadata = HypershuntProviderMetadata::discover_async(
         issuer_url,
-        async_http_client,
+        http_client,
     )
     .await
     .with_context(|| format!("OIDC discovery failed for {}", cfg.issuer))?;
@@ -292,28 +352,32 @@ async fn run_discovery(
         metadata.additional_metadata().revocation_endpoint.clone();
     let jwks = metadata.jwks().clone();
 
-    // Build the client from individual endpoints rather than
-    // OidcClient::from_provider_metadata so we stay independent of
-    // any future Core/Hypershunt-metadata divergence.
-    let mut client = OidcClient::new(
+    let redirect = RedirectUrl::new(cfg.redirect_uri.clone())
+        .with_context(|| {
+            format!("invalid redirect-uri: {}", cfg.redirect_uri)
+        })?;
+
+    // v4 client construction is a typestate builder.
+    // `from_provider_metadata` flips HasAuthUrl=Set, HasTokenUrl and
+    // HasUserInfoUrl=MaybeSet.  We must then call `set_revocation_url`
+    // unconditionally so the `revoke_token` method exists at compile
+    // time (it requires HasRevocationUrl=Set).  When discovery did NOT
+    // surface a revocation endpoint we set a harmless placeholder (the
+    // issuer URL); the runtime revocation path in `revoke_refresh_token`
+    // is guarded on `self.revocation_url()` being `Some`, so the
+    // placeholder is never actually contacted.
+    let revocation_for_client = revocation_url
+        .clone()
+        .unwrap_or_else(|| metadata.issuer().url().clone());
+    let client = OidcClientFromMetadata::from_provider_metadata(
+        metadata,
         ClientId::new(cfg.client_id.clone()),
         cfg.client_secret.clone().map(ClientSecret::new),
-        metadata.issuer().clone(),
-        metadata.authorization_endpoint().clone(),
-        metadata.token_endpoint().cloned(),
-        metadata.userinfo_endpoint().cloned(),
-        jwks.clone(),
     )
-    .set_redirect_uri(
-        RedirectUrl::new(cfg.redirect_uri.clone()).with_context(|| {
-            format!("invalid redirect-uri: {}", cfg.redirect_uri)
-        })?,
-    );
-    if let Some(ref rev) = revocation_url {
-        client = client.set_revocation_uri(
-            openidconnect::RevocationUrl::from_url(rev.clone()),
-        );
-    }
+    .set_redirect_uri(redirect)
+    .set_revocation_url(openidconnect::RevocationUrl::from_url(
+        revocation_for_client,
+    ));
 
     Ok((client, end_session_url, revocation_url, jwks))
 }
@@ -331,7 +395,33 @@ impl OidcProvider {
     /// fail-fast request without crashing hypershunt; restart picks up
     /// the new IdP state.
     pub fn new(cfg: OidcConfig, metrics: Arc<Metrics>) -> Arc<Self> {
+        // Build the SSRF-guarded HTTP client up front.  Constructing a
+        // reqwest client with the default TLS backend is effectively
+        // infallible; if it ever does fail we must NOT silently fall
+        // back to a redirect-following default (that would reopen the
+        // SSRF hole).  Instead degrade to a client that still has
+        // redirects disabled (only losing connection pooling), and if
+        // even that cannot be built, leave `http_client` as a
+        // never-ready stub — discovery then fails loudly on first use.
+        let http_client = build_http_client().unwrap_or_else(|e| {
+            tracing::error!(
+                error = %format!("{e:#}"),
+                "OIDC HTTP client build failed; using minimal \
+                 redirect-disabled client"
+            );
+            openidconnect::reqwest::Client::builder()
+                .redirect(openidconnect::reqwest::redirect::Policy::none())
+                .pool_max_idle_per_host(0)
+                .build()
+                // The redirect policy is identical to the primary
+                // builder, so this second attempt cannot regress the
+                // SSRF guard; `expect` here only fires if reqwest
+                // itself is fundamentally broken at runtime, which is
+                // not a recoverable production state.
+                .expect("redirect-disabled reqwest client must build")
+        });
         let provider = Arc::new(Self {
+            http_client,
             client: ArcSwap::new(Arc::new(None)),
             state_ttl: Duration::from_secs(cfg.state_ttl_secs),
             refresh_ttl: Duration::from_secs(cfg.refresh_ttl_secs),
@@ -357,7 +447,7 @@ impl OidcProvider {
             // Bootstrap loop.
             loop {
                 let Some(p) = weak.upgrade() else { return };
-                match run_discovery(&p.cfg).await {
+                match run_discovery(&p.cfg, &p.http_client).await {
                     Ok((client, end_session, revocation, jwks)) => {
                         p.client.store(Arc::new(Some(Arc::new(client))));
                         p.end_session_url.store(Arc::new(end_session));
@@ -420,7 +510,7 @@ impl OidcProvider {
             loop {
                 ticker.tick().await;
                 let Some(p) = weak.upgrade() else { return };
-                match run_discovery(&p.cfg).await {
+                match run_discovery(&p.cfg, &p.http_client).await {
                     Ok((client, end_session, revocation, jwks)) => {
                         p.client.store(Arc::new(Some(Arc::new(client))));
                         p.end_session_url.store(Arc::new(end_session));
@@ -523,7 +613,7 @@ impl OidcProvider {
         let info: UserInfoClaims<
             ExtraClaims,
             openidconnect::core::CoreGenderClaim,
-        > = match request.request_async(async_http_client).await {
+        > = match request.request_async(&self.http_client).await {
             Ok(c) => c,
             Err(e) => {
                 self.metrics.oidc_userinfo_failures.fetch_add(
@@ -713,15 +803,24 @@ impl OidcProvider {
         if !self.cfg.revoke_on_logout {
             return;
         }
+        // v4 typestate forces a revocation URL to always be set on the
+        // client (so `revoke_token` compiles); when discovery did not
+        // surface a real endpoint we set a never-used placeholder.
+        // Guard here so we never POST a revocation to that placeholder:
+        // skip entirely unless discovery gave us a genuine endpoint.
+        if self.revocation_url.load().is_none() {
+            return;
+        }
         let Some(client) = self.client() else { return };
-        // Move the client Arc and refresh token into the task so the
-        // RevocationRequest borrow is local to the spawned future.
+        // Move the client Arc, http client, and refresh token into the
+        // task so the RevocationRequest borrow is local to the spawned
+        // future.
         let metrics = self.metrics.clone();
+        let http_client = self.http_client.clone();
         crate::task::spawn_supervised("oidc.revocation", async move {
-            // The OidcClient only knows how to build a revocation
-            // request when set_revocation_uri was called at
-            // construction time, which we do iff discovery surfaced
-            // the endpoint.
+            // `revoke_token` returns Err for a non-https endpoint
+            // (RFC 7009 requires HTTPS); on loopback/plain-http IdPs
+            // this is the documented graceful-skip path.
             let request = match client.revoke_token(refresh_token.into()) {
                 Ok(r) => r,
                 Err(e) => {
@@ -733,7 +832,7 @@ impl OidcProvider {
                     return;
                 }
             };
-            match request.request_async(async_http_client).await {
+            match request.request_async(&http_client).await {
                 Ok(()) => {
                     metrics.oidc_revocations.fetch_add(
                         1,
@@ -786,14 +885,18 @@ impl OidcProvider {
         // token exchange so the IdP's access-token `aud` narrowing
         // applies here too (the spec requires the parameter on
         // both legs of the flow).
+        // v4: `exchange_code` now returns a Result (it validates the
+        // client has a token endpoint configured before building the
+        // request).
         let mut exchange = client
             .exchange_code(AuthorizationCode::new(code))
+            .context("OIDC token endpoint not configured")?
             .set_pkce_verifier(entry.pkce_verifier);
         for r in &self.cfg.resources {
             exchange = exchange.add_extra_param("resource", r.clone());
         }
         let token_response = exchange
-            .request_async(async_http_client)
+            .request_async(&self.http_client)
             .await
             .context("OIDC token exchange failed")?;
 
@@ -894,12 +997,15 @@ impl OidcProvider {
 
         // RFC 8707: forward resources on refresh as well so the
         // re-issued access token carries the same `aud` narrowing.
-        let mut exchange = client.exchange_refresh_token(&rt);
+        // v4: `exchange_refresh_token` returns a Result.
+        let mut exchange = client
+            .exchange_refresh_token(&rt)
+            .context("OIDC token endpoint not configured")?;
         for r in &self.cfg.resources {
             exchange = exchange.add_extra_param("resource", r.clone());
         }
         let token_response = exchange
-            .request_async(async_http_client)
+            .request_async(&self.http_client)
             .await
             .inspect_err(|_| {
                 // The IdP's "no" is permanent for this token --
@@ -1102,19 +1208,7 @@ pub(crate) mod tests {
             require_iss: false,
             resources: vec![],
         };
-        let client = OidcClient::new(
-            ClientId::new(cfg.client_id.clone()),
-            None,
-            IssuerUrl::new(cfg.issuer.clone()).unwrap(),
-            openidconnect::AuthUrl::new(
-                "https://idp.example/authorize".into(),
-            )
-            .unwrap(),
-            None,
-            None,
-            openidconnect::JsonWebKeySet::new(vec![]),
-        )
-        .set_redirect_uri(RedirectUrl::new(cfg.redirect_uri.clone()).unwrap());
+        let client = dummy_client(&cfg);
         Arc::new(OidcProvider {
             client: ArcSwap::new(Arc::new(Some(Arc::new(client)))),
             state_ttl: Duration::from_secs(cfg.state_ttl_secs),
@@ -1130,7 +1224,60 @@ pub(crate) mod tests {
             bearer_cache: Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(16).unwrap(),
             )),
+            http_client: build_http_client().unwrap(),
         })
+    }
+
+    /// Build a never-network-called `OidcClient` for unit tests.
+    /// v4's typestate requires the token/userinfo markers to be
+    /// `EndpointMaybeSet`, which only `from_provider_metadata` produces,
+    /// so we synthesize a minimal provider-metadata document offline and
+    /// run it through the exact same builder chain as production.
+    fn dummy_client(cfg: &crate::config::OidcConfig) -> OidcClient {
+        use openidconnect::core::{
+            CoreJwsSigningAlgorithm, CoreResponseType,
+            CoreSubjectIdentifierType,
+        };
+        let issuer = IssuerUrl::new(cfg.issuer.clone()).unwrap();
+        let metadata = HypershuntProviderMetadata::new(
+            issuer,
+            openidconnect::AuthUrl::new(
+                "https://idp.example/authorize".into(),
+            )
+            .unwrap(),
+            openidconnect::JsonWebKeySetUrl::new(
+                "https://idp.example/jwks".into(),
+            )
+            .unwrap(),
+            vec![openidconnect::ResponseTypes::new(vec![
+                CoreResponseType::Code,
+            ])],
+            vec![CoreSubjectIdentifierType::Public],
+            vec![CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256],
+            LogoutMetadata {
+                end_session_endpoint: None,
+                revocation_endpoint: None,
+            },
+        )
+        .set_token_endpoint(Some(
+            openidconnect::TokenUrl::new(
+                "https://idp.example/token".into(),
+            )
+            .unwrap(),
+        ))
+        .set_jwks(openidconnect::JsonWebKeySet::new(vec![]));
+        OidcClientFromMetadata::from_provider_metadata(
+            metadata,
+            ClientId::new(cfg.client_id.clone()),
+            None,
+        )
+        .set_redirect_uri(
+            RedirectUrl::new(cfg.redirect_uri.clone()).unwrap(),
+        )
+        .set_revocation_url(openidconnect::RevocationUrl::new(
+            "https://idp.example/revoke".into(),
+        )
+        .unwrap())
     }
 
     // -- Mock IdP -------------------------------------------------
@@ -1252,8 +1399,16 @@ pub(crate) mod tests {
                                                     ["code"],
                                                 "subject_types_supported":
                                                     ["public"],
+                                                // Must match the alg
+                                                // the mock actually
+                                                // signs with (RS256):
+                                                // v4's id_token verifier
+                                                // restricts accepted
+                                                // algs to those the
+                                                // discovery doc
+                                                // advertises.
                                                 "id_token_signing_alg_values_supported":
-                                                    ["ES256"],
+                                                    ["RS256"],
                                             })
                                             .to_string()
                                         }
@@ -1765,6 +1920,7 @@ pub(crate) mod tests {
             bearer_cache: Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(16).unwrap(),
             )),
+            http_client: build_http_client().unwrap(),
         });
         // No tokio runtime needed: the early-return branch fires
         // before any spawn.

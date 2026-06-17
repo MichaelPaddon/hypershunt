@@ -90,11 +90,11 @@ zeroize    = "1"
 p256       = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 sha2       = "0.10"
 rand_core  = { version = "0.6", features = ["getrandom"] }
-lru        = "0.16"
+lru        = "0.18"
 # OAuth/OIDC client used by `auth jwt { wrap oidc { ... } }`.
 # Provides discovery, JWKS fetch, authorization-code + PKCE flow,
 # and ID-token validation.
-openidconnect = "3"
+openidconnect = "4"
 url           = "2"
 # ASN.1 codec + PKIX/OCSP types for OCSP-stapling support.  Used by
 # src/ocsp.rs to build OCSPRequest blobs to POST to a responder and
@@ -102,13 +102,13 @@ url           = "2"
 rasn          = "0.28"
 rasn-pkix     = "0.28"
 rasn-ocsp     = "0.28"
-sha1          = "0.10"
+sha1          = "0.11"
 # Hash verifiers for the file-backed Basic-auth back-end
 # (`auth file { path "/etc/hypershunt/htpasswd" }`).  Each crate is
 # narrowly scoped: bcrypt for `$2y$/$2b$`, pwhash for SHA-512 crypt
 # (`$6$`), argon2 for `$argon2id$`.  Other schemes (DES, MD5-crypt,
 # plain) are rejected at parse time -- see src/auth.rs.
-bcrypt        = "0.17"
+bcrypt        = "0.19"
 pwhash        = "1"
 argon2        = "0.5"
 # chrono is already a transitive dep of `rasn` (its GeneralizedTime
@@ -153,7 +153,7 @@ time              = "0.3"
 # WebSocket client + server for the proxy upgrade-bridge tests.
 # We only need the protocol + handshake helpers; no TLS features
 # (the test backend is plaintext loopback).
-tokio-tungstenite = { version = "0.27", default-features = false, features = ["handshake", "connect"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake", "connect"] }
 futures-util      = "0.3"
 
 [profile.release]
