@@ -1771,7 +1771,7 @@ dependencies = [
 
 [[package]]
 name = "hypershunt"
-version = "1.0.0-rc16"
+version = "1.0.0-rc17"
 dependencies = [
  "anyhow",
  "arc-swap",
