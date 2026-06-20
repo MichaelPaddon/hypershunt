@@ -414,6 +414,13 @@ default `login` stack expects a TTY.
 server { auth "pam" service="hypershunt" }
 ```
 
+> **Running unprivileged:** hypershunt authenticates *after* dropping to
+> its unprivileged user, so `pam_unix.so` cannot read `/etc/shadow` — and
+> the shipped systemd unit's `NoNewPrivileges=yes` disables the usual
+> setuid `unix_chkpwd` fallback. Grant the hypershunt user read access to
+> `/etc/shadow` (e.g. add it to the `shadow` group). See
+> [Running unprivileged](guide.md#running-unprivileged).
+
 ##### service
 
 **Property** on [`auth "pam"`](#auth-pam).  Optional string.
