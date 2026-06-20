@@ -17,6 +17,10 @@ RestartSec=5
 StateDirectory=hypershunt
 
 # Security hardening
+# NOTE: NoNewPrivileges disables pam_unix's setuid `unix_chkpwd` helper, so
+# local PAM auth (auth "pam") can't read /etc/shadow via the usual fallback.
+# Grant the hypershunt user shadow access directly -- e.g. add it to the
+# "shadow" group.  See the docs' "Running unprivileged" section.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
