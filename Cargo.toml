@@ -119,7 +119,7 @@ chrono        = { version = "0.4", default-features = false, features = ["alloc"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["user", "fs", "socket", "process", "signal"] }
 libc = "0.2"
-pam = "0.7"
+pam-client2 = "0.5"
 
 [dev-dependencies]
 tempfile          = "3"

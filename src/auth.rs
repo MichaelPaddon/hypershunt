@@ -675,11 +675,20 @@ fn pam_validate(
     username: &str,
     password: &str,
 ) -> anyhow::Result<Vec<String>> {
-    let mut auth = pam::Authenticator::with_password(service)
-        .map_err(|e| anyhow::anyhow!("PAM init: {e:?}"))?;
-    auth.get_handler().set_credentials(username, password);
-    auth.authenticate()
-        .map_err(|e| anyhow::anyhow!("PAM authenticate: {e:?}"))?;
+    use pam_client2::conv_mock::Conversation;
+    use pam_client2::{Context, Flag};
+    // Non-interactive conversation: hand PAM the credentials we already
+    // hold (from HTTP Basic) instead of prompting a TTY.
+    let conv = Conversation::with_credentials(username, password);
+    let mut ctx = Context::new(service, Some(username), conv)
+        .map_err(|e| anyhow::anyhow!("PAM init: {e}"))?;
+    // authenticate() verifies the password; acct_mgmt() then rejects
+    // expired / locked / disabled accounts.  The previous `pam` crate
+    // skipped acct_mgmt -- enforcing it is the correct PAM contract.
+    ctx.authenticate(Flag::NONE)
+        .map_err(|e| anyhow::anyhow!("PAM authenticate: {e}"))?;
+    ctx.acct_mgmt(Flag::NONE)
+        .map_err(|e| anyhow::anyhow!("PAM account check: {e}"))?;
     lookup_groups(username)
 }
 
