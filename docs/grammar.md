@@ -418,7 +418,7 @@ Additionally for `"acme"` the body may contain repeating
 
 ### `dns-provider-block`
 
-`"dns-provider"` ( `"acme-dns"` | `"cloudflare"` | `"route53"` |
+`"dns-provider"` ( `"acme-dns"` | `"cloudflare"` |
 `"exec"` ) [`<dns-provider-property>`](#dns-provider-property)*
 ( `{` `"arg"` [`<string>`](#string) `}` )?
 
@@ -432,7 +432,6 @@ Properties vary by provider kind.
   `subdomain=`[`<string>`](#string)
 - `"cloudflare"`: `zone-id=`[`<string>`](#string)
   `api-token=`[`<string>`](#string)
-- `"route53"`: `hosted-zone-id=`[`<string>`](#string)
 - `"exec"`: `program=`[`<string>`](#string); the optional `arg`
   repeating child carries one positional string per argv element.
 
