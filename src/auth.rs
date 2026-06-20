@@ -675,11 +675,20 @@ fn pam_validate(
     username: &str,
     password: &str,
 ) -> anyhow::Result<Vec<String>> {
-    let mut auth = pam::Authenticator::with_password(service)
-        .map_err(|e| anyhow::anyhow!("PAM init: {e:?}"))?;
-    auth.get_handler().set_credentials(username, password);
-    auth.authenticate()
-        .map_err(|e| anyhow::anyhow!("PAM authenticate: {e:?}"))?;
+    use pam_client2::conv_mock::Conversation;
+    use pam_client2::{Context, Flag};
+    // Non-interactive conversation: hand PAM the credentials we already
+    // hold (from HTTP Basic) instead of prompting a TTY.
+    let conv = Conversation::with_credentials(username, password);
+    let mut ctx = Context::new(service, Some(username), conv)
+        .map_err(|e| anyhow::anyhow!("PAM init: {e}"))?;
+    // authenticate() verifies the password; acct_mgmt() then rejects
+    // expired / locked / disabled accounts.  The previous `pam` crate
+    // skipped acct_mgmt -- enforcing it is the correct PAM contract.
+    ctx.authenticate(Flag::NONE)
+        .map_err(|e| anyhow::anyhow!("PAM authenticate: {e}"))?;
+    ctx.acct_mgmt(Flag::NONE)
+        .map_err(|e| anyhow::anyhow!("PAM account check: {e}"))?;
     lookup_groups(username)
 }
 
@@ -709,6 +718,27 @@ mod tests {
         let mut map = hyper::HeaderMap::new();
         map.insert(hyper::header::AUTHORIZATION, value.parse().unwrap());
         map
+    }
+
+    // The PAM call itself needs a live service + privileges, so the
+    // authenticate/acct_mgmt path is covered by the container
+    // integration suite (suite_auth.sh).  Here we only verify the guard
+    // that short-circuits to Anonymous before any PAM call.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pam_no_auth_header_is_anonymous() {
+        let auth = PamAuthenticator::new("hypershunt-nonexistent");
+        let p = auth.authenticate(&hyper::HeaderMap::new()).await;
+        assert!(matches!(p, Principal::Anonymous));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pam_non_basic_scheme_is_anonymous() {
+        let auth = PamAuthenticator::new("hypershunt-nonexistent");
+        let h = headers_with_auth("Bearer some.jwt.token");
+        let p = auth.authenticate(&h).await;
+        assert!(matches!(p, Principal::Anonymous));
     }
 
     #[test]
