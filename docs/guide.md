@@ -536,10 +536,11 @@ listener "tcp://[::]:443" {
 The bundled providers are
 [`acme-dns`](reference.md#acme-dns) (works with any DNS server
 behind an [acme-dns](https://github.com/joohoi/acme-dns)
-instance), [`cloudflare`](reference.md#cloudflare),
-[`route53`](reference.md#route53) (requires the `dns-route53`
-Cargo feature), and [`exec`](reference.md#exec) (shells out to a
-script).
+instance), [`cloudflare`](reference.md#cloudflare), and
+[`exec`](reference.md#exec) (shells out to a script).  Any other
+DNS host -- Route 53, Google Cloud DNS, an RFC 2136 server, and so
+on -- is driven through `exec` (for example by calling that
+provider's CLI).
 
 The `exec` provider is the escape hatch for everything else --
 write a short script that adds/removes a TXT record on the

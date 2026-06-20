@@ -121,27 +121,6 @@ nix = { version = "0.31", features = ["user", "fs", "socket", "process", "signal
 libc = "0.2"
 pam = "0.7"
 
-[features]
-# Route53 DNS-01 provider pulls in the AWS SDK (~30 transitive
-# crates).  Operators who want it opt in via `cargo build --features
-# dns-route53` so the default `cargo build` stays slim.  acme-dns,
-# Cloudflare, and exec providers don't need extra deps and are always
-# compiled in.
-default = []
-dns-route53 = ["aws-config", "aws-sdk-route53"]
-
-[dependencies.aws-config]
-version = "1"
-optional = true
-default-features = false
-features = ["behavior-version-latest", "rustls", "rt-tokio"]
-
-[dependencies.aws-sdk-route53]
-version = "1"
-optional = true
-default-features = false
-features = ["behavior-version-latest", "rustls", "rt-tokio"]
-
 [dev-dependencies]
 tempfile          = "3"
 # RS256 signing for the in-process mock IdP in the OIDC tests; the

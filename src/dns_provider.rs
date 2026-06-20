@@ -38,10 +38,7 @@ pub trait DnsProvider: Send + Sync {
 }
 
 /// Construct a `DnsProvider` from its config-time description.
-/// The mapping is exhaustive over `DnsProviderConfig`; Route53 is
-/// only present when the binary was built with `--features
-/// dns-route53` -- otherwise we return a parse-time error so
-/// operators get a clear "rebuild with the feature" message.
+/// The mapping is exhaustive over `DnsProviderConfig`.
 pub fn build(cfg: &DnsProviderConfig) -> Result<Arc<dyn DnsProvider>> {
     match cfg {
         DnsProviderConfig::AcmeDns {
@@ -67,15 +64,6 @@ pub fn build(cfg: &DnsProviderConfig) -> Result<Arc<dyn DnsProvider>> {
                 args: args.clone(),
             }))
         }
-        #[cfg(feature = "dns-route53")]
-        DnsProviderConfig::Route53 { hosted_zone_id } => Ok(Arc::new(
-            Route53Provider::new(hosted_zone_id.clone())?,
-        )),
-        #[cfg(not(feature = "dns-route53"))]
-        DnsProviderConfig::Route53 { .. } => Err(anyhow!(
-            "dns-provider \"route53\" is unavailable in this build; \
-             rebuild with `cargo build --features dns-route53`"
-        )),
     }
 }
 
@@ -333,106 +321,6 @@ impl DnsProvider for ExecProvider {
     }
 }
 
-// ---------------------------------------------------------------
-// Route 53.  Uses the AWS SDK; gated behind the dns-route53 Cargo
-// feature so the default binary stays slim.
-// ---------------------------------------------------------------
-
-#[cfg(feature = "dns-route53")]
-struct Route53Provider {
-    hosted_zone_id: String,
-    client: tokio::sync::OnceCell<aws_sdk_route53::Client>,
-}
-
-#[cfg(feature = "dns-route53")]
-impl Route53Provider {
-    fn new(hosted_zone_id: String) -> Result<Self> {
-        Ok(Route53Provider {
-            hosted_zone_id,
-            client: tokio::sync::OnceCell::new(),
-        })
-    }
-
-    async fn client(&self) -> &aws_sdk_route53::Client {
-        self.client
-            .get_or_init(|| async {
-                // Route 53 is a global service; the SDK still needs
-                // a region but us-east-1 is the conventional choice
-                // for the global endpoint.
-                let cfg = aws_config::defaults(
-                    aws_config::BehaviorVersion::latest(),
-                )
-                .region(aws_config::Region::new("us-east-1"))
-                .load()
-                .await;
-                aws_sdk_route53::Client::new(&cfg)
-            })
-            .await
-    }
-
-    async fn change(
-        &self,
-        action: aws_sdk_route53::types::ChangeAction,
-        fqdn: &str,
-        value: &str,
-    ) -> Result<()> {
-        use aws_sdk_route53::types::{
-            Change, ChangeBatch, ResourceRecord, ResourceRecordSet, RrType,
-        };
-        let rec = ResourceRecord::builder()
-            // TXT record values must be wrapped in literal quotes.
-            .value(format!("\"{value}\""))
-            .build()
-            .map_err(|e| anyhow!("building Route53 record: {e}"))?;
-        let rrs = ResourceRecordSet::builder()
-            .name(fqdn)
-            .r#type(RrType::Txt)
-            .ttl(60)
-            .resource_records(rec)
-            .build()
-            .map_err(|e| anyhow!("building Route53 rrset: {e}"))?;
-        let change = Change::builder()
-            .action(action)
-            .resource_record_set(rrs)
-            .build()
-            .map_err(|e| anyhow!("building Route53 change: {e}"))?;
-        let batch = ChangeBatch::builder()
-            .changes(change)
-            .build()
-            .map_err(|e| anyhow!("building Route53 batch: {e}"))?;
-        self.client()
-            .await
-            .change_resource_record_sets()
-            .hosted_zone_id(&self.hosted_zone_id)
-            .change_batch(batch)
-            .send()
-            .await
-            .map_err(|e| anyhow!("Route53 change failed: {e}"))?;
-        Ok(())
-    }
-}
-
-#[cfg(feature = "dns-route53")]
-#[async_trait]
-impl DnsProvider for Route53Provider {
-    async fn set_txt(&self, fqdn: &str, value: &str) -> Result<()> {
-        self.change(
-            aws_sdk_route53::types::ChangeAction::Upsert,
-            fqdn,
-            value,
-        )
-        .await
-    }
-    async fn clear_txt(&self, fqdn: &str, value: &str) -> Result<()> {
-        self.change(
-            aws_sdk_route53::types::ChangeAction::Delete,
-            fqdn,
-            value,
-        )
-        .await
-    }
-}
-
 /// Default propagation wait after `set_txt` succeeds.  RFC 8555
 /// recommends that clients wait until the resolver they expect the
 /// ACME server to use has caught up; in practice 30 s covers most
@@ -577,18 +465,4 @@ mod tests {
         assert!(err.contains("spawning DNS exec hook"), "got: {err}");
     }
 
-    #[cfg(not(feature = "dns-route53"))]
-    #[test]
-    fn build_route53_without_feature_errors() {
-        let cfg = DnsProviderConfig::Route53 {
-            hosted_zone_id: "Z".into(),
-        };
-        // dyn DnsProvider is not Debug, so unwrap_err can't print
-        // it; pattern-match instead.
-        let err = match build(&cfg) {
-            Ok(_) => panic!("expected error, got Ok"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("dns-route53"), "got: {err}");
-    }
 }

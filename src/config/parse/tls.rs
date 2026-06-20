@@ -354,7 +354,7 @@ fn parse_dns_provider(
     let kind = req_arg_str(node, 0).with_context(|| {
         format!(
             "{name}:{line}: 'dns-provider' takes a kind argument \
-             (\"acme-dns\", \"cloudflare\", \"route53\", or \"exec\")"
+             (\"acme-dns\", \"cloudflare\", or \"exec\")"
         )
     })?;
     let need = |k: &str| -> anyhow::Result<String> {
@@ -376,9 +376,6 @@ fn parse_dns_provider(
             zone_id: need("zone-id")?,
             api_token: need("api-token")?,
         },
-        "route53" => DnsProviderConfig::Route53 {
-            hosted_zone_id: need("hosted-zone-id")?,
-        },
         "exec" => {
             let program = need("program")?;
             // `arg "..."` repeating single-argument children carry
@@ -397,7 +394,7 @@ fn parse_dns_provider(
         }
         other => bail!(
             "{name}:{line}: unknown dns-provider {other:?}; expected \
-             \"acme-dns\", \"cloudflare\", \"route53\", or \"exec\""
+             \"acme-dns\", \"cloudflare\", or \"exec\""
         ),
     };
     Ok(Some(cfg))

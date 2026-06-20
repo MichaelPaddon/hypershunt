@@ -186,18 +186,6 @@ pub enum DnsProviderConfig {
         zone_id: String,
         api_token: String,
     },
-    /// AWS Route 53 via the AWS SDK; credentials come from the
-    /// standard AWS provider chain (env vars, ~/.aws/credentials,
-    /// instance role).  The hosted zone is looked up by ID.
-    Route53 {
-        // Read by `dns_provider::build` only when the `dns-route53`
-        // Cargo feature is enabled; otherwise the variant fails at
-        // build-time with a clear error.  Keep the field on the config
-        // type so the parser can still accept and validate Route53
-        // entries on a stock build.
-        #[allow(dead_code)]
-        hosted_zone_id: String,
-    },
     /// Run an external command with the FQDN and TXT value in env
     /// vars.  Always available; useful for any provider not built in.
     Exec {

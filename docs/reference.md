@@ -1569,9 +1569,9 @@ is set, a [`dns-provider`](#dns-provider) child is required.
 
 Names the plugin used to write `_acme-challenge.<domain>` TXT
 records during the DNS-01 challenge.  The positional argument is
-the provider kind: `"acme-dns"`, `"cloudflare"`, `"route53"`, or
-`"exec"`.  The Route 53 provider requires building hypershunt with the
-`dns-route53` Cargo feature.
+the provider kind: `"acme-dns"`, `"cloudflare"`, or `"exec"`.  Any
+DNS host without a built-in provider (Route 53, Google Cloud DNS,
+an RFC 2136 server, ...) is driven through `"exec"`.
 
 ###### acme-dns
 
@@ -1589,12 +1589,6 @@ dns-provider "acme-dns" api-url="https://acme-dns.internal" \
 **Variant** of [`dns-provider`](#dns-provider) for Cloudflare DNS.
 Required properties: `zone-id=`, `api-token=` (a scoped token with
 `Zone:DNS:Edit` is recommended over a global key).
-
-###### route53
-
-**Variant** of [`dns-provider`](#dns-provider) for AWS Route 53.
-Required property: `hosted-zone-id=`.  Credentials are read from
-the usual AWS chain (environment, profile, IMDS).
 
 ###### exec
 
