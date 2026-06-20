@@ -720,6 +720,27 @@ mod tests {
         map
     }
 
+    // The PAM call itself needs a live service + privileges, so the
+    // authenticate/acct_mgmt path is covered by the container
+    // integration suite (suite_auth.sh).  Here we only verify the guard
+    // that short-circuits to Anonymous before any PAM call.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pam_no_auth_header_is_anonymous() {
+        let auth = PamAuthenticator::new("hypershunt-nonexistent");
+        let p = auth.authenticate(&hyper::HeaderMap::new()).await;
+        assert!(matches!(p, Principal::Anonymous));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pam_non_basic_scheme_is_anonymous() {
+        let auth = PamAuthenticator::new("hypershunt-nonexistent");
+        let h = headers_with_auth("Bearer some.jwt.token");
+        let p = auth.authenticate(&h).await;
+        assert!(matches!(p, Principal::Anonymous));
+    }
+
     #[test]
     fn parse_basic_auth_valid() {
         // "user:pass" base64-encodes to "dXNlcjpwYXNz"

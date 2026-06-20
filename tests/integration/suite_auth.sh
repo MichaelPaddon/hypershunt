@@ -52,6 +52,71 @@ EOF
         -u "hypershunttest:wrongpassword"
 
     stop_server
+
+    # -- acct_mgmt enforcement (pam-client2 migration) --
+    # The migration calls acct_mgmt() after authenticate().  Prove it is
+    # enforced with two PAM services that AUTHENTICATE identically
+    # (pam_permit) and differ ONLY in their account stack: a permitting
+    # account yields 200, a denying account yields 401.  Same user, same
+    # password -> the account stack is the sole differentiator.  The old
+    # `pam` crate skipped acct_mgmt and would have allowed both.
+    if [ -d /etc/pam.d ]; then
+        printf 'auth required pam_permit.so\naccount required pam_permit.so\n' \
+            >/etc/pam.d/hypershunt-permit
+        printf 'auth required pam_permit.so\naccount required pam_deny.so\n' \
+            >/etc/pam.d/hypershunt-acct-deny
+
+        cat >"$TMPDIR/pam_permit.kdl" <<'EOF'
+server { auth "pam" service="hypershunt-permit" }
+listener "tcp://127.0.0.1:8084"
+vhost localhost {
+    location "/" {
+        static root="/tmp/www" {
+index-file index.html;
+}
+        basic-auth realm="Permit"
+        policy {
+            allow authenticated
+            deny code=401
+        }
+    }
+}
+EOF
+        if start_server "$TMPDIR/pam_permit.kdl" 8084; then
+            # auth permits + account permits -> authenticated -> 200.
+            # (hypershunttest exists, so group lookup succeeds.)
+            assert_status "auth/acct_mgmt_permit_200" 200 \
+                "http://127.0.0.1:8084/" -u "hypershunttest:anything"
+            stop_server
+        else
+            fail "auth/acct_permit_start" "hypershunt failed"
+        fi
+
+        cat >"$TMPDIR/pam_acct_deny.kdl" <<'EOF'
+server { auth "pam" service="hypershunt-acct-deny" }
+listener "tcp://127.0.0.1:8085"
+vhost localhost {
+    location "/" {
+        static root="/tmp/www" {
+index-file index.html;
+}
+        basic-auth realm="AcctDeny"
+        policy {
+            allow authenticated
+            deny code=401
+        }
+    }
+}
+EOF
+        if start_server "$TMPDIR/pam_acct_deny.kdl" 8085; then
+            # auth permits but account denies -> acct_mgmt() fails -> 401.
+            assert_status "auth/acct_mgmt_deny_401" 401 \
+                "http://127.0.0.1:8085/" -u "hypershunttest:anything"
+            stop_server
+        else
+            fail "auth/acct_deny_start" "hypershunt failed"
+        fi
+    fi
 }
 
 suite_ldap_auth() {
