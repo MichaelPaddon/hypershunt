@@ -6,7 +6,8 @@
 // JWT, proxy/CGI/FastCGI/SCGI, etc.) work identically over HTTP/3.
 
 use super::{
-    HypershuntService, AppState, DRAIN_TIMEOUT, PeerAddr, SharedAppState,
+    DEFAULT_HEADER_TIMEOUT_SECS, DRAIN_TIMEOUT, HypershuntService, AppState,
+    PeerAddr, SharedAppState,
 };
 use crate::config::{ListenerConfig, Timeouts};
 use crate::error::{BoxBody, ReqBody, response_413};
@@ -409,10 +410,26 @@ async fn handle_h3_request(
         .quic_requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let (req_head, req_stream) = resolver
-        .resolve_request()
+    // Bound the time spent reading the request headers so a client can't
+    // pin an h3 request stream open mid-headers (Slowloris).  Mirrors
+    // HTTP/1's `header_read_timeout`; the QUIC max-idle-timeout only
+    // catches whole-connection silence, not a slow drip that keeps the
+    // connection alive.  `request-header=0` disables it.
+    let header_secs = timeouts
+        .request_header_secs
+        .unwrap_or(DEFAULT_HEADER_TIMEOUT_SECS);
+    let resolve = resolver.resolve_request();
+    let (req_head, req_stream) = if header_secs > 0 {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(header_secs),
+            resolve,
+        )
         .await
-        .map_err(|e| anyhow!("h3 resolve: {e}"))?;
+        .map_err(|_| anyhow!("h3 request-header timeout"))?
+        .map_err(|e| anyhow!("h3 resolve: {e}"))?
+    } else {
+        resolve.await.map_err(|e| anyhow!("h3 resolve: {e}"))?
+    };
 
     let (mut send_half, recv_half) = req_stream.split();
 

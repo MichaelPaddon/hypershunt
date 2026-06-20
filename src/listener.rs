@@ -28,7 +28,7 @@ mod datagram;
 pub use datagram::run_dgram_proxy;
 
 mod service;
-pub(super) use service::HypershuntService;
+pub(super) use service::{FirstRequest, HypershuntService};
 
 mod socket;
 pub use socket::{BoundSocket, LocalAddr, LocalUnixPath, bind_socket};
