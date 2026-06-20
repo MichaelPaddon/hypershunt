@@ -12,7 +12,7 @@
 </div>
 
 > **Status:** release-candidate — approaching 1.0 (currently
-> 1.0.0-rc17).  The config format is stable; no breaking changes are
+> 1.0.0-rc18).  The config format is stable; no breaking changes are
 > expected before 1.0.
 
 hypershunt puts the whole serving stack in one coherent place: a
