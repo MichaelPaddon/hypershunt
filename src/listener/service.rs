@@ -37,8 +37,9 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 // Wraps the per-request authenticator so it implements AuthProvider
 // for the access evaluator (which doesn't know about hyper::Request).
@@ -57,6 +58,37 @@ impl AuthProvider for RequestAuthProvider<'_> {
             return Principal::Authenticated(id.clone());
         }
         self.authenticator.authenticate(self.headers).await
+    }
+}
+
+/// Per-connection signal raised the first time the service dispatches a
+/// request.  The connection-serve loop uses it to lift its
+/// time-to-first-request header timeout: HTTP/1 has hyper's per-request
+/// `header_read_timeout`, but the auto builder offers no per-stream header
+/// timeout for HTTP/2, so this bounds the accept->first-request window
+/// (Slowloris guard) and is then disarmed so idle keep-alive survives.
+#[derive(Default)]
+pub(crate) struct FirstRequest {
+    seen: AtomicBool,
+    notify: Notify,
+}
+
+impl FirstRequest {
+    /// Mark the first request as received (idempotent).
+    pub(super) fn signal(&self) {
+        if !self.seen.swap(true, Ordering::Relaxed) {
+            // `notify_one` leaves a permit even if no waiter is parked
+            // yet, so `wait` below cannot miss this wakeup.
+            self.notify.notify_one();
+        }
+    }
+
+    /// Resolve once the first request has been dispatched.
+    pub(super) async fn wait(&self) {
+        if self.seen.load(Ordering::Relaxed) {
+            return;
+        }
+        self.notify.notified().await;
     }
 }
 
@@ -88,6 +120,9 @@ pub struct HypershuntService {
     // None for plaintext listeners and for TLS connections that did not
     // present a verified cert (only possible in `mode "optional"`).
     pub(super) client_cert: Option<Arc<crate::cert::mtls::ClientCertIdentity>>,
+    // Per-connection first-request signal; shared with the connection
+    // loop so it can lift its time-to-first-request header timeout.
+    pub(super) first_request: Arc<FirstRequest>,
 }
 
 impl hyper::service::Service<Request<Incoming>> for HypershuntService {
@@ -99,6 +134,9 @@ impl hyper::service::Service<Request<Incoming>> for HypershuntService {
     >;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
+        // Release the connection's time-to-first-request header timeout:
+        // headers are fully parsed by the time hyper hands us a request.
+        self.first_request.signal();
         // Detect h1 / h2 upgrade *before* we lose the hyper-native
         // Incoming body: `hyper::upgrade::on(&mut req)` snips the
         // upgrade future out, which can't be done once the body has
@@ -1008,6 +1046,7 @@ impl HypershuntService {
             // trust + revocation at handshake, but the per-request Principal
             // stays Anonymous on this transport for v1.
             client_cert: None,
+            first_request: Arc::new(FirstRequest::default()),
         }
     }
 }
@@ -1121,9 +1160,56 @@ fn record_compression(
 
 #[cfg(test)]
 mod tests {
+    use super::FirstRequest;
     use super::presented_credentials;
     use hyper::HeaderMap;
     use hyper::header::{AUTHORIZATION, COOKIE, HeaderValue};
+
+    #[tokio::test]
+    async fn first_request_signal_before_wait_returns_immediately() {
+        let fr = FirstRequest::default();
+        fr.signal();
+        // Already signalled: wait must resolve without blocking.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            fr.wait(),
+        )
+        .await
+        .expect("wait() should return immediately after signal()");
+    }
+
+    #[tokio::test]
+    async fn first_request_wait_then_signal_wakes() {
+        let fr = std::sync::Arc::new(FirstRequest::default());
+        let fr2 = fr.clone();
+        let waiter = tokio::spawn(async move { fr2.wait().await });
+        // Give the waiter a moment to park on the notify, then signal.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        fr.signal();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should wake after signal()")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_request_wait_blocks_until_signalled() {
+        let fr = FirstRequest::default();
+        // Never signalled: wait must not resolve.
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            fr.wait(),
+        )
+        .await;
+        assert!(r.is_err(), "wait() resolved without a signal");
+    }
+
+    #[test]
+    fn first_request_signal_is_idempotent() {
+        let fr = FirstRequest::default();
+        fr.signal();
+        fr.signal(); // second call must not panic or double-permit
+    }
 
     #[test]
     fn authorization_header_counts_as_credentials() {

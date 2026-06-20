@@ -194,6 +194,94 @@
         );
     }
 
+    // An HTTP/2 connection that completes the protocol handshake but never
+    // sends a request must be dropped by the time-to-first-request header
+    // guard.  hyper exposes no per-stream header timeout for h2, so this
+    // connection-level bound is the protection; h1's header_read_timeout
+    // does not apply once the peer has committed to h2.
+    #[tokio::test]
+    async fn request_header_timeout_drops_stalled_h2_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let tokio_listener =
+            tokio::net::TcpListener::from_std(listener).unwrap();
+
+        let cfg = Config::parse(
+            r#"
+            listener "tcp://0.0.0.0:0" { timeouts request-header=1 }
+            vhost "x" { location "/" { static root="/tmp" } }
+            "#,
+        )
+        .unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let summary = Arc::new(
+            crate::handler::status::ServerSummary::from_config(&cfg),
+        );
+        let router =
+            Arc::new(Router::new(&cfg, &metrics, &summary, None).unwrap());
+        let state = Arc::new(AppState {
+            router,
+            acme_challenges: Default::default(),
+            authenticator: Arc::new(AnonymousAuthenticator),
+            metrics,
+            geoip: None,
+            health: std::sync::Arc::new(
+                crate::handler::health::HealthState::disabled(),
+            ),
+            error_pages: Arc::new(ErrorPages::new(HashMap::new())),
+            jwt_manager: None,
+            oidc: None,
+            access_log: Arc::new(
+                crate::access_log::AccessLogger::tracing_default(),
+            ),
+        });
+        let lcfg = cfg.listeners.into_iter().next().unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        tokio::spawn(run_plain(
+            lcfg,
+            BoundSocket::Tcp(tokio_listener),
+            Arc::new(ArcSwap::from(state)),
+            shutdown_rx,
+            stop_rx,
+        ));
+
+        let mut sock =
+            tokio::net::TcpStream::connect(addr).await.unwrap();
+        // HTTP/2 client preface + an empty SETTINGS frame: enough for the
+        // auto builder to commit to h2 and sit waiting for a request, so
+        // the eventual close is attributable to the first-request guard.
+        sock.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        sock.write_all(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+            .await
+            .unwrap();
+        // Never send HEADERS.  request-header=1 means the server must
+        // drop us within ~1s; drain any handshake bytes until EOF/reset.
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            async {
+                let mut buf = [0u8; 256];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break, // EOF or reset = closed
+                        Ok(_) => continue,       // hyper SETTINGS/ack
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "stalled h2 connection was not closed within 8s; \
+             the request-header guard did not fire"
+        );
+    }
+
     // -- AppState snapshot semantics ---
 
     // A connection task that captured the old Arc<AppState> at accept

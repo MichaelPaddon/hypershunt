@@ -1877,6 +1877,20 @@ Defends against Slowloris-style header drip.
 
 **Default:** `30`.  `0` means "unlimited".
 
+How it applies differs by protocol:
+
+- **HTTP/1.1** — enforced per request: every request's headers must
+  arrive within the window.
+- **HTTP/2** — enforced as a per-connection *time-to-first-request*
+  bound: a connection that never completes a request's headers within
+  the window is dropped.  Once the first request is dispatched the
+  bound is lifted so idle keep-alive between streams is unaffected;
+  hyper exposes no per-stream header timeout, so later streams on an
+  established connection are not individually bounded.
+- **HTTP/3** — enforced per request header read.  HTTP/3 connections
+  are additionally bounded by the QUIC
+  [`max-idle-timeout`](#quic-transport).
+
 ##### handler
 
 **Property** on [`timeouts`](#timeouts).  Optional integer.

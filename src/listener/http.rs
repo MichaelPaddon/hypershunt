@@ -9,7 +9,8 @@
 
 use super::socket::{BoundSocket, apply_proxy_proto};
 use super::{
-    HypershuntService, DEFAULT_HEADER_TIMEOUT_SECS, PeerAddr, SharedAppState,
+    DEFAULT_HEADER_TIMEOUT_SECS, FirstRequest, HypershuntService, PeerAddr,
+    SharedAppState,
     TLS_HANDSHAKE_TIMEOUT, drain_connections,
 };
 use crate::config::{ListenerConfig, Timeouts};
@@ -141,6 +142,7 @@ pub async fn run_plain(
                                 max_body_bytes: max_body,
                                 auto_alt_svc: alt_svc,
                                 client_cert: None,
+                                first_request: Arc::new(FirstRequest::default()),
                             };
                             serve_connection(
                                 io, svc, conn_shutdown, peer_addr,
@@ -314,6 +316,7 @@ pub async fn run_tls(
                                 max_body_bytes: max_body,
                                 auto_alt_svc: alt_svc,
                                 client_cert,
+                                first_request: Arc::new(FirstRequest::default()),
                             };
                             serve_connection(
                                 io, svc, conn_shutdown, peer_addr,
@@ -385,6 +388,20 @@ async fn serve_connection<I>(
     let _conn_guard = HttpConnGuard(svc.state.metrics.clone());
     debug!(%peer_addr, "accepted connection");
     let builder = make_builder(&svc.timeouts);
+    // Bound the accept->first-request window so a peer can't hold a
+    // connection open without ever completing a request's headers
+    // (Slowloris).  HTTP/1 also has hyper's per-request
+    // `header_read_timeout`; this additionally covers HTTP/2, for which
+    // the auto builder exposes no per-stream header timeout.  The guard
+    // is disarmed once the first request is dispatched, so legitimate
+    // idle keep-alive between streams is unaffected.  `request-header=0`
+    // disables it.  Limitation: on HTTP/2 this bounds only the first
+    // request per connection, not every subsequent stream.
+    let header_secs = svc
+        .timeouts
+        .request_header_secs
+        .unwrap_or(DEFAULT_HEADER_TIMEOUT_SECS);
+    let first_request = svc.first_request.clone();
     // `serve_connection_with_upgrades` is the variant that keeps
     // the underlying IO alive across a 101 / extended-CONNECT
     // handoff -- without this any request the service decides to
@@ -392,7 +409,26 @@ async fn serve_connection<I>(
     let conn = builder.serve_connection_with_upgrades(io, svc);
     tokio::pin!(conn);
 
+    // Resolves to `true` if the window elapsed before the first request,
+    // `false` once the first request arrives in time (or immediately when
+    // the timeout is disabled).
+    let header_guard = async {
+        if header_secs == 0 {
+            first_request.wait().await;
+            false
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(header_secs),
+                first_request.wait(),
+            )
+            .await
+            .is_err()
+        }
+    };
+    tokio::pin!(header_guard);
+
     let mut graceful = false;
+    let mut first_seen = false;
     loop {
         tokio::select! {
             result = conn.as_mut() => {
@@ -400,6 +436,18 @@ async fn serve_connection<I>(
                     debug!(%peer_addr, "connection closed: {e}");
                 }
                 break;
+            }
+            // Drop the connection if no request completes its headers in
+            // time.  Disarmed after the first request (or once it fires).
+            timed_out = header_guard.as_mut(), if !first_seen => {
+                first_seen = true;
+                if timed_out {
+                    debug!(
+                        %peer_addr,
+                        "request-header timeout before first request"
+                    );
+                    break;
+                }
             }
             // Only arm this branch until we've initiated shutdown once.
             _ = shutdown.changed(), if !graceful => {
