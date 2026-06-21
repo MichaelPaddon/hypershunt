@@ -12,7 +12,8 @@ a **draft** GitHub Release.  The maintainer's job is therefore small:
 
 1. Bump the version and commit it.
 2. Tag and push.
-3. Review and publish the draft Release that CI created.
+3. Review and publish the draft Release that CI created, and publish the
+   crate to crates.io.
 
 ## Versioning
 
@@ -97,6 +98,17 @@ Markdown mirror is stale and was not rebuilt + committed.
 Once the workflow finishes, the container images are already live on
 `ghcr.io`.  Open the **draft** GitHub Release, review the generated notes
 and attached assets, and publish it to finalize.
+
+Then publish the crate to crates.io (one-time `cargo login` with an API
+token from <https://crates.io/me> first):
+
+```sh
+cargo publish --dry-run    # verification build; inspect the file list
+cargo publish              # immutable — versions can be yanked, never deleted
+```
+
+Do this only after the GitHub Release is published, so the git tag the
+crate's `repository` points at already exists.
 
 ## Local packaging (optional)
 
