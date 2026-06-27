@@ -993,4 +993,52 @@ mod tests {
         // The entry is retained (not dropped) for the fallback.
         assert!(s.get("k").is_some());
     }
+
+    #[test]
+    fn evaluate_parses_stale_windows() {
+        let p = policy(60, 1024);
+        let d = p
+            .evaluate(
+                StatusCode::OK,
+                &hmap(&[(
+                    "cache-control",
+                    "max-age=10, stale-while-revalidate=30, \
+                     stale-if-error=120",
+                )]),
+                &HeaderMap::new(),
+            )
+            .expect("cacheable");
+        assert_eq!(d.swr, Duration::from_secs(30));
+        assert_eq!(d.sie, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn request_cache_control_parses_directives() {
+        let cc = RequestCacheControl::parse(&hmap(&[(
+            "cache-control",
+            "no-store, max-age=5, min-fresh=10, only-if-cached",
+        )]));
+        assert!(cc.no_store);
+        assert!(cc.only_if_cached);
+        assert!(!cc.no_cache);
+        assert_eq!(cc.max_age, Some(5));
+        assert_eq!(cc.min_fresh, Some(10));
+        // Bare `max-stale` accepts any staleness; valued is bounded.
+        assert_eq!(
+            RequestCacheControl::parse(&hmap(&[(
+                "cache-control",
+                "max-stale"
+            )]))
+            .max_stale,
+            Some(None)
+        );
+        assert_eq!(
+            RequestCacheControl::parse(&hmap(&[(
+                "cache-control",
+                "max-stale=60"
+            )]))
+            .max_stale,
+            Some(Some(60))
+        );
+    }
 }

@@ -245,6 +245,15 @@ class H(BaseHTTPRequestHandler):
                       [("ETag", '"w%d"' % n),
                        ("Cache-Control",
                         "max-age=1, stale-while-revalidate=60")])
+        elif p == "/short":
+            # Short freshness, no validator and no stale windows.
+            n = bump("short")
+            self.send(200, ("[count=%d]" % n).encode(),
+                      [("Cache-Control", "max-age=1")])
+        elif p == "/ma":
+            n = bump("ma")
+            self.send(200, ("[count=%d]" % n).encode(),
+                      [("Cache-Control", "max-age=300")])
         else:
             self.send(200, b"ok", [("Cache-Control", "no-store")])
     def log_message(self, *a):
@@ -293,6 +302,201 @@ EOF
     assert_body "cache/swr_serves_stale" "[count=1]" "$base/swr"
     sleep 1
     assert_body "cache/swr_refreshed" "[count=2]" "$base/swr"
+
+    # only-if-cached HIT: /h is already cached, so it is served (not 504).
+    assert_body "cache/only_if_cached_hit" "[count=1]" "$base/h" \
+        -H "Cache-Control: only-if-cached"
+
+    # max-stale: a stale entry (no validator, no stale windows) is served
+    # only because the client opted into staleness.
+    assert_body "cache/maxstale_store" "[count=1]" "$base/short"
+    sleep 2
+    assert_body "cache/maxstale_serves_stale" "[count=1]" "$base/short" \
+        -H "Cache-Control: max-stale=60"
+
+    # Client max-age=0 forces a refetch of an entry older than 0s.  (A
+    # zero-age entry would satisfy max-age=0, so let it age first.)
+    assert_body "cache/ma_store" "[count=1]" "$base/ma"
+    assert_body "cache/ma_hit" "[count=1]" "$base/ma"
+    sleep 1
+    assert_body "cache/client_maxage_refetch" "[count=2]" "$base/ma" \
+        -H "Cache-Control: max-age=0"
+
+    stop_server
+}
+
+# Static-file caching: prove the response is served from memory, not
+# re-read from disk, by mutating the file and still getting the old body.
+suite_cache_static() {
+    echo "=== Cache: static file served from memory ==="
+    local hport=8309
+    local root="$TMPDIR/cstatic"
+    mkdir -p "$root"
+    printf 'alpha' >"$root/data.txt"
+
+    cat >"$TMPDIR/cstatic.kdl" <<EOF
+server { cache max-size=1048576 }
+listener "tcp://127.0.0.1:$hport"
+vhost localhost {
+    location "/" { cache ttl=300; static root="$root" }
+}
+EOF
+    start_server "$TMPDIR/cstatic.kdl" "$hport" \
+        || { fail "cstatic/server_start" "hypershunt failed"; return; }
+    local base="http://127.0.0.1:$hport"
+
+    assert_body "cache/static_store" "alpha" "$base/data.txt"
+    # Mutate the file; a working cache still serves the old body.
+    printf 'bravo' >"$root/data.txt"
+    assert_body "cache/static_served_from_cache" "alpha" "$base/data.txt"
+
+    stop_server
+}
+
+# Negative caching (404), HEAD caching, POST bypass, and key templating.
+suite_cache_extras() {
+    echo "=== Cache: 404 / HEAD / POST / key template ==="
+    local hport=8310 bport=9310
+
+    python3 - "$bport" <<'PYEOF' >/dev/null 2>&1 &
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+counts = {}
+def bump(k):
+    counts[k] = counts.get(k, 0) + 1
+    return counts[k]
+class H(BaseHTTPRequestHandler):
+    def out(self, code, body, headers, with_body=True):
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        if with_body:
+            self.wfile.write(body)
+    def do_GET(self):
+        p = self.path.split("?")[0]
+        if p == "/nf":
+            n = bump("nf")
+            self.out(404, ("[count=%d]" % n).encode(),
+                     [("Cache-Control", "max-age=300")])
+        elif p.startswith("/key"):
+            n = bump("key")
+            self.out(200, ("[count=%d]" % n).encode(),
+                     [("Cache-Control", "max-age=300")])
+        else:
+            n = bump("c")
+            self.out(200, ("[count=%d]" % n).encode(),
+                     [("Cache-Control", "max-age=300")])
+    def do_HEAD(self):
+        n = bump("head")
+        self.out(200, ("[count=%d]" % n).encode(),
+                 [("Cache-Control", "max-age=300")], with_body=False)
+    def do_POST(self):
+        length = int(self.headers.get("content-length", 0))
+        self.rfile.read(length)
+        n = bump("post")
+        self.out(200, ("[count=%d]" % n).encode(),
+                 [("Cache-Control", "max-age=300")])
+    def log_message(self, *a):
+        pass
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PYEOF
+    BACKEND_PIDS+=("$!")
+    sleep 0.3
+
+    cat >"$TMPDIR/cextras.kdl" <<EOF
+server { cache max-size=1048576 }
+listener "tcp://127.0.0.1:$hport"
+vhost localhost {
+    location "/key/" {
+        cache ttl=300 key="{host}{path}"
+        proxy { upstream "http://127.0.0.1:$bport" }
+    }
+    location "/" {
+        cache ttl=300 { method "GET"; method "HEAD" }
+        proxy { upstream "http://127.0.0.1:$bport" }
+    }
+}
+EOF
+    start_server "$TMPDIR/cextras.kdl" "$hport" \
+        || { fail "cextras/server_start" "hypershunt failed"; return; }
+    local base="http://127.0.0.1:$hport"
+
+    # Negative caching: a 404 is cached, so the origin is hit once.
+    assert_body "cache/neg_store" "[count=1]" "$base/nf"
+    assert_status "cache/neg_404" 404 "$base/nf"
+    assert_body "cache/neg_cached" "[count=1]" "$base/nf"
+
+    # HEAD caching: the HEAD response is stored, so its Age grows on a
+    # second HEAD (curl -I sends HEAD).
+    curl -sI "$base/c" >/dev/null 2>&1
+    sleep 1
+    assert_header "cache/head_cached_age_grows" "age" "[1-9]" \
+        "$base/c" -I
+
+    # POST bypass: a non-cacheable method never hits the cache, so the
+    # origin counter advances on every request.
+    assert_body "cache/post_1" "[count=1]" "$base/c" -X POST --data x
+    assert_body "cache/post_2" "[count=2]" "$base/c" -X POST --data x
+
+    # Key template: key="{host}{path}" folds the query string, so two
+    # URLs that differ only in their query share one cache entry.
+    assert_body "cache/key_store" "[count=1]" "$base/key/x?a=1"
+    assert_body "cache/key_folds_query" "[count=1]" "$base/key/x?b=2"
+
+    stop_server
+}
+
+# Cached entries survive a SIGHUP config reload (the store is carried
+# forward across the AppState swap).
+suite_cache_reload() {
+    echo "=== Cache: entries survive SIGHUP reload ==="
+    local hport=8311 bport=9311
+
+    python3 - "$bport" <<'PYEOF' >/dev/null 2>&1 &
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+counts = {}
+def bump(k):
+    counts[k] = counts.get(k, 0) + 1
+    return counts[k]
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        n = bump("r")
+        body = ("[count=%d]" % n).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=300")
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PYEOF
+    BACKEND_PIDS+=("$!")
+    sleep 0.3
+
+    cat >"$TMPDIR/creload.kdl" <<EOF
+server { cache max-size=1048576 }
+listener "tcp://127.0.0.1:$hport"
+vhost localhost {
+    location "/" {
+        cache ttl=300
+        proxy { upstream "http://127.0.0.1:$bport" }
+    }
+}
+EOF
+    start_server "$TMPDIR/creload.kdl" "$hport" \
+        || { fail "creload/server_start" "hypershunt failed"; return; }
+    local base="http://127.0.0.1:$hport"
+
+    assert_body "cache/reload_store" "[count=1]" "$base/r"
+    # Reload the (unchanged) config; the shared store is carried forward,
+    # so the entry survives and the origin is not hit again.
+    kill -HUP "$HYPERSHUNT_PID" 2>/dev/null || true
+    sleep 0.3
+    assert_body "cache/reload_survives" "[count=1]" "$base/r"
 
     stop_server
 }
