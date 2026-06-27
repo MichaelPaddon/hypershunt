@@ -15,5 +15,5 @@ mod key;
 mod policy;
 mod store;
 
-pub use policy::CachePolicy;
-pub use store::{CacheStore, spawn_cache_eviction_task};
+pub use policy::{CachePolicy, Lookup};
+pub use store::{CacheStore, FetchRole, spawn_cache_eviction_task};

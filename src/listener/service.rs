@@ -907,43 +907,179 @@ impl HypershuntService {
                             });
                         let mut resp = if let Some((store, policy)) = cache
                         {
+                            use std::sync::atomic::Ordering::Relaxed;
                             let now = std::time::Instant::now();
                             let key = policy.build_key(&req_ctx);
-                            if let Some(hit) = policy.lookup(
+                            match policy.lookup(
                                 store,
-                                &state.metrics,
                                 &key,
                                 req.headers(),
                                 now,
                             ) {
-                                hit
-                            } else {
-                                state.metrics.cache_misses.fetch_add(
-                                    1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                // Snapshot request headers before the
-                                // handler consumes `req`; the store path
-                                // needs them for Vary capture.
-                                let req_headers = req.headers().clone();
-                                let raw = route
-                                    .handler
-                                    .handle(
-                                        req,
-                                        &route.matched_prefix,
-                                        &req_ctx,
-                                    )
-                                    .await;
-                                policy
-                                    .maybe_store(
-                                        store,
-                                        &state.metrics,
-                                        key,
-                                        &req_headers,
-                                        raw,
-                                        now,
-                                    )
-                                    .await
+                                crate::cache::Lookup::Hit(hit) => {
+                                    state
+                                        .metrics
+                                        .cache_hits
+                                        .fetch_add(1, Relaxed);
+                                    hit
+                                }
+                                crate::cache::Lookup::Miss => {
+                                    // Single-flight: only the first
+                                    // request for a key fetches from the
+                                    // origin; concurrent misses wait and
+                                    // then serve the leader's stored
+                                    // response, so a slow backend isn't
+                                    // stampeded.
+                                    match store.begin_fetch(&key) {
+                                        crate::cache::FetchRole::Leader(
+                                            _lead,
+                                        ) => {
+                                            state
+                                                .metrics
+                                                .cache_misses
+                                                .fetch_add(1, Relaxed);
+                                            let req_headers =
+                                                req.headers().clone();
+                                            let raw = route
+                                                .handler
+                                                .handle(
+                                                    req,
+                                                    &route.matched_prefix,
+                                                    &req_ctx,
+                                                )
+                                                .await;
+                                            policy
+                                                .maybe_store(
+                                                    store,
+                                                    &state.metrics,
+                                                    key,
+                                                    &req_headers,
+                                                    raw,
+                                                    now,
+                                                )
+                                                .await
+                                            // `_lead` drops here, waking
+                                            // any followers.
+                                        }
+                                        crate::cache::FetchRole::Follower(
+                                            mut rx,
+                                        ) => {
+                                            // Wait for the leader to
+                                            // finish (Err == leader done,
+                                            // including the already-done
+                                            // race -- no lost wakeup).
+                                            let _ = rx.changed().await;
+                                            let now2 =
+                                                std::time::Instant::now();
+                                            match policy.lookup(
+                                                store,
+                                                &key,
+                                                req.headers(),
+                                                now2,
+                                            ) {
+                                                crate::cache::Lookup::Hit(
+                                                    hit,
+                                                ) => {
+                                                    state
+                                                        .metrics
+                                                        .cache_hits
+                                                        .fetch_add(
+                                                            1, Relaxed,
+                                                        );
+                                                    hit
+                                                }
+                                                _ => {
+                                                    // Leader stored
+                                                    // nothing usable for
+                                                    // us; fetch ourselves.
+                                                    state
+                                                        .metrics
+                                                        .cache_misses
+                                                        .fetch_add(
+                                                            1, Relaxed,
+                                                        );
+                                                    let req_headers = req
+                                                        .headers()
+                                                        .clone();
+                                                    let raw = route
+                                                        .handler
+                                                        .handle(
+                                                            req,
+                                                            &route
+                                                                .matched_prefix,
+                                                            &req_ctx,
+                                                        )
+                                                        .await;
+                                                    policy
+                                                        .maybe_store(
+                                                            store,
+                                                            &state.metrics,
+                                                            key,
+                                                            &req_headers,
+                                                            raw,
+                                                            now2,
+                                                        )
+                                                        .await
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                crate::cache::Lookup::Revalidate(entry) => {
+                                    state
+                                        .metrics
+                                        .cache_revalidations
+                                        .fetch_add(1, Relaxed);
+                                    // Keep the client's original headers
+                                    // (its own conditional + Vary inputs)
+                                    // before swapping in our validators.
+                                    let req_headers = req.headers().clone();
+                                    let h = req.headers_mut();
+                                    h.remove(
+                                        hyper::header::IF_NONE_MATCH,
+                                    );
+                                    h.remove(
+                                        hyper::header::IF_MODIFIED_SINCE,
+                                    );
+                                    for (n, v) in
+                                        entry.revalidation_headers()
+                                    {
+                                        h.insert(n, v);
+                                    }
+                                    let raw = route
+                                        .handler
+                                        .handle(
+                                            req,
+                                            &route.matched_prefix,
+                                            &req_ctx,
+                                        )
+                                        .await;
+                                    if raw.status()
+                                        == hyper::StatusCode::NOT_MODIFIED
+                                    {
+                                        policy.serve_revalidated(
+                                            store,
+                                            key,
+                                            entry,
+                                            raw,
+                                            &req_headers,
+                                            now,
+                                        )
+                                    } else {
+                                        // Origin returned a fresh
+                                        // representation: store it.
+                                        policy
+                                            .maybe_store(
+                                                store,
+                                                &state.metrics,
+                                                key,
+                                                &req_headers,
+                                                raw,
+                                                now,
+                                            )
+                                            .await
+                                    }
+                                }
                             }
                         } else {
                             route

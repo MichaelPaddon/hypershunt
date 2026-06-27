@@ -12,14 +12,21 @@
 use crate::cache::entry::StoredResponse;
 use crate::metrics::Metrics;
 use lru::LruCache;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 pub struct CacheStore {
     inner: Mutex<Inner>,
     /// Hard upper bound on `Inner::bytes`.
     max_bytes: u64,
+    /// In-flight fetches, keyed by cache key, for request coalescing.
+    /// The leader holds a `watch::Sender`; followers clone the
+    /// `Receiver` and await it.  When the leader finishes it drops the
+    /// sender (closing the channel), which wakes every follower.
+    inflight: Mutex<HashMap<String, watch::Receiver<()>>>,
     metrics: Arc<Metrics>,
 }
 
@@ -27,6 +34,39 @@ struct Inner {
     map: LruCache<String, Arc<StoredResponse>>,
     /// Running sum of every held entry's `size()`.
     bytes: u64,
+}
+
+/// Whether this request leads a fetch for its key or follows one
+/// already in flight.  See [`CacheStore::begin_fetch`].
+pub enum FetchRole {
+    /// No fetch was in flight: this request leads it.  Hold the guard
+    /// until the response is stored; dropping it wakes any followers.
+    Leader(LeaderGuard),
+    /// A fetch is already in flight: await this, then re-check the
+    /// cache.
+    Follower(watch::Receiver<()>),
+}
+
+/// RAII marker for the in-flight leader.  Dropping it removes the
+/// in-flight entry and (via the contained sender) wakes followers,
+/// whether the fetch succeeded, was uncacheable, or the task was
+/// dropped mid-flight.
+pub struct LeaderGuard {
+    store: Arc<CacheStore>,
+    key: String,
+    // Dropping the sender closes the watch channel, which is the
+    // signal followers wait on.  Never read directly.
+    _tx: watch::Sender<()>,
+}
+
+impl Drop for LeaderGuard {
+    fn drop(&mut self) {
+        self.store
+            .inflight
+            .lock()
+            .expect("cache inflight mutex")
+            .remove(&self.key);
+    }
 }
 
 impl CacheStore {
@@ -38,8 +78,29 @@ impl CacheStore {
                 bytes: 0,
             }),
             max_bytes,
+            inflight: Mutex::new(HashMap::new()),
             metrics,
         })
+    }
+
+    /// Claim or join the in-flight fetch for `key`.  The first caller
+    /// becomes the [`FetchRole::Leader`]; concurrent callers become
+    /// [`FetchRole::Follower`]s and should await the returned receiver,
+    /// then re-run `lookup` (which serves the leader's stored response,
+    /// or falls back to fetching themselves if it was uncacheable).
+    pub fn begin_fetch(self: &Arc<Self>, key: &str) -> FetchRole {
+        let mut inflight = self.inflight.lock().expect("cache inflight mutex");
+        if let Some(rx) = inflight.get(key) {
+            FetchRole::Follower(rx.clone())
+        } else {
+            let (tx, rx) = watch::channel(());
+            inflight.insert(key.to_owned(), rx);
+            FetchRole::Leader(LeaderGuard {
+                store: self.clone(),
+                key: key.to_owned(),
+                _tx: tx,
+            })
+        }
     }
 
     /// Look up a key, bumping its recency.  Returns the shared entry
@@ -214,5 +275,20 @@ mod tests {
         store.insert("k".into(), entry(100, 60, t0));
         store.insert("k".into(), entry(40, 60, t0));
         assert_eq!(store.stats(), (1, 40));
+    }
+
+    #[test]
+    fn single_flight_assigns_leader_then_followers() {
+        let m = Arc::new(Metrics::new());
+        let store = CacheStore::new(1024, m);
+        let lead = store.begin_fetch("k");
+        assert!(matches!(lead, FetchRole::Leader(_)));
+        // A concurrent request for the same key follows.
+        assert!(matches!(store.begin_fetch("k"), FetchRole::Follower(_)));
+        // A different key leads its own fetch.
+        assert!(matches!(store.begin_fetch("other"), FetchRole::Leader(_)));
+        // Once the leader finishes, the key is claimable again.
+        drop(lead);
+        assert!(matches!(store.begin_fetch("k"), FetchRole::Leader(_)));
     }
 }

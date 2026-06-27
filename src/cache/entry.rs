@@ -9,8 +9,9 @@
 use crate::error::{HttpResponse, bytes_body};
 use bytes::Bytes;
 use hyper::header::{
-    AGE, CACHE_CONTROL, CONTENT_LENGTH, ETAG, HeaderMap, HeaderName,
-    HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
+    AGE, CACHE_CONTROL, CONTENT_LENGTH, DATE, ETAG, EXPIRES, HeaderMap,
+    HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
+    VARY,
 };
 use hyper::{Response, StatusCode};
 use std::time::{Duration, Instant, SystemTime};
@@ -175,6 +176,71 @@ impl StoredResponse {
         // 304 must not carry Content-Length of the omitted body.
         h.remove(CONTENT_LENGTH);
         resp
+    }
+
+    /// True when the entry carries a validator (ETag or Last-Modified)
+    /// usable to revalidate it against the origin instead of refetching
+    /// the whole body.
+    pub fn has_validators(&self) -> bool {
+        self.etag.is_some() || self.last_modified.is_some()
+    }
+
+    /// Conditional-request headers to send to the origin when
+    /// revalidating this stale entry: `If-None-Match` from the stored
+    /// ETag and/or `If-Modified-Since` from the stored Last-Modified.
+    pub fn revalidation_headers(&self) -> Vec<(HeaderName, HeaderValue)> {
+        let mut out = Vec::new();
+        if let Some(etag) = &self.etag
+            && let Ok(v) = HeaderValue::from_str(etag)
+        {
+            out.push((IF_NONE_MATCH, v));
+        }
+        if let Some(lm) = self.last_modified
+            && let Ok(v) = HeaderValue::from_str(&httpdate::fmt_http_date(lm))
+        {
+            out.push((IF_MODIFIED_SINCE, v));
+        }
+        out
+    }
+
+    /// Produce a refreshed copy after a successful revalidation (origin
+    /// 304).  Resets the freshness clock to `now`, takes the new
+    /// lifetime/age, and overlays the metadata headers the 304 carried
+    /// (RFC 9111 §4.3.4).  The body is shared (Arc-backed), so this is
+    /// cheap.
+    pub fn refreshed(
+        &self,
+        update: &HeaderMap,
+        lifetime: Duration,
+        initial_age: Duration,
+        now: Instant,
+    ) -> StoredResponse {
+        let mut headers = self.headers.clone();
+        for name in [CACHE_CONTROL, DATE, EXPIRES, ETAG, LAST_MODIFIED, VARY] {
+            if let Some(v) = update.get(&name) {
+                headers.insert(name, v.clone());
+            }
+        }
+        let etag = headers
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let last_modified = headers
+            .get(LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| httpdate::parse_http_date(s).ok());
+        StoredResponse {
+            status: self.status,
+            headers,
+            body: self.body.clone(),
+            stored_at: now,
+            freshness_lifetime: lifetime,
+            initial_age,
+            etag,
+            last_modified,
+            vary: self.vary.clone(),
+            size: self.size,
+        }
     }
 }
 
@@ -379,5 +445,62 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
         assert!(resp.headers().get(ETAG).is_some());
         assert!(resp.headers().get(CONTENT_LENGTH).is_none());
+    }
+
+    #[test]
+    fn revalidation_headers_from_validators() {
+        let t0 = Instant::now();
+        let e = entry_with(
+            Duration::from_secs(60),
+            &[
+                ("etag", "\"abc\""),
+                ("last-modified", "Sun, 06 Nov 1994 08:49:37 GMT"),
+            ],
+            b"x",
+            vec![],
+            t0,
+        );
+        assert!(e.has_validators());
+        let hs = e.revalidation_headers();
+        assert!(
+            hs.iter()
+                .any(|(n, v)| *n == IF_NONE_MATCH && v == "\"abc\"")
+        );
+        assert!(hs.iter().any(|(n, _)| *n == IF_MODIFIED_SINCE));
+    }
+
+    #[test]
+    fn no_validators_when_absent() {
+        let t0 = Instant::now();
+        let e = entry_with(Duration::from_secs(60), &[], b"x", vec![], t0);
+        assert!(!e.has_validators());
+        assert!(e.revalidation_headers().is_empty());
+    }
+
+    #[test]
+    fn refreshed_resets_clock_and_overlays_metadata() {
+        let t0 = Instant::now();
+        let e = entry_with(
+            Duration::from_secs(5),
+            &[("etag", "\"abc\""), ("cache-control", "max-age=5")],
+            b"body",
+            vec![],
+            t0,
+        );
+        // Originally stale after 5s.
+        assert!(!e.is_fresh(t0 + Duration::from_secs(6)));
+        // The 304 extends freshness and updates Cache-Control.
+        let mut update = HeaderMap::new();
+        update.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=100"));
+        let r = e.refreshed(
+            &update,
+            Duration::from_secs(100),
+            Duration::ZERO,
+            t0 + Duration::from_secs(6),
+        );
+        // Fresh again from the refresh instant; body preserved.
+        assert!(r.is_fresh(t0 + Duration::from_secs(50)));
+        let resp = r.to_response(t0 + Duration::from_secs(6));
+        assert_eq!(resp.headers().get(CACHE_CONTROL).unwrap(), "max-age=100");
     }
 }

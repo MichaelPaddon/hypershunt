@@ -2,11 +2,12 @@
 // freshness-lifetime resolution (§4.2), and the read-through /
 // write-through orchestration the dispatch site calls.
 //
-// Phase 1 scope: store fresh responses by a TTL that caps any origin
-// freshness, honour `no-store`/`private`/`no-cache`/`Vary`/`Set-Cookie`
-// and the `Authorization` rule, and answer client conditionals with a
-// 304.  Client request directives are ignored (operator opt-in lands
-// later); stale entries are dropped rather than revalidated.
+// Stores fresh responses by a TTL that caps any origin freshness,
+// honours `no-store`/`private`/`no-cache`/`Vary`/`Set-Cookie` and the
+// `Authorization` rule, and answers client conditionals with a 304.  A
+// stale entry that carries a validator is revalidated against the
+// origin (§4.3) rather than refetched; one without is dropped.  Client
+// request directives are still ignored (operator opt-in lands later).
 
 use crate::cache::entry::StoredResponse;
 use crate::cache::key::CacheKey;
@@ -46,6 +47,21 @@ struct Decision {
     vary: Vec<(HeaderName, Option<String>)>,
 }
 
+/// Outcome of a read-through lookup.
+pub enum Lookup {
+    /// A fresh, variant-matching entry: serve this response directly
+    /// (full body, or a client-driven 304).
+    Hit(HttpResponse),
+    /// A stale entry that carries a validator: the dispatch site should
+    /// revalidate it against the origin (send our conditional headers)
+    /// and then call [`CachePolicy::serve_revalidated`] on a 304 or
+    /// [`CachePolicy::maybe_store`] on a fresh 200.
+    Revalidate(Arc<StoredResponse>),
+    /// No usable entry (absent, stale without a validator, or a
+    /// different variant): fetch and store normally.
+    Miss,
+}
+
 impl CachePolicy {
     pub fn compile(cfg: &CacheConfig) -> CachePolicy {
         CachePolicy {
@@ -69,30 +85,68 @@ impl CachePolicy {
         self.key.build(ctx)
     }
 
-    /// Read-through: return a usable response (full or 304) for a
-    /// fresh, variant-matching hit; `None` on miss (absent, stale, or
-    /// wrong variant).  A stale entry is dropped on the way out.
+    /// Read-through.  Returns [`Lookup::Hit`] for a fresh,
+    /// variant-matching entry (serving a full body or a client-driven
+    /// 304), [`Lookup::Revalidate`] for a stale entry that still has a
+    /// validator, or [`Lookup::Miss`] otherwise.  A stale entry with no
+    /// validator is dropped here, since it can only be refetched.
+    /// Counters are incremented by the caller, which knows the final
+    /// outcome of a revalidation.
     pub fn lookup(
         &self,
         store: &CacheStore,
-        metrics: &Metrics,
         key: &str,
         req_headers: &HeaderMap,
         now: Instant,
-    ) -> Option<HttpResponse> {
-        let entry = store.get(key)?;
+    ) -> Lookup {
+        let Some(entry) = store.get(key) else {
+            return Lookup::Miss;
+        };
         if !entry.vary_matches(req_headers) {
-            return None;
+            return Lookup::Miss;
         }
         if !entry.is_fresh(now) {
+            if entry.has_validators() {
+                return Lookup::Revalidate(entry);
+            }
             store.remove(key);
-            return None;
+            return Lookup::Miss;
         }
-        metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
         if entry.client_not_modified(req_headers) {
-            Some(entry.not_modified_response(now))
+            Lookup::Hit(entry.not_modified_response(now))
         } else {
-            Some(entry.to_response(now))
+            Lookup::Hit(entry.to_response(now))
+        }
+    }
+
+    /// After a stale entry was revalidated and the origin answered
+    /// `304 Not Modified`: refresh the entry's freshness from the 304's
+    /// metadata, re-store it, and serve it (honouring the client's own
+    /// conditional request against the refreshed validators).
+    pub fn serve_revalidated(
+        &self,
+        store: &CacheStore,
+        key: String,
+        entry: Arc<StoredResponse>,
+        resp_304: HttpResponse,
+        orig_req_headers: &HeaderMap,
+        now: Instant,
+    ) -> HttpResponse {
+        let (parts, _body) = resp_304.into_parts();
+        let cc = ResponseCacheControl::parse(&parts.headers);
+        let lifetime = self.lifetime_from(&cc, &parts.headers);
+        let initial_age = age_of(&parts.headers);
+        let refreshed = Arc::new(entry.refreshed(
+            &parts.headers,
+            lifetime,
+            initial_age,
+            now,
+        ));
+        store.insert(key, refreshed.clone());
+        if refreshed.client_not_modified(orig_req_headers) {
+            refreshed.not_modified_response(now)
+        } else {
+            refreshed.to_response(now)
         }
     }
 
@@ -207,26 +261,11 @@ impl CachePolicy {
         if !cacheable_status(status) {
             return None;
         }
-        let origin = cc
-            .s_maxage
-            .or(cc.max_age)
-            .map(Duration::from_secs)
-            .or_else(|| expires_minus_date(resp_headers));
-        // TTL caps any origin freshness; with no origin signal the TTL
-        // is the lifetime.
-        let lifetime = match origin {
-            Some(o) => o.min(self.ttl),
-            None => self.ttl,
-        };
+        let lifetime = self.lifetime_from(&cc, resp_headers);
         if lifetime.is_zero() {
             return None;
         }
-        let initial_age = resp_headers
-            .get(AGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_default();
+        let initial_age = age_of(resp_headers);
         let vary = vary_names
             .into_iter()
             .map(|name| {
@@ -243,6 +282,37 @@ impl CachePolicy {
             vary,
         })
     }
+
+    /// Resolve the freshness lifetime from already-parsed response
+    /// `Cache-Control` plus `Expires`/`Date`: `s-maxage` > `max-age` >
+    /// (`Expires` - `Date`), capped by the configured TTL; the TTL
+    /// alone when the origin declared nothing.  Shared by the store
+    /// path and the revalidation refresh path.
+    fn lifetime_from(
+        &self,
+        cc: &ResponseCacheControl,
+        headers: &HeaderMap,
+    ) -> Duration {
+        let origin = cc
+            .s_maxage
+            .or(cc.max_age)
+            .map(Duration::from_secs)
+            .or_else(|| expires_minus_date(headers));
+        match origin {
+            Some(o) => o.min(self.ttl),
+            None => self.ttl,
+        }
+    }
+}
+
+/// Parse the `Age` response header into a `Duration` (0 when absent).
+fn age_of(headers: &HeaderMap) -> Duration {
+    headers
+        .get(AGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_default()
 }
 
 /// Status codes Phase 1 will cache by default.  Conservative subset of
@@ -494,5 +564,111 @@ mod tests {
             .evaluate(StatusCode::OK, &HeaderMap::new(), &HeaderMap::new())
             .expect("200 cacheable by TTL");
         assert_eq!(d.lifetime, Duration::from_secs(60));
+    }
+
+    // -- Revalidation (phase 2) ------------------------------------
+
+    fn store() -> Arc<CacheStore> {
+        CacheStore::new(1 << 20, Arc::new(Metrics::new()))
+    }
+
+    fn put(
+        store: &CacheStore,
+        key: &str,
+        headers: &[(&str, &str)],
+        lifetime: Duration,
+        at: Instant,
+    ) {
+        let mut h = HeaderMap::new();
+        for (n, v) in headers {
+            h.insert(
+                HeaderName::from_bytes(n.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        store.insert(
+            key.to_owned(),
+            Arc::new(StoredResponse::new(
+                StatusCode::OK,
+                &h,
+                Bytes::from_static(b"body"),
+                lifetime,
+                Duration::ZERO,
+                vec![],
+                at,
+            )),
+        );
+    }
+
+    #[test]
+    fn lookup_fresh_is_hit() {
+        let p = policy(60, 1024);
+        let s = store();
+        let t0 = Instant::now();
+        put(&s, "k", &[], Duration::from_secs(60), t0);
+        assert!(matches!(
+            p.lookup(&s, "k", &HeaderMap::new(), t0),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn lookup_stale_with_validator_is_revalidate() {
+        let p = policy(60, 1024);
+        let s = store();
+        let t0 = Instant::now();
+        put(&s, "k", &[("etag", "\"v1\"")], Duration::from_secs(5), t0);
+        assert!(matches!(
+            p.lookup(&s, "k", &HeaderMap::new(), t0 + Duration::from_secs(6)),
+            Lookup::Revalidate(_)
+        ));
+    }
+
+    #[test]
+    fn lookup_stale_without_validator_is_miss_and_removed() {
+        let p = policy(60, 1024);
+        let s = store();
+        let t0 = Instant::now();
+        put(&s, "k", &[], Duration::from_secs(5), t0);
+        assert!(matches!(
+            p.lookup(&s, "k", &HeaderMap::new(), t0 + Duration::from_secs(6)),
+            Lookup::Miss
+        ));
+        // The dead entry was dropped on the way out.
+        assert!(s.get("k").is_none());
+    }
+
+    #[test]
+    fn serve_revalidated_refreshes_freshness() {
+        let p = policy(60, 1024);
+        let s = store();
+        let t0 = Instant::now();
+        put(&s, "k", &[("etag", "\"v1\"")], Duration::from_secs(5), t0);
+        let stale_at = t0 + Duration::from_secs(6);
+        let Lookup::Revalidate(entry) =
+            p.lookup(&s, "k", &HeaderMap::new(), stale_at)
+        else {
+            panic!("expected revalidate");
+        };
+        // Origin says "still valid, max-age=100".
+        let mut r304 = Response::new(bytes_body(Bytes::new()));
+        *r304.status_mut() = StatusCode::NOT_MODIFIED;
+        r304.headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("max-age=100"));
+        let resp = p.serve_revalidated(
+            &s,
+            "k".to_owned(),
+            entry,
+            r304,
+            &HeaderMap::new(),
+            stale_at,
+        );
+        // Full body served (client sent no conditional).
+        assert_eq!(resp.status(), StatusCode::OK);
+        // And the entry is fresh again -- next lookup is a plain hit.
+        assert!(matches!(
+            p.lookup(&s, "k", &HeaderMap::new(), stale_at),
+            Lookup::Hit(_)
+        ));
     }
 }

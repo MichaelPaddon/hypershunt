@@ -244,6 +244,7 @@ pub struct CacheSnap {
     pub stores: u64,
     pub bypass: u64,
     pub evictions: u64,
+    pub revalidations: u64,
     pub entries: u64,
     pub bytes: u64,
 }
@@ -715,6 +716,9 @@ pub struct Metrics {
     pub cache_stores: AtomicU64,
     pub cache_bypass: AtomicU64,
     pub cache_evictions: AtomicU64,
+    // Stale entries revalidated against the origin (a conditional
+    // request was sent because the cached copy had a validator).
+    pub cache_revalidations: AtomicU64,
     pub cache_entries: AtomicU64,
     pub cache_bytes: AtomicU64,
     // OCSP-stapling: count of background fetches that produced a
@@ -891,6 +895,7 @@ impl Metrics {
             cache_stores: AtomicU64::new(0),
             cache_bypass: AtomicU64::new(0),
             cache_evictions: AtomicU64::new(0),
+            cache_revalidations: AtomicU64::new(0),
             cache_entries: AtomicU64::new(0),
             cache_bytes: AtomicU64::new(0),
             ocsp_refreshes: AtomicU64::new(0),
@@ -1350,6 +1355,7 @@ impl Metrics {
             stores: self.cache_stores.load(Ordering::Relaxed),
             bypass: self.cache_bypass.load(Ordering::Relaxed),
             evictions: self.cache_evictions.load(Ordering::Relaxed),
+            revalidations: self.cache_revalidations.load(Ordering::Relaxed),
             entries: self.cache_entries.load(Ordering::Relaxed),
             bytes: self.cache_bytes.load(Ordering::Relaxed),
         }

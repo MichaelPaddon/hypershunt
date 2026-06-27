@@ -59,6 +59,37 @@ class H(BaseHTTPRequestHandler):
             self.send(b"etagbody",
                       [("ETag", '"v1"'),
                        ("Cache-Control", "max-age=300")])
+        elif p == "/reval":
+            # Short freshness; revalidatable.  A conditional request
+            # matching our ETag gets 304 without advancing the counter,
+            # so a revalidation reuses the cached body.
+            inm = self.headers.get("If-None-Match", "")
+            if '"v1"' in inm:
+                self.send_response(304)
+                self.send_header("ETag", '"v1"')
+                self.send_header("Cache-Control", "max-age=1")
+                self.end_headers()
+            else:
+                n = bump("reval")
+                self.send(("[count=%d]" % n).encode(),
+                          [("ETag", '"v1"'),
+                           ("Cache-Control", "max-age=1")])
+        elif p == "/revalchange":
+            # Short freshness; the content always changes, so a
+            # revalidation returns a fresh 200 (counter advances).
+            n = bump("revalchange")
+            self.send(("[count=%d]" % n).encode(),
+                      [("ETag", '"r%d"' % n),
+                       ("Cache-Control", "max-age=1")])
+        elif p == "/slow":
+            # Slow origin: counts each request it actually serves and
+            # sleeps so concurrent requests overlap.  With single-flight
+            # only the leader reaches here, so the counter stays at 1.
+            import time
+            n = bump("slow")
+            time.sleep(1)
+            self.send(("[count=%d]" % n).encode(),
+                      [("Cache-Control", "max-age=300")])
         else:
             # Liveness poll and anything else: never cached.
             self.send(b"ok", [("Cache-Control", "no-store")])
@@ -121,6 +152,49 @@ EOF
     assert_status "cache/etag_store" 200 "$base/etag"
     assert_status "cache/etag_304" 304 "$base/etag" \
         -H 'If-None-Match: "v1"'
+
+    # Revalidation: store with a 1 s lifetime, let it go stale, then a
+    # request revalidates against the origin.  The backend answers 304
+    # (counter frozen) so the cached body is reused -- [count=1], not a
+    # full refetch that would yield [count=2].
+    assert_body "cache/reval_store" "[count=1]" "$base/reval"
+    sleep 2
+    assert_body "cache/reval_304_reuses_body" "[count=1]" "$base/reval"
+
+    # Revalidation where the origin has changed: a stale entry revalidates
+    # and the origin returns a fresh 200, so the new body is served and
+    # cached ([count=2]), then re-served from cache.
+    assert_body "cache/revalchange_store" "[count=1]" "$base/revalchange"
+    sleep 2
+    assert_body "cache/revalchange_200_replaces" "[count=2]" \
+        "$base/revalchange"
+    assert_body "cache/revalchange_rehit" "[count=2]" "$base/revalchange"
+
+    # Single-flight: five concurrent requests for an uncached, slow key.
+    # Only the leader reaches the origin (counter == 1), so every
+    # response carries [count=1]; without coalescing the origin would be
+    # hit up to five times.
+    local sf_ok=1 i
+    local sf_pids=()
+    for i in 1 2 3 4 5; do
+        curl -s --max-time 10 "$base/slow" \
+            >"$TMPDIR/slow_$i" 2>/dev/null &
+        sf_pids+=("$!")
+    done
+    # Wait only on the curl jobs -- a bare `wait` would also block on
+    # the long-running backend and server processes.
+    for i in "${sf_pids[@]}"; do
+        wait "$i" 2>/dev/null || true
+    done
+    for i in 1 2 3 4 5; do
+        grep -qF "[count=1]" "$TMPDIR/slow_$i" 2>/dev/null || sf_ok=0
+    done
+    if [ "$sf_ok" = 1 ]; then
+        pass "cache/single_flight_coalesces"
+    else
+        fail "cache/single_flight_coalesces" \
+            "concurrent misses were not coalesced to one origin hit"
+    fi
 
     stop_server
 }

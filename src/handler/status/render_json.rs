@@ -230,13 +230,14 @@ pub(super) fn render_json(
         "active_keys": s.rate_limit.active_keys,
     });
     let cache_json = serde_json::json!({
-        "hits":      s.cache.hits,
-        "misses":    s.cache.misses,
-        "stores":    s.cache.stores,
-        "bypass":    s.cache.bypass,
-        "evictions": s.cache.evictions,
-        "entries":   s.cache.entries,
-        "bytes":     s.cache.bytes,
+        "hits":          s.cache.hits,
+        "misses":        s.cache.misses,
+        "stores":        s.cache.stores,
+        "bypass":        s.cache.bypass,
+        "evictions":     s.cache.evictions,
+        "revalidations": s.cache.revalidations,
+        "entries":       s.cache.entries,
+        "bytes":         s.cache.bytes,
     });
     let oidc_json = serde_json::json!({
         "refreshes":            s.oidc.refreshes,
