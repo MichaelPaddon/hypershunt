@@ -2399,10 +2399,11 @@ cache ttl=300 key="{host}{path}"   // ignore the query string
 
 **Property** on [`cache`](#cache-location).  Optional boolean.
 
-When `#true`, honour client **request** `Cache-Control` directives
-(`no-cache`, `no-store`, `max-age`, ...).  When `#false` (the default),
-client directives are ignored so clients cannot bust the shared cache;
-the operator's policy governs.
+When `#true`, honour client **request** `Cache-Control` directives —
+`no-store`, `no-cache`, `max-age`, `min-fresh`, `max-stale`, and
+`only-if-cached` (see [the guide](guide.md#client-cache-busting)).  When
+`#false` (the default), client directives are ignored so clients cannot
+bust the shared cache; the operator's policy governs.
 
 **Default:** `#false`.
 

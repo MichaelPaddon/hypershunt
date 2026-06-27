@@ -1885,13 +1885,33 @@ flight wait for it and are then served from the freshly stored response.
 A burst of identical requests to an empty cache therefore hits a slow
 backend once, not once per request.
 
+### Serving stale content (RFC 5861)
+
+When the origin's `Cache-Control` declares a `stale-while-revalidate=N`
+window, a stale entry within that window is served **immediately** and
+refreshed in the background, so clients never wait for a revalidation.
+When it declares `stale-if-error=N`, a stale entry within that window is
+served if a revalidation to the origin **fails** (a 5xx or an
+unreachable backend), shielding clients from origin blips.  Both windows
+come from the origin response; hypershunt does not synthesise them.
+
 ### Client cache-busting
 
-By default a client's request `Cache-Control` (`no-cache`, `no-store`,
-`max-age=0`) is **ignored**, so clients cannot force the cache to be
-bypassed or evicted — the operator's policy governs.  Set
+By default a client's request `Cache-Control` is **ignored**, so clients
+cannot force the cache to be bypassed or evicted — the operator's policy
+governs.  Set
 [`honor-client-cache-control`](reference.md#honor-client-cache-control)
-to honour client directives where that is desired.
+on the location to honour the request directives instead:
+
+- `no-store` — bypass the cache entirely for this request (no lookup,
+  no store).
+- `no-cache` — revalidate with the origin before serving.
+- `max-age=N` / `min-fresh=N` — reject a cached entry that is older than
+  `N` seconds, or that has less than `N` seconds of freshness left.
+- `max-stale[=N]` — accept a stale entry (optionally only within `N`
+  seconds of expiry).
+- `only-if-cached` — serve only from cache; if nothing is cached, return
+  `504 Gateway Timeout` without contacting the origin.
 
 ### Cache key
 
