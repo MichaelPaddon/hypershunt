@@ -154,6 +154,7 @@ suite_rate_limit_per_ip_isolated
 suite_rate_limit_user_key
 suite_rate_limit_header_key
 suite_cache_proxy
+suite_cache_phase3
 suite_match_method_dispatch
 suite_match_header_regex
 suite_match_query

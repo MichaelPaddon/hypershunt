@@ -53,6 +53,13 @@ pub struct StoredResponse {
     /// `Vary`, captured at store time.  A later request matches only
     /// when its values for these headers are identical.
     vary: Vec<(HeaderName, Option<String>)>,
+    /// `stale-while-revalidate` window (RFC 5861): once stale, the
+    /// entry may be served for this long while a background refresh
+    /// runs.  Zero when the origin did not declare it.
+    swr: Duration,
+    /// `stale-if-error` window (RFC 5861): once stale, the entry may be
+    /// served for this long if the origin errors.  Zero when undeclared.
+    sie: Duration,
     /// Body length, charged against the store's byte budget.
     size: usize,
 }
@@ -96,8 +103,18 @@ impl StoredResponse {
             etag,
             last_modified,
             vary,
+            swr: Duration::ZERO,
+            sie: Duration::ZERO,
             size,
         }
+    }
+
+    /// Set the RFC 5861 stale-serving windows (builder style, so the
+    /// `new` signature stays small).
+    pub fn with_stale_windows(mut self, swr: Duration, sie: Duration) -> Self {
+        self.swr = swr;
+        self.sie = sie;
+        self
     }
 
     /// Bytes charged against the store's cap.
@@ -114,6 +131,30 @@ impl StoredResponse {
     /// the entry has spent in cache.
     pub fn current_age(&self, now: Instant) -> Duration {
         self.initial_age + now.saturating_duration_since(self.stored_at)
+    }
+
+    /// Remaining freshness (zero once stale): how much longer the entry
+    /// stays fresh.  Used for the client `min-fresh` directive.
+    pub fn remaining_freshness(&self, now: Instant) -> Duration {
+        self.freshness_lifetime
+            .saturating_sub(now.saturating_duration_since(self.stored_at))
+    }
+
+    /// How far past its freshness lifetime the entry is (zero while
+    /// still fresh).  Drives the SWR / SIE / max-stale windows.
+    pub fn staleness(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.stored_at)
+            .saturating_sub(self.freshness_lifetime)
+    }
+
+    /// The `stale-while-revalidate` window.
+    pub fn swr_window(&self) -> Duration {
+        self.swr
+    }
+
+    /// The `stale-if-error` window.
+    pub fn sie_window(&self) -> Duration {
+        self.sie
     }
 
     /// True when the request's values for this entry's `Vary` headers
@@ -239,6 +280,8 @@ impl StoredResponse {
             etag,
             last_modified,
             vary: self.vary.clone(),
+            swr: self.swr,
+            sie: self.sie,
             size: self.size,
         }
     }

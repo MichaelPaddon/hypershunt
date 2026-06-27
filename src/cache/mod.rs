@@ -15,5 +15,6 @@ mod key;
 mod policy;
 mod store;
 
-pub use policy::{CachePolicy, Lookup};
+pub use entry::StoredResponse;
+pub use policy::{CachePolicy, Lookup, RequestCacheControl};
 pub use store::{CacheStore, FetchRole, spawn_cache_eviction_task};

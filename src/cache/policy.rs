@@ -6,8 +6,11 @@
 // honours `no-store`/`private`/`no-cache`/`Vary`/`Set-Cookie` and the
 // `Authorization` rule, and answers client conditionals with a 304.  A
 // stale entry that carries a validator is revalidated against the
-// origin (§4.3) rather than refetched; one without is dropped.  Client
-// request directives are still ignored (operator opt-in lands later).
+// origin (§4.3) rather than refetched.  RFC 5861 stale-serving applies
+// when the origin declared `stale-while-revalidate` / `stale-if-error`.
+// Client request directives are honoured only when the location set
+// `honor-client-cache-control` (otherwise the request `Cache-Control`
+// is ignored).
 
 use crate::cache::entry::StoredResponse;
 use crate::cache::key::CacheKey;
@@ -35,8 +38,7 @@ pub struct CachePolicy {
     max_object_size: u64,
     /// Cacheable request methods, upper-case (validated GET/HEAD).
     methods: Vec<String>,
-    /// Reserved for the later client-directive-honouring phase.
-    #[allow(dead_code)]
+    /// Whether request `Cache-Control` directives are honoured.
     honor_client_cache_control: bool,
 }
 
@@ -45,20 +47,30 @@ struct Decision {
     lifetime: Duration,
     initial_age: Duration,
     vary: Vec<(HeaderName, Option<String>)>,
+    swr: Duration,
+    sie: Duration,
 }
 
 /// Outcome of a read-through lookup.
 pub enum Lookup {
-    /// A fresh, variant-matching entry: serve this response directly
-    /// (full body, or a client-driven 304).
+    /// A usable entry: serve this response directly (full body, a
+    /// client-driven 304, or -- under max-stale -- a stale body).
     Hit(HttpResponse),
-    /// A stale entry that carries a validator: the dispatch site should
-    /// revalidate it against the origin (send our conditional headers)
-    /// and then call [`CachePolicy::serve_revalidated`] on a 304 or
-    /// [`CachePolicy::maybe_store`] on a fresh 200.
-    Revalidate(Arc<StoredResponse>),
-    /// No usable entry (absent, stale without a validator, or a
-    /// different variant): fetch and store normally.
+    /// A stale entry within its `stale-while-revalidate` window: serve
+    /// it now and refresh it in the background.
+    StaleWhileRevalidate(Arc<StoredResponse>),
+    /// Revalidate against the origin.  The dispatch site sends the
+    /// stored validators and calls [`CachePolicy::serve_revalidated`]
+    /// on a 304 or [`CachePolicy::maybe_store`] on a fresh 200.
+    /// `serve_stale_on_error` is set when the entry is within its
+    /// `stale-if-error` window, so an origin 5xx falls back to the
+    /// stale body ([`CachePolicy::stale_response`]).
+    Revalidate {
+        entry: Arc<StoredResponse>,
+        serve_stale_on_error: bool,
+    },
+    /// No usable entry (absent, a different variant, or stale with no
+    /// way to revalidate): fetch and store normally.
     Miss,
 }
 
@@ -85,19 +97,23 @@ impl CachePolicy {
         self.key.build(ctx)
     }
 
-    /// Read-through.  Returns [`Lookup::Hit`] for a fresh,
-    /// variant-matching entry (serving a full body or a client-driven
-    /// 304), [`Lookup::Revalidate`] for a stale entry that still has a
-    /// validator, or [`Lookup::Miss`] otherwise.  A stale entry with no
-    /// validator is dropped here, since it can only be refetched.
-    /// Counters are incremented by the caller, which knows the final
-    /// outcome of a revalidation.
+    /// Whether this location honours request `Cache-Control` directives.
+    pub fn honors_client_cc(&self) -> bool {
+        self.honor_client_cache_control
+    }
+
+    /// Read-through.  `rcc` carries the client's request `Cache-Control`
+    /// (default/empty when the location does not honour it, making every
+    /// client directive a no-op).  Returns how the dispatch should
+    /// proceed; counters are incremented by the caller, which knows the
+    /// final outcome.
     pub fn lookup(
         &self,
         store: &CacheStore,
         key: &str,
         req_headers: &HeaderMap,
         now: Instant,
+        rcc: &RequestCacheControl,
     ) -> Lookup {
         let Some(entry) = store.get(key) else {
             return Lookup::Miss;
@@ -105,18 +121,88 @@ impl CachePolicy {
         if !entry.vary_matches(req_headers) {
             return Lookup::Miss;
         }
-        if !entry.is_fresh(now) {
-            if entry.has_validators() {
-                return Lookup::Revalidate(entry);
+
+        let fresh = entry.is_fresh(now);
+        // Client directives can make a still-fresh entry unusable.
+        let too_old = rcc
+            .max_age
+            .is_some_and(|m| entry.current_age(now).as_secs() > m);
+        let min_fresh_unmet = rcc
+            .min_fresh
+            .is_some_and(|mf| entry.remaining_freshness(now).as_secs() < mf);
+        let usable_fresh =
+            fresh && !rcc.no_cache && !too_old && !min_fresh_unmet;
+
+        if usable_fresh {
+            return if entry.client_not_modified(req_headers) {
+                Lookup::Hit(entry.not_modified_response(now))
+            } else {
+                Lookup::Hit(entry.to_response(now))
+            };
+        }
+
+        // Still fresh, but the client forced revalidation (no-cache /
+        // max-age / min-fresh): revalidate if we can, else refetch.
+        if fresh {
+            return if entry.has_validators() {
+                Lookup::Revalidate {
+                    entry,
+                    serve_stale_on_error: false,
+                }
+            } else {
+                Lookup::Miss
+            };
+        }
+
+        // The entry is genuinely stale from here on.
+        let staleness = entry.staleness(now);
+
+        // Client max-stale: serve the stale entry as-is (no origin trip)
+        // when the client opted in and didn't also ask for no-cache.
+        if !rcc.no_cache
+            && let Some(max_stale) = rcc.max_stale
+        {
+            let within = match max_stale {
+                None => true,
+                Some(n) => staleness.as_secs() <= n,
+            };
+            if within {
+                return Lookup::Hit(entry.to_response(now));
             }
-            store.remove(key);
-            return Lookup::Miss;
         }
-        if entry.client_not_modified(req_headers) {
-            Lookup::Hit(entry.not_modified_response(now))
-        } else {
-            Lookup::Hit(entry.to_response(now))
+
+        // stale-while-revalidate: serve now, refresh in the background.
+        if !rcc.no_cache
+            && !entry.swr_window().is_zero()
+            && staleness <= entry.swr_window()
+        {
+            return Lookup::StaleWhileRevalidate(entry);
         }
+
+        // Revalidate when we have a validator; also keep the entry as a
+        // stale-if-error fallback when within that window.
+        let sie_ok =
+            !entry.sie_window().is_zero() && staleness <= entry.sie_window();
+        if entry.has_validators() || sie_ok {
+            return Lookup::Revalidate {
+                entry,
+                serve_stale_on_error: sie_ok,
+            };
+        }
+
+        // No validator and no stale window: drop it and refetch.
+        store.remove(key);
+        Lookup::Miss
+    }
+
+    /// Serve a stale entry as the stale-if-error fallback after the
+    /// origin failed.  The body is served as-is with its current `Age`.
+    pub fn stale_response(
+        &self,
+        entry: &StoredResponse,
+        now: Instant,
+    ) -> HttpResponse {
+        entry.to_response(now)
     }
 
     /// After a stale entry was revalidated and the origin answered
@@ -195,15 +281,18 @@ impl CachePolicy {
                 return r;
             }
         };
-        let stored = Arc::new(StoredResponse::new(
-            parts.status,
-            &parts.headers,
-            bytes,
-            decision.lifetime,
-            decision.initial_age,
-            decision.vary,
-            now,
-        ));
+        let stored = Arc::new(
+            StoredResponse::new(
+                parts.status,
+                &parts.headers,
+                bytes,
+                decision.lifetime,
+                decision.initial_age,
+                decision.vary,
+                now,
+            )
+            .with_stale_windows(decision.swr, decision.sie),
+        );
         store.insert(key, stored.clone());
         stored.to_response(now)
     }
@@ -280,6 +369,14 @@ impl CachePolicy {
             lifetime,
             initial_age,
             vary,
+            swr: cc
+                .stale_while_revalidate
+                .map(Duration::from_secs)
+                .unwrap_or_default(),
+            sie: cc
+                .stale_if_error
+                .map(Duration::from_secs)
+                .unwrap_or_default(),
         })
     }
 
@@ -335,7 +432,7 @@ fn expires_minus_date(headers: &HeaderMap) -> Option<Duration> {
     Some(expires.duration_since(date).unwrap_or(Duration::ZERO))
 }
 
-/// The response `Cache-Control` directives Phase 1 reads.
+/// The response `Cache-Control` directives the cache reads.
 #[derive(Default)]
 struct ResponseCacheControl {
     no_store: bool,
@@ -344,6 +441,9 @@ struct ResponseCacheControl {
     public: bool,
     max_age: Option<u64>,
     s_maxage: Option<u64>,
+    /// RFC 5861 stale-serving windows.
+    stale_while_revalidate: Option<u64>,
+    stale_if_error: Option<u64>,
 }
 
 impl ResponseCacheControl {
@@ -366,6 +466,59 @@ impl ResponseCacheControl {
                     "public" => cc.public = true,
                     "max-age" => cc.max_age = arg.and_then(parse_secs),
                     "s-maxage" => cc.s_maxage = arg.and_then(parse_secs),
+                    "stale-while-revalidate" => {
+                        cc.stale_while_revalidate = arg.and_then(parse_secs)
+                    }
+                    "stale-if-error" => {
+                        cc.stale_if_error = arg.and_then(parse_secs)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        cc
+    }
+}
+
+/// The request `Cache-Control` directives honoured when a location
+/// sets `honor-client-cache-control`.  All fields are "unset" by
+/// default, so a `RequestCacheControl::default()` (used when the
+/// location does not honour client directives) is a no-op.
+#[derive(Default)]
+pub struct RequestCacheControl {
+    pub no_store: bool,
+    pub no_cache: bool,
+    pub only_if_cached: bool,
+    pub max_age: Option<u64>,
+    pub min_fresh: Option<u64>,
+    /// `max-stale` with no argument is `Some(None)` (accept any stale);
+    /// `max-stale=N` is `Some(Some(N))`.
+    pub max_stale: Option<Option<u64>>,
+}
+
+impl RequestCacheControl {
+    pub fn parse(headers: &HeaderMap) -> Self {
+        let mut cc = RequestCacheControl::default();
+        for value in headers.get_all(CACHE_CONTROL) {
+            let Ok(s) = value.to_str() else {
+                continue;
+            };
+            for directive in s.split(',') {
+                let directive = directive.trim();
+                let (name, arg) = match directive.split_once('=') {
+                    Some((n, a)) => (n.trim(), Some(a.trim())),
+                    None => (directive, None),
+                };
+                match name.to_ascii_lowercase().as_str() {
+                    "no-store" => cc.no_store = true,
+                    "no-cache" => cc.no_cache = true,
+                    "only-if-cached" => cc.only_if_cached = true,
+                    "max-age" => cc.max_age = arg.and_then(parse_secs),
+                    "min-fresh" => cc.min_fresh = arg.and_then(parse_secs),
+                    // Bare `max-stale` accepts any staleness.
+                    "max-stale" => {
+                        cc.max_stale = Some(arg.and_then(parse_secs))
+                    }
                     _ => {}
                 }
             }
@@ -600,6 +753,10 @@ mod tests {
         );
     }
 
+    fn rcc() -> RequestCacheControl {
+        RequestCacheControl::default()
+    }
+
     #[test]
     fn lookup_fresh_is_hit() {
         let p = policy(60, 1024);
@@ -607,7 +764,7 @@ mod tests {
         let t0 = Instant::now();
         put(&s, "k", &[], Duration::from_secs(60), t0);
         assert!(matches!(
-            p.lookup(&s, "k", &HeaderMap::new(), t0),
+            p.lookup(&s, "k", &HeaderMap::new(), t0, &rcc()),
             Lookup::Hit(_)
         ));
     }
@@ -619,8 +776,14 @@ mod tests {
         let t0 = Instant::now();
         put(&s, "k", &[("etag", "\"v1\"")], Duration::from_secs(5), t0);
         assert!(matches!(
-            p.lookup(&s, "k", &HeaderMap::new(), t0 + Duration::from_secs(6)),
-            Lookup::Revalidate(_)
+            p.lookup(
+                &s,
+                "k",
+                &HeaderMap::new(),
+                t0 + Duration::from_secs(6),
+                &rcc()
+            ),
+            Lookup::Revalidate { .. }
         ));
     }
 
@@ -631,7 +794,13 @@ mod tests {
         let t0 = Instant::now();
         put(&s, "k", &[], Duration::from_secs(5), t0);
         assert!(matches!(
-            p.lookup(&s, "k", &HeaderMap::new(), t0 + Duration::from_secs(6)),
+            p.lookup(
+                &s,
+                "k",
+                &HeaderMap::new(),
+                t0 + Duration::from_secs(6),
+                &rcc()
+            ),
             Lookup::Miss
         ));
         // The dead entry was dropped on the way out.
@@ -645,8 +814,8 @@ mod tests {
         let t0 = Instant::now();
         put(&s, "k", &[("etag", "\"v1\"")], Duration::from_secs(5), t0);
         let stale_at = t0 + Duration::from_secs(6);
-        let Lookup::Revalidate(entry) =
-            p.lookup(&s, "k", &HeaderMap::new(), stale_at)
+        let Lookup::Revalidate { entry, .. } =
+            p.lookup(&s, "k", &HeaderMap::new(), stale_at, &rcc())
         else {
             panic!("expected revalidate");
         };
@@ -667,8 +836,161 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         // And the entry is fresh again -- next lookup is a plain hit.
         assert!(matches!(
-            p.lookup(&s, "k", &HeaderMap::new(), stale_at),
+            p.lookup(&s, "k", &HeaderMap::new(), stale_at, &rcc()),
             Lookup::Hit(_)
         ));
+    }
+
+    // -- Phase 3: client directives + RFC 5861 ---------------------
+
+    // Store an entry with explicit stale-while-revalidate /
+    // stale-if-error windows.
+    fn put_windows(
+        store: &CacheStore,
+        key: &str,
+        validator: bool,
+        lifetime: Duration,
+        swr: Duration,
+        sie: Duration,
+        at: Instant,
+    ) {
+        let mut h = HeaderMap::new();
+        if validator {
+            h.insert(
+                HeaderName::from_static("etag"),
+                HeaderValue::from_static("\"v1\""),
+            );
+        }
+        store.insert(
+            key.to_owned(),
+            Arc::new(
+                StoredResponse::new(
+                    StatusCode::OK,
+                    &h,
+                    Bytes::from_static(b"body"),
+                    lifetime,
+                    Duration::ZERO,
+                    vec![],
+                    at,
+                )
+                .with_stale_windows(swr, sie),
+            ),
+        );
+    }
+
+    #[test]
+    fn client_no_cache_forces_revalidation_of_fresh_entry() {
+        let p = policy(60, 1024);
+        let s = store();
+        let t0 = Instant::now();
+        put(&s, "k", &[("etag", "\"v1\"")], Duration::from_secs(60), t0);
+        let mut cc = rcc();
+        cc.no_cache = true;
+        assert!(matches!(
+            p.lookup(&s, "k", &HeaderMap::new(), t0, &cc),
+            Lookup::Revalidate { .. }
+        ));
+    }
+
+    #[test]
+    fn client_max_age_treats_old_entry_as_stale() {
+        let p = policy(600, 1024);
+        let s = store();
+        let t0 = Instant::now();
+        put(&s, "k", &[("etag", "\"v1\"")], Duration::from_secs(600), t0);
+        let mut cc = rcc();
+        cc.max_age = Some(5); // client accepts at most 5s old
+        // Entry is fresh by the origin but 10s old: client rejects it.
+        assert!(matches!(
+            p.lookup(
+                &s,
+                "k",
+                &HeaderMap::new(),
+                t0 + Duration::from_secs(10),
+                &cc
+            ),
+            Lookup::Revalidate { .. }
+        ));
+    }
+
+    #[test]
+    fn client_max_stale_serves_stale_entry() {
+        let p = policy(60, 1024);
+        let s = store();
+        let t0 = Instant::now();
+        put(&s, "k", &[], Duration::from_secs(5), t0);
+        let mut cc = rcc();
+        cc.max_stale = Some(Some(100)); // accept up to 100s stale
+        // 6s stored, 1s stale -> served from cache.
+        assert!(matches!(
+            p.lookup(
+                &s,
+                "k",
+                &HeaderMap::new(),
+                t0 + Duration::from_secs(6),
+                &cc
+            ),
+            Lookup::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn stale_while_revalidate_window_serves_stale() {
+        let p = policy(60, 1024);
+        let s = store();
+        let t0 = Instant::now();
+        put_windows(
+            &s,
+            "k",
+            true,
+            Duration::from_secs(5),
+            Duration::from_secs(60), // swr
+            Duration::ZERO,
+            t0,
+        );
+        // 2s past fresh, within the 60s swr window.
+        assert!(matches!(
+            p.lookup(
+                &s,
+                "k",
+                &HeaderMap::new(),
+                t0 + Duration::from_secs(7),
+                &rcc()
+            ),
+            Lookup::StaleWhileRevalidate(_)
+        ));
+    }
+
+    #[test]
+    fn stale_if_error_keeps_validatorless_entry_for_fallback() {
+        let p = policy(60, 1024);
+        let s = store();
+        let t0 = Instant::now();
+        // No validator, but a stale-if-error window.
+        put_windows(
+            &s,
+            "k",
+            false,
+            Duration::from_secs(5),
+            Duration::ZERO,
+            Duration::from_secs(60), // sie
+            t0,
+        );
+        let l = p.lookup(
+            &s,
+            "k",
+            &HeaderMap::new(),
+            t0 + Duration::from_secs(7),
+            &rcc(),
+        );
+        match l {
+            Lookup::Revalidate {
+                serve_stale_on_error,
+                ..
+            } => assert!(serve_stale_on_error),
+            _ => panic!("expected revalidate with stale-on-error"),
+        }
+        // The entry is retained (not dropped) for the fallback.
+        assert!(s.get("k").is_some());
     }
 }

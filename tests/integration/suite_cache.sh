@@ -198,3 +198,99 @@ EOF
 
     stop_server
 }
+
+# Phase 3: client Cache-Control honouring + RFC 5861 stale serving.
+suite_cache_phase3() {
+    echo "=== Cache: client directives + stale-while/if ==="
+    local hport=8308 bport=9308
+
+    python3 - "$bport" <<'PYEOF' >/dev/null 2>&1 &
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+counts = {}
+def bump(k):
+    counts[k] = counts.get(k, 0) + 1
+    return counts[k]
+class H(BaseHTTPRequestHandler):
+    def send(self, code, body, headers):
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        p = self.path.split("?")[0]
+        inm = self.headers.get("If-None-Match", "")
+        if p == "/h":
+            n = bump("h")
+            self.send(200, ("[count=%d]" % n).encode(),
+                      [("Cache-Control", "max-age=300")])
+        elif p == "/sie":
+            # Revalidation always fails; the stale-if-error window lets
+            # the cached copy be served instead of the 500.
+            if inm:
+                self.send(500, b"origin error", [])
+            else:
+                n = bump("sie")
+                self.send(200, ("[count=%d]" % n).encode(),
+                          [("ETag", '"s1"'),
+                           ("Cache-Control",
+                            "max-age=1, stale-if-error=60")])
+        elif p == "/swr":
+            n = bump("swr")
+            self.send(200, ("[count=%d]" % n).encode(),
+                      [("ETag", '"w%d"' % n),
+                       ("Cache-Control",
+                        "max-age=1, stale-while-revalidate=60")])
+        else:
+            self.send(200, b"ok", [("Cache-Control", "no-store")])
+    def log_message(self, *a):
+        pass
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PYEOF
+    BACKEND_PIDS+=("$!")
+    sleep 0.3
+
+    cat >"$TMPDIR/cache3.kdl" <<EOF
+server { cache max-size=1048576 }
+listener "tcp://127.0.0.1:$hport"
+vhost localhost {
+    location "/" {
+        cache ttl=300 max-object-size=1024 honor-client-cache-control=#true
+        proxy { upstream "http://127.0.0.1:$bport" }
+    }
+}
+EOF
+    start_server "$TMPDIR/cache3.kdl" "$hport" \
+        || { fail "cache3/server_start" "hypershunt failed"; return; }
+    local base="http://127.0.0.1:$hport"
+
+    # Client no-store bypasses the cache (origin hit) and does not store,
+    # so the previously cached value is still served afterwards.
+    assert_body "cache/cc_store" "[count=1]" "$base/h"
+    assert_body "cache/cc_no_store_bypass" "[count=2]" "$base/h" \
+        -H "Cache-Control: no-store"
+    assert_body "cache/cc_cache_intact" "[count=1]" "$base/h"
+
+    # only-if-cached with nothing cached -> 504, no origin contact.
+    assert_status "cache/cc_only_if_cached_504" 504 "$base/uncached" \
+        -H "Cache-Control: only-if-cached"
+
+    # stale-if-error: once stale, a failing revalidation serves the
+    # stale body (HTTP 200, [count=1]) instead of the origin's 500.
+    assert_body "cache/sie_store" "[count=1]" "$base/sie"
+    sleep 2
+    assert_status "cache/sie_serves_stale_200" 200 "$base/sie"
+    assert_body "cache/sie_serves_stale_body" "[count=1]" "$base/sie"
+
+    # stale-while-revalidate: once stale, the stale body is served at
+    # once and a background refresh updates the cache for next time.
+    assert_body "cache/swr_store" "[count=1]" "$base/swr"
+    sleep 2
+    assert_body "cache/swr_serves_stale" "[count=1]" "$base/swr"
+    sleep 1
+    assert_body "cache/swr_refreshed" "[count=2]" "$base/swr"
+
+    stop_server
+}

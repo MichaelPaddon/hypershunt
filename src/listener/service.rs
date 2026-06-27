@@ -907,180 +907,16 @@ impl HypershuntService {
                             });
                         let mut resp = if let Some((store, policy)) = cache
                         {
-                            use std::sync::atomic::Ordering::Relaxed;
-                            let now = std::time::Instant::now();
-                            let key = policy.build_key(&req_ctx);
-                            match policy.lookup(
+                            serve_with_cache(
+                                req,
+                                &route.handler,
+                                &route.matched_prefix,
+                                &req_ctx,
                                 store,
-                                &key,
-                                req.headers(),
-                                now,
-                            ) {
-                                crate::cache::Lookup::Hit(hit) => {
-                                    state
-                                        .metrics
-                                        .cache_hits
-                                        .fetch_add(1, Relaxed);
-                                    hit
-                                }
-                                crate::cache::Lookup::Miss => {
-                                    // Single-flight: only the first
-                                    // request for a key fetches from the
-                                    // origin; concurrent misses wait and
-                                    // then serve the leader's stored
-                                    // response, so a slow backend isn't
-                                    // stampeded.
-                                    match store.begin_fetch(&key) {
-                                        crate::cache::FetchRole::Leader(
-                                            _lead,
-                                        ) => {
-                                            state
-                                                .metrics
-                                                .cache_misses
-                                                .fetch_add(1, Relaxed);
-                                            let req_headers =
-                                                req.headers().clone();
-                                            let raw = route
-                                                .handler
-                                                .handle(
-                                                    req,
-                                                    &route.matched_prefix,
-                                                    &req_ctx,
-                                                )
-                                                .await;
-                                            policy
-                                                .maybe_store(
-                                                    store,
-                                                    &state.metrics,
-                                                    key,
-                                                    &req_headers,
-                                                    raw,
-                                                    now,
-                                                )
-                                                .await
-                                            // `_lead` drops here, waking
-                                            // any followers.
-                                        }
-                                        crate::cache::FetchRole::Follower(
-                                            mut rx,
-                                        ) => {
-                                            // Wait for the leader to
-                                            // finish (Err == leader done,
-                                            // including the already-done
-                                            // race -- no lost wakeup).
-                                            let _ = rx.changed().await;
-                                            let now2 =
-                                                std::time::Instant::now();
-                                            match policy.lookup(
-                                                store,
-                                                &key,
-                                                req.headers(),
-                                                now2,
-                                            ) {
-                                                crate::cache::Lookup::Hit(
-                                                    hit,
-                                                ) => {
-                                                    state
-                                                        .metrics
-                                                        .cache_hits
-                                                        .fetch_add(
-                                                            1, Relaxed,
-                                                        );
-                                                    hit
-                                                }
-                                                _ => {
-                                                    // Leader stored
-                                                    // nothing usable for
-                                                    // us; fetch ourselves.
-                                                    state
-                                                        .metrics
-                                                        .cache_misses
-                                                        .fetch_add(
-                                                            1, Relaxed,
-                                                        );
-                                                    let req_headers = req
-                                                        .headers()
-                                                        .clone();
-                                                    let raw = route
-                                                        .handler
-                                                        .handle(
-                                                            req,
-                                                            &route
-                                                                .matched_prefix,
-                                                            &req_ctx,
-                                                        )
-                                                        .await;
-                                                    policy
-                                                        .maybe_store(
-                                                            store,
-                                                            &state.metrics,
-                                                            key,
-                                                            &req_headers,
-                                                            raw,
-                                                            now2,
-                                                        )
-                                                        .await
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                crate::cache::Lookup::Revalidate(entry) => {
-                                    state
-                                        .metrics
-                                        .cache_revalidations
-                                        .fetch_add(1, Relaxed);
-                                    // Keep the client's original headers
-                                    // (its own conditional + Vary inputs)
-                                    // before swapping in our validators.
-                                    let req_headers = req.headers().clone();
-                                    let h = req.headers_mut();
-                                    h.remove(
-                                        hyper::header::IF_NONE_MATCH,
-                                    );
-                                    h.remove(
-                                        hyper::header::IF_MODIFIED_SINCE,
-                                    );
-                                    for (n, v) in
-                                        entry.revalidation_headers()
-                                    {
-                                        h.insert(n, v);
-                                    }
-                                    let raw = route
-                                        .handler
-                                        .handle(
-                                            req,
-                                            &route.matched_prefix,
-                                            &req_ctx,
-                                        )
-                                        .await;
-                                    if raw.status()
-                                        == hyper::StatusCode::NOT_MODIFIED
-                                    {
-                                        policy.serve_revalidated(
-                                            store,
-                                            key,
-                                            entry,
-                                            raw,
-                                            &req_headers,
-                                            now,
-                                        )
-                                    } else {
-                                        // Origin returned a fresh
-                                        // representation: store it.
-                                        policy
-                                            .maybe_store(
-                                                store,
-                                                &state.metrics,
-                                                key,
-                                                &req_headers,
-                                                raw,
-                                                now,
-                                            )
-                                            .await
-                                    }
-                                }
-                            }
+                                policy,
+                                &state.metrics,
+                            )
+                            .await
                         } else {
                             route
                                 .handler
@@ -1245,6 +1081,269 @@ impl HypershuntService {
             first_request: Arc::new(FirstRequest::default()),
         }
     }
+}
+
+// Response-cache serving path, factored out of dispatch().  Performs
+// the RFC 9111 read-through: serve a hit / stale-while-revalidate /
+// revalidated / stale-if-error response, or fetch through single-flight
+// and store.  Honours request `Cache-Control` only when the location
+// opted in (otherwise `rcc` is empty and every client directive is a
+// no-op).
+#[allow(clippy::too_many_arguments)]
+async fn serve_with_cache(
+    mut req: Request<ReqBody>,
+    handler: &Arc<dyn crate::handler::Handler>,
+    prefix: &str,
+    ctx: &RequestContext<'_>,
+    store: &Arc<crate::cache::CacheStore>,
+    policy: &Arc<crate::cache::CachePolicy>,
+    metrics: &Arc<crate::metrics::Metrics>,
+) -> crate::error::HttpResponse {
+    use crate::cache::{FetchRole, Lookup};
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = Instant::now();
+    let key = policy.build_key(ctx);
+    let rcc = if policy.honors_client_cc() {
+        crate::cache::RequestCacheControl::parse(req.headers())
+    } else {
+        crate::cache::RequestCacheControl::default()
+    };
+    // Client `no-store`: never read from or write to the cache.
+    if rcc.no_store {
+        return handler.handle(req, prefix, ctx).await;
+    }
+    match policy.lookup(store, &key, req.headers(), now, &rcc) {
+        Lookup::Hit(hit) => {
+            metrics.cache_hits.fetch_add(1, Relaxed);
+            hit
+        }
+        Lookup::StaleWhileRevalidate(entry) => {
+            // Serve the stale body now; refresh in the background.
+            metrics.cache_hits.fetch_add(1, Relaxed);
+            let resp = policy.stale_response(&entry, now);
+            spawn_swr_refresh(
+                handler.clone(),
+                prefix.to_owned(),
+                store.clone(),
+                policy.clone(),
+                metrics.clone(),
+                key,
+                entry,
+                req.headers().clone(),
+                OwnedCtx::from(ctx),
+            );
+            resp
+        }
+        Lookup::Revalidate {
+            entry,
+            serve_stale_on_error,
+        } => {
+            metrics.cache_revalidations.fetch_add(1, Relaxed);
+            // Preserve the client's original headers, then swap in our
+            // stored validators for the origin round-trip.
+            let req_headers = req.headers().clone();
+            let h = req.headers_mut();
+            h.remove(hyper::header::IF_NONE_MATCH);
+            h.remove(hyper::header::IF_MODIFIED_SINCE);
+            for (n, v) in entry.revalidation_headers() {
+                h.insert(n, v);
+            }
+            let raw = handler.handle(req, prefix, ctx).await;
+            let status = raw.status();
+            if status == StatusCode::NOT_MODIFIED {
+                policy.serve_revalidated(
+                    store,
+                    key,
+                    entry,
+                    raw,
+                    &req_headers,
+                    now,
+                )
+            } else if serve_stale_on_error && status.is_server_error() {
+                // stale-if-error: the origin failed; serve the stale
+                // copy rather than propagate the error.
+                metrics.cache_hits.fetch_add(1, Relaxed);
+                policy.stale_response(&entry, now)
+            } else {
+                policy
+                    .maybe_store(
+                        store, metrics, key, &req_headers, raw, now,
+                    )
+                    .await
+            }
+        }
+        Lookup::Miss => {
+            if rcc.only_if_cached {
+                // RFC 9111 §5.2.1.7: nothing cached, so do not contact
+                // the origin -- answer 504.
+                metrics.cache_misses.fetch_add(1, Relaxed);
+                let mut r = Response::new(bytes_body(Bytes::from_static(
+                    b"<h1>504 Gateway Timeout</h1>",
+                )));
+                *r.status_mut() = StatusCode::GATEWAY_TIMEOUT;
+                return r;
+            }
+            // Single-flight: the first request for a key fetches; later
+            // ones wait and then serve the leader's stored response.
+            match store.begin_fetch(&key) {
+                FetchRole::Leader(_lead) => {
+                    metrics.cache_misses.fetch_add(1, Relaxed);
+                    let req_headers = req.headers().clone();
+                    let raw = handler.handle(req, prefix, ctx).await;
+                    policy
+                        .maybe_store(
+                            store, metrics, key, &req_headers, raw, now,
+                        )
+                        .await
+                    // `_lead` drops here, waking any followers.
+                }
+                FetchRole::Follower(mut rx) => {
+                    // Err == leader done (sticky; no lost wakeup).
+                    let _ = rx.changed().await;
+                    let now2 = Instant::now();
+                    match policy.lookup(
+                        store,
+                        &key,
+                        req.headers(),
+                        now2,
+                        &rcc,
+                    ) {
+                        Lookup::Hit(hit) => {
+                            metrics.cache_hits.fetch_add(1, Relaxed);
+                            hit
+                        }
+                        _ => {
+                            // Leader cached nothing usable for us.
+                            metrics.cache_misses.fetch_add(1, Relaxed);
+                            let req_headers = req.headers().clone();
+                            let raw =
+                                handler.handle(req, prefix, ctx).await;
+                            policy
+                                .maybe_store(
+                                    store, metrics, key, &req_headers,
+                                    raw, now2,
+                                )
+                                .await
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Owned snapshot of a `RequestContext` so a background
+// stale-while-revalidate task can rebuild it after the original
+// request has been consumed.
+struct OwnedCtx {
+    client_ip: String,
+    username: String,
+    groups: String,
+    path: String,
+    query: String,
+    path_and_query: String,
+    host: String,
+    scheme: &'static str,
+    cert_subject: String,
+    cert_sans: String,
+}
+
+impl OwnedCtx {
+    fn from(ctx: &RequestContext<'_>) -> Self {
+        OwnedCtx {
+            client_ip: ctx.client_ip.to_owned(),
+            username: ctx.username.to_owned(),
+            groups: ctx.groups.to_owned(),
+            path: ctx.path.to_owned(),
+            query: ctx.query.to_owned(),
+            path_and_query: ctx.path_and_query.to_owned(),
+            host: ctx.host.to_owned(),
+            scheme: if ctx.scheme == "https" { "https" } else { "http" },
+            cert_subject: ctx.client_cert_subject.to_owned(),
+            cert_sans: ctx.client_cert_sans.to_owned(),
+        }
+    }
+
+    fn as_ctx(&self) -> RequestContext<'_> {
+        RequestContext {
+            client_ip: &self.client_ip,
+            username: &self.username,
+            groups: &self.groups,
+            method: "GET",
+            path: &self.path,
+            query: &self.query,
+            path_and_query: &self.path_and_query,
+            host: &self.host,
+            scheme: self.scheme,
+            client_cert_subject: &self.cert_subject,
+            client_cert_sans: &self.cert_sans,
+        }
+    }
+}
+
+// Spawn the stale-while-revalidate background refresh.  De-duplicated
+// through the store's single-flight registry so a burst of SWR hits
+// triggers at most one origin refresh per key.  Replays the original
+// request headers (so any Vary inputs match) plus the stored
+// validators, then stores the result like a normal fetch.
+#[allow(clippy::too_many_arguments)]
+fn spawn_swr_refresh(
+    handler: Arc<dyn crate::handler::Handler>,
+    prefix: String,
+    store: Arc<crate::cache::CacheStore>,
+    policy: Arc<crate::cache::CachePolicy>,
+    metrics: Arc<crate::metrics::Metrics>,
+    key: String,
+    entry: Arc<crate::cache::StoredResponse>,
+    base_headers: hyper::HeaderMap,
+    owned: OwnedCtx,
+) {
+    crate::task::spawn_supervised("cache.swr", async move {
+        // Only one background refresh per key at a time.
+        let _lead = match store.begin_fetch(&key) {
+            crate::cache::FetchRole::Leader(g) => g,
+            crate::cache::FetchRole::Follower(_) => return,
+        };
+        let now = Instant::now();
+        let ctx = owned.as_ctx();
+        let mut headers = base_headers.clone();
+        headers.remove(hyper::header::IF_NONE_MATCH);
+        headers.remove(hyper::header::IF_MODIFIED_SINCE);
+        for (n, v) in entry.revalidation_headers() {
+            headers.insert(n, v);
+        }
+        let mut builder = Request::builder()
+            .method(hyper::Method::GET)
+            .uri(owned.path_and_query.as_str());
+        if let Some(hb) = builder.headers_mut() {
+            *hb = headers;
+        }
+        let body = http_body_util::Empty::<Bytes>::new()
+            .map_err(|never| match never {})
+            .boxed_unsync();
+        let req = match builder.body(body) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let raw = handler.handle(req, &prefix, &ctx).await;
+        metrics
+            .cache_revalidations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if raw.status() == StatusCode::NOT_MODIFIED {
+            policy.serve_revalidated(
+                &store,
+                key,
+                entry,
+                raw,
+                &base_headers,
+                now,
+            );
+        } else {
+            policy
+                .maybe_store(&store, &metrics, key, &base_headers, raw, now)
+                .await;
+        }
+    });
 }
 
 // True iff the request carried credential material -- an `Authorization`
