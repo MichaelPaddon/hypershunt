@@ -140,7 +140,9 @@ EOF
         -H "X-Variant: a"
     assert_body "cache/vary_a_hit" "[v=a-1]" "$base/vary" \
         -H "X-Variant: a"
-    assert_body "cache/vary_b_distinct" "[v=b-2]" "$base/vary" \
+    # A different variant is a miss served its own body (per-variant
+    # backend counter), never variant a's "[v=a-1]".
+    assert_body "cache/vary_b_distinct" "[v=b-1]" "$base/vary" \
         -H "X-Variant: b"
 
     # Oversized response (> max-object-size) streams through uncached.
