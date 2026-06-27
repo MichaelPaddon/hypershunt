@@ -1865,6 +1865,26 @@ A client revalidating with `If-None-Match` (against the cached `ETag`) or
 `If-Modified-Since` (against `Last-Modified`) gets a `304 Not Modified`
 straight from the cache, with no body transferred.
 
+### Revalidating stale entries
+
+When an entry has gone stale but carries a validator (`ETag` or
+`Last-Modified`), hypershunt revalidates it against the origin rather
+than refetching the whole body: it sends the stored validator as
+`If-None-Match` / `If-Modified-Since`.  If the origin answers `304 Not
+Modified`, the cached body is reused and its freshness is refreshed from
+the 304; if the origin returns a new `200`, that response replaces the
+entry.  This saves the body transfer on the common "still unchanged"
+case and works for any backend that honours conditional requests
+(reverse proxy, static files, the CGI gateways).
+
+### Coalescing concurrent requests
+
+On a cache miss, only the first request for a key contacts the origin;
+other requests that arrive for the same key while that fetch is in
+flight wait for it and are then served from the freshly stored response.
+A burst of identical requests to an empty cache therefore hits a slow
+backend once, not once per request.
+
 ### Client cache-busting
 
 By default a client's request `Cache-Control` (`no-cache`, `no-store`,
@@ -1884,7 +1904,7 @@ an identity variable.
 ### Surfacing on `/status`
 
 The status page and its JSON report cache hits, misses, stores,
-bypasses, evictions, and the live entry/byte counts.
+bypasses, evictions, revalidations, and the live entry/byte counts.
 
 **See also:** [Reference — cache](reference.md#cache-location),
 [Status, health, metrics](#status-health-metrics).
