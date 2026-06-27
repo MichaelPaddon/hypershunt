@@ -12,6 +12,24 @@ homepage = "https://github.com/MichaelPaddon/hypershunt"
 documentation = "https://github.com/MichaelPaddon/hypershunt/tree/main/docs"
 keywords = ["http", "reverse-proxy", "server", "tls", "http3"]
 categories = ["network-programming", "web-programming::http-server"]
+# Only source needed to build the binary ships in the published crate;
+# docs/, tests/, packaging/, scripts/, and .github/ are repo-only.
+# Cargo.toml, Cargo.lock (bin crate), and README.md (readme=) come along
+# automatically, but LICENSE is listed explicitly since the manifest uses
+# the `license` SPDX field, not `license-file`.
+# Patterns are gitignore-style; a leading `/` anchors to the package root
+# so a bare name (e.g. README.md) can't also pull in docs/vendor/README.md.
+include = [
+    "/src/**/*",
+    "/build.rs",
+    "/examples/**/*",   # h3get / h2c_connect_echo are declared [[example]] targets
+    "/README.md",
+    "/LICENSE",
+    # Embedded at compile time by src/handler/status/render_html.rs
+    # (include_bytes!), so the build needs them in the packaged tarball.
+    "/docs/hs-icon.svg",
+    "/docs/hs-favicon.svg",
+]
 
 [[bin]]
 name = "hypershunt"

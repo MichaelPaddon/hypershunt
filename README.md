@@ -114,6 +114,16 @@ sudo rpm -i  hypershunt-<version>.<arch>.rpm    # RHEL/Fedora
 sudo systemctl enable --now hypershunt
 ```
 
+Or install from source via crates.io:
+
+```sh
+cargo install hypershunt
+```
+
+This compiles from source and needs a C toolchain (cmake + a C compiler;
+PAM headers on Unix) for the native dependencies --- the prebuilt
+packages above are the lighter path.
+
 Building from source (prerequisites, tests, and packaging) is covered in
 [BUILD.md](BUILD.md).
 
