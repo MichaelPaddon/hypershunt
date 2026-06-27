@@ -8,7 +8,7 @@ To cut a release, see [`RELEASING.md`](RELEASING.md).
 
 ## Prerequisites
 
-- **Rust** — a recent stable toolchain. The crate's MSRV is **1.87**
+- **Rust** — a recent stable toolchain. The crate's MSRV is **1.96**
   (set as `rust-version` in `Cargo.toml`). Install via
   [rustup](https://rustup.rs).
 - **System libraries** (build-time):
