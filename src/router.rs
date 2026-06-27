@@ -39,6 +39,10 @@ pub struct Route {
     /// body`.  When `Some`, requests with `Content-Length` over the
     /// listed value get a 413 after routing resolves the location.
     pub max_request_body: Option<u64>,
+    /// Compiled response-cache policy; `Some` only when the location
+    /// has a `cache { }` block.  Drives read-through/write-through at
+    /// the dispatch site against the shared `CacheStore`.
+    pub cache_policy: Option<Arc<crate::cache::CachePolicy>>,
 }
 
 // Runtime representation of a virtual host, with handlers pre-built.
@@ -72,6 +76,9 @@ struct Location {
     // own handler runs unchanged.  Wrapped in `Arc` so the
     // compiled regex is shared rather than cloned per request.
     rewrite: Option<Arc<Rewrite>>,
+    // Compiled response-cache policy; None when the location has no
+    // `cache { }` block (the common case, zero overhead).
+    cache_policy: Option<Arc<crate::cache::CachePolicy>>,
 }
 
 /// Runtime rewrite: compiled regex plus its replacement template.
@@ -250,6 +257,7 @@ impl Router {
                 header_rules: loc.header_rules.clone(),
                 rate_limits: loc.rate_limits.clone(),
                 max_request_body: loc.max_request_body,
+                cache_policy: loc.cache_policy.clone(),
             });
         }
         tracing::warn!(
@@ -611,6 +619,9 @@ fn build_vhost(
             .map(rewrite_from_config)
             .transpose()?
             .map(Arc::new);
+        let cache_policy = loc.cache.as_ref().map(|c| {
+            Arc::new(crate::cache::CachePolicy::compile(c))
+        });
         locations.push(Location {
             path: loc.path.clone(),
             handler,
@@ -622,6 +633,7 @@ fn build_vhost(
             max_request_body: loc.max_request_body,
             matcher,
             rewrite,
+            cache_policy,
         });
     }
     Ok(VHost {
@@ -835,6 +847,23 @@ impl Router {
             }
         }
         out
+    }
+
+    /// True when at least one location opted into response caching.
+    /// Used at startup to decide whether to build the shared store.
+    pub fn any_cache_enabled(&self) -> bool {
+        self.tables.values().any(|table| {
+            table
+                .literals
+                .values()
+                .chain(table.patterns.iter().map(|(_, v)| v))
+                .chain(table.default.iter())
+                .any(|v| {
+                    v.locations
+                        .iter()
+                        .any(|loc| loc.cache_policy.is_some())
+                })
+        })
     }
 }
 

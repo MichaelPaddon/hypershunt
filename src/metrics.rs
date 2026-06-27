@@ -238,6 +238,17 @@ pub struct RateLimitSnap {
 }
 
 #[derive(Clone, Copy, Default)]
+pub struct CacheSnap {
+    pub hits: u64,
+    pub misses: u64,
+    pub stores: u64,
+    pub bypass: u64,
+    pub evictions: u64,
+    pub entries: u64,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Copy, Default)]
 pub struct DatagramSnap {
     pub flows_active: u64,
     pub datagrams_in: u64,
@@ -350,6 +361,7 @@ pub struct Snapshot {
     pub lb: LbSnap,
     pub upstream: UpstreamSnap,
     pub rate_limit: RateLimitSnap,
+    pub cache: CacheSnap,
     pub oidc: OidcSnap,
     pub http_conns: HttpConnSnap,
     pub fcgi: BackendSnap,
@@ -692,6 +704,19 @@ pub struct Metrics {
     // refreshed by tick_loop.
     pub rate_limit_triggers: AtomicU64,
     pub rate_limit_active_keys: AtomicU64,
+    // Response-cache counters.  `hits`/`misses` count read-through
+    // outcomes; `stores` counts responses written into the cache;
+    // `bypass` counts cacheable-method responses that were ineligible
+    // (uncacheable directives, oversized, ...); `evictions` counts
+    // entries dropped by LRU or TTL.  `entries`/`bytes` are live
+    // gauges of the shared store, refreshed by the eviction task.
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
+    pub cache_stores: AtomicU64,
+    pub cache_bypass: AtomicU64,
+    pub cache_evictions: AtomicU64,
+    pub cache_entries: AtomicU64,
+    pub cache_bytes: AtomicU64,
     // OCSP-stapling: count of background fetches that produced a
     // valid staple, and count of failures (HTTP / parse / responder
     // status / no AIA).  Together they bound the freshness of the
@@ -861,6 +886,13 @@ impl Metrics {
             proxy_lb_health_recoveries: AtomicU64::new(0),
             rate_limit_triggers: AtomicU64::new(0),
             rate_limit_active_keys: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            cache_stores: AtomicU64::new(0),
+            cache_bypass: AtomicU64::new(0),
+            cache_evictions: AtomicU64::new(0),
+            cache_entries: AtomicU64::new(0),
+            cache_bytes: AtomicU64::new(0),
             ocsp_refreshes: AtomicU64::new(0),
             ocsp_refresh_failures: AtomicU64::new(0),
             datagram_flows_active: AtomicU64::new(0),
@@ -1142,6 +1174,7 @@ impl Metrics {
             lb: self.lb_snap(),
             upstream: self.upstream_snap(),
             rate_limit: self.rate_limit_snap(),
+            cache: self.cache_snap(),
             oidc: self.oidc_snap(),
             http_conns: HttpConnSnap {
                 active: self.http_conns_active.load(Ordering::Relaxed),
@@ -1307,6 +1340,18 @@ impl Metrics {
         RateLimitSnap {
             triggers: self.rate_limit_triggers.load(Ordering::Relaxed),
             active_keys: self.rate_limit_active_keys.load(Ordering::Relaxed),
+        }
+    }
+
+    fn cache_snap(&self) -> CacheSnap {
+        CacheSnap {
+            hits: self.cache_hits.load(Ordering::Relaxed),
+            misses: self.cache_misses.load(Ordering::Relaxed),
+            stores: self.cache_stores.load(Ordering::Relaxed),
+            bypass: self.cache_bypass.load(Ordering::Relaxed),
+            evictions: self.cache_evictions.load(Ordering::Relaxed),
+            entries: self.cache_entries.load(Ordering::Relaxed),
+            bytes: self.cache_bytes.load(Ordering::Relaxed),
         }
     }
 

@@ -891,10 +891,70 @@ impl HypershuntService {
                             );
                         }
 
-                        let mut resp = route
-                            .handler
-                            .handle(req, &route.matched_prefix, &req_ctx)
-                            .await;
+                        // Response cache (RFC 9111).  When the location
+                        // opted in and the method is cacheable, serve a
+                        // fresh hit or store the handler's response.
+                        // The wrap is tight around handle() so the
+                        // per-request Set-Cookie / JWT issuance below
+                        // runs on hits and misses alike and never enters
+                        // the shared cache.
+                        let cache = state
+                            .cache
+                            .as_ref()
+                            .zip(route.cache_policy.as_ref())
+                            .filter(|(_, p)| {
+                                p.request_cacheable(req.method())
+                            });
+                        let mut resp = if let Some((store, policy)) = cache
+                        {
+                            let now = std::time::Instant::now();
+                            let key = policy.build_key(&req_ctx);
+                            if let Some(hit) = policy.lookup(
+                                store,
+                                &state.metrics,
+                                &key,
+                                req.headers(),
+                                now,
+                            ) {
+                                hit
+                            } else {
+                                state.metrics.cache_misses.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                // Snapshot request headers before the
+                                // handler consumes `req`; the store path
+                                // needs them for Vary capture.
+                                let req_headers = req.headers().clone();
+                                let raw = route
+                                    .handler
+                                    .handle(
+                                        req,
+                                        &route.matched_prefix,
+                                        &req_ctx,
+                                    )
+                                    .await;
+                                policy
+                                    .maybe_store(
+                                        store,
+                                        &state.metrics,
+                                        key,
+                                        &req_headers,
+                                        raw,
+                                        now,
+                                    )
+                                    .await
+                            }
+                        } else {
+                            route
+                                .handler
+                                .handle(
+                                    req,
+                                    &route.matched_prefix,
+                                    &req_ctx,
+                                )
+                                .await
+                        };
 
                         // Apply response-header rules to the response
                         // before it reaches the client.

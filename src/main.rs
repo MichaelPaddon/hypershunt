@@ -11,6 +11,7 @@ mod access;
 mod access_log;
 mod auth;
 mod bootstrap;
+mod cache;
 mod cert;
 mod compress;
 mod config;
@@ -312,6 +313,27 @@ async fn main() -> anyhow::Result<()> {
         metrics.clone(),
     );
 
+    // Response cache: build the single shared store only when a
+    // location opted in, and spawn the TTL sweeper.  The store is
+    // carried forward across SIGHUP (see reload.rs) so cached entries
+    // survive a reload.
+    let cache_store = if router.any_cache_enabled() {
+        let max_size = config
+            .server
+            .cache
+            .as_ref()
+            .map(|c| c.max_size)
+            .unwrap_or(256 * 1024 * 1024);
+        let store = cache::CacheStore::new(max_size, metrics.clone());
+        let _cache_eviction = cache::spawn_cache_eviction_task(
+            store.clone(),
+            metrics.clone(),
+        );
+        Some(store)
+    } else {
+        None
+    };
+
     // Construct the OIDC provider in not-ready state and let it
     // bootstrap itself in the background.  Discovery failures do
     // not block startup; the provider's endpoints serve 503 until
@@ -358,6 +380,7 @@ async fn main() -> anyhow::Result<()> {
         jwt_manager,
         oidc,
         access_log,
+        cache: cache_store,
     }));
 
     // Background task: advance the request-rate ring buffer every 5 s.

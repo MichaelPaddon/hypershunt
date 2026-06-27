@@ -107,6 +107,11 @@ pub struct ServerConfig {
     pub health: HealthConfig,
     // Named policy blocks available to all vhosts/locations.
     pub policies: HashMap<String, Vec<PolicyRuleDef>>,
+    // Server-wide response-cache settings.  `None` when no `cache { }`
+    // block appears in the `server` node; sizes the single shared
+    // store when present.  Mere presence does not enable caching --
+    // locations opt in with their own `cache { }` block.
+    pub cache: Option<CacheGlobalConfig>,
     // Per-status-code custom error pages.
     pub error_pages: Vec<(u16, ErrorPageDef)>,
     // Unix file mode for ACME private key files (key.pem).
@@ -153,6 +158,7 @@ impl Default for ServerConfig {
             geoip: None,
             health: Default::default(),
             policies: HashMap::new(),
+            cache: None,
             error_pages: Vec::new(),
             cert_key_mode: None,
             access_log: None,
@@ -620,8 +626,48 @@ pub struct LocationConfig {
     // does not match, the location's own handler runs on the
     // original URI -- so a non-matching rewrite is a no-op.
     pub rewrite: Option<RewriteConfig>,
+    // Optional response cache.  Presence of a `cache { }` block on
+    // the location opts that location into caching; `None` keeps the
+    // historical behaviour (no caching).
+    pub cache: Option<CacheConfig>,
     // 1-based source line of this location's node, for error messages.
     pub line: usize,
+}
+
+/// Server-wide response-cache sizing.  The store is shared across
+/// every cache-enabled location; this bounds its total memory.
+#[derive(Debug, Clone)]
+pub struct CacheGlobalConfig {
+    /// Hard upper bound, in bytes, on the sum of all cached response
+    /// bodies.  LRU eviction keeps the store at or under this.
+    pub max_size: u64,
+}
+
+/// Per-location response-cache opt-in.  The block's presence enables
+/// caching for the location; the fields tune it.  Converted to a
+/// `cache::CachePolicy` in router.rs.
+#[derive(Debug, Clone)]
+pub struct CacheConfig {
+    /// Freshness cap, in seconds.  The effective lifetime of a
+    /// cached entry is the smaller of this and any origin-declared
+    /// `max-age`/`s-maxage`/`Expires`, so a cached response is never
+    /// served staler than the origin permits.
+    pub ttl_secs: u64,
+    /// Largest response body, in bytes, eligible for caching.
+    /// Responses whose `Content-Length` exceeds this (or is absent)
+    /// stream through uncached.
+    pub max_object_size: u64,
+    /// Cacheable request methods (upper-case).  Defaults to `["GET"]`.
+    pub methods: Vec<String>,
+    /// Optional cache-key template, rendered against the request
+    /// context (same `{var}` syntax as header templates).  `None`
+    /// uses the default key: method + scheme + host + path + query.
+    pub key: Option<String>,
+    /// Honour client request `Cache-Control` directives (no-cache,
+    /// no-store, max-age, ...).  Defaults to `false` so clients
+    /// cannot bust a shared cache; the honouring path lands in a
+    /// later phase.
+    pub honor_client_cache_control: bool,
 }
 
 /// One configured `rewrite from="..." to="..."` directive.
