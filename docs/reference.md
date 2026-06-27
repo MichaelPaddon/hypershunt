@@ -1161,6 +1161,31 @@ vhost "internal.example.com" {
 }
 ```
 
+### cache (server)
+
+**Guide:** [Response caching](guide.md#response-caching).
+
+**Child** of [`server`](#server).  Optional.
+
+Sizes the single in-memory response store shared by every cache-enabled
+location.  Its presence alone does **not** enable caching — locations
+opt in with their own [`cache`](#cache-location) block.
+
+```kdl
+server {
+    cache max-size=268435456   // 256 MiB
+}
+```
+
+#### max-size
+
+**Property** on [`cache`](#cache-server).  Optional integer (bytes).
+
+Hard upper bound on the total bytes held across all cached entries.
+Least-recently-used entries are evicted to stay within it.
+
+**Default:** `268435456` (256 MiB).
+
 ### error-page
 
 **Child** of [`server`](#server).  Optional, repeatable.
@@ -2303,6 +2328,84 @@ Missing-header / anonymous-user requests share the `""` bucket.
 Display name surfaced on the `/status` page.  When unset, hypershunt
 synthesises one from the location path and the limiter's
 declaration order (`<loc>-rl-<idx>`).
+
+#### cache (location)
+
+**Guide:** [Response caching](guide.md#response-caching).
+
+**Child** of [`location`](#location).  Optional.
+
+Opt the location into the in-memory response cache (RFC 9111).  The
+block's presence enables caching; the properties tune it.  Caching is
+off for any location without a `cache` block, so existing configs are
+unchanged.  All cache-enabled locations share one store sized by the
+server [`cache`](#cache-server) block.
+
+```kdl
+location "/assets/" {
+    cache ttl=3600 max-object-size=1048576
+    static root="/var/www/assets"
+}
+```
+
+Only `GET` (and `HEAD`, when listed) responses are cacheable, and only
+when the response permits it (no `no-store`/`private`/`no-cache`, no
+`Set-Cookie`, a cacheable status, `Content-Length` within
+[`max-object-size`](#max-object-size), and — for `Authorization`
+requests — an explicit `public`/`s-maxage`).  `Vary` is honoured.
+
+##### ttl
+
+**Property** on [`cache`](#cache-location).  Optional integer (seconds).
+
+Upper bound on an entry's freshness lifetime.  The effective lifetime is
+the smaller of `ttl` and any origin `s-maxage`/`max-age`/`Expires`, so a
+response is never served staler than the origin allows.  With no origin
+signal, `ttl` is the lifetime.
+
+**Default:** `60`.
+
+##### max-object-size
+
+**Property** on [`cache`](#cache-location).  Optional integer (bytes).
+
+Largest response body eligible for caching.  Responses whose
+`Content-Length` exceeds this — or that have no `Content-Length` —
+stream through uncached.
+
+**Default:** `1048576` (1 MiB).
+
+##### method (cache)
+
+**Child** of [`cache`](#cache-location).  Optional, repeatable.  Single
+positional argument: a cacheable request method.  Only `"GET"` and
+`"HEAD"` are accepted.
+
+**Default:** `GET` only.
+
+##### key (cache)
+
+**Property** on [`cache`](#cache-location).  Optional string.
+
+Cache-key template, rendered with the same `{variable}` syntax as
+[header values](#response-headers).  When unset, the key is method +
+scheme + host + path + query.
+
+```kdl
+cache ttl=300 key="{host}{path}"   // ignore the query string
+```
+
+##### honor-client-cache-control
+
+**Property** on [`cache`](#cache-location).  Optional boolean.
+
+When `#true`, honour client **request** `Cache-Control` directives —
+`no-store`, `no-cache`, `max-age`, `min-fresh`, `max-stale`, and
+`only-if-cached` (see [the guide](guide.md#client-cache-busting)).  When
+`#false` (the default), client directives are ignored so clients cannot
+bust the shared cache; the operator's policy governs.
+
+**Default:** `#false`.
 
 #### match
 

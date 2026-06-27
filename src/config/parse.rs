@@ -285,6 +285,14 @@ pub(super) fn parse_server(
     let lame_duck_timeout = parse_nonneg_u32(node, "lame-duck-timeout", 0)
         .context("server.lame-duck-timeout")?;
 
+    let cache = node
+        .children()
+        .and_then(|doc| {
+            doc.nodes().iter().find(|n| n.name().value() == "cache")
+        })
+        .map(|n| parse_cache_global(n, src, name))
+        .transpose()?;
+
     Ok(ServerConfig {
         state_dir: prop_str(node, "state-dir"),
         tls_defaults,
@@ -299,6 +307,7 @@ pub(super) fn parse_server(
         geoip,
         health,
         policies,
+        cache,
         error_pages,
         cert_key_mode: parse_file_mode(node, "cert-key-mode")
             .context("server.cert-key-mode")?,
@@ -849,6 +858,11 @@ fn parse_location(
         .find(|n| n.name().value() == "rewrite")
         .map(|n| parse_rewrite(n, src, name))
         .transpose()?;
+    let cache = children
+        .iter()
+        .find(|n| n.name().value() == "cache")
+        .map(|n| parse_cache(n, src, name))
+        .transpose()?;
     Ok(LocationConfig {
         path,
         handler,
@@ -860,7 +874,90 @@ fn parse_location(
         max_request_body,
         matcher,
         rewrite,
+        cache,
         line,
+    })
+}
+
+/// Default freshness cap when a location's `cache` block omits
+/// `ttl`.  Conservative: only one minute of trust unless the
+/// operator opts into longer.
+const CACHE_DEFAULT_TTL_SECS: u64 = 60;
+/// Default per-object body cap (1 MiB) when `max-object-size` is
+/// omitted.  Keeps a single large response from dominating the store.
+const CACHE_DEFAULT_MAX_OBJECT: u64 = 1024 * 1024;
+/// Default server-wide store cap (256 MiB) when the `server` `cache`
+/// block omits `max-size`.
+const CACHE_DEFAULT_MAX_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Parse the server-wide `cache { max-size=N }` block.  Only sizes
+/// the shared store; enabling caching is a per-location decision.
+fn parse_cache_global(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<crate::config::CacheGlobalConfig> {
+    let line = node_line(src, node);
+    let max_size = match prop_i64(node, "max-size") {
+        Some(v) if v > 0 => v as u64,
+        Some(v) => bail!(
+            "{name}:{line}: cache `max-size` must be > 0 (got {v})"
+        ),
+        None => CACHE_DEFAULT_MAX_SIZE,
+    };
+    Ok(crate::config::CacheGlobalConfig { max_size })
+}
+
+/// Parse a per-location `cache { ttl=N max-object-size=N method "GET"
+/// key="..." honor-client-cache-control=#bool }` block.  Presence of
+/// the block opts the location into caching.
+fn parse_cache(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<crate::config::CacheConfig> {
+    let line = node_line(src, node);
+    let ttl_secs = match prop_i64(node, "ttl") {
+        Some(v) if v >= 0 => v as u64,
+        Some(v) => bail!(
+            "{name}:{line}: cache `ttl` must be >= 0 (got {v})"
+        ),
+        None => CACHE_DEFAULT_TTL_SECS,
+    };
+    let max_object_size = match prop_i64(node, "max-object-size") {
+        Some(v) if v > 0 => v as u64,
+        Some(v) => bail!(
+            "{name}:{line}: cache `max-object-size` must be > 0 \
+             (got {v})"
+        ),
+        None => CACHE_DEFAULT_MAX_OBJECT,
+    };
+    // Cacheable methods come from repeating `method "GET"` children;
+    // default to GET only.  Upper-cased so matching is case-stable.
+    let mut methods: Vec<String> = repeated_strs(node, "method")
+        .into_iter()
+        .map(|m| m.to_ascii_uppercase())
+        .collect();
+    if methods.is_empty() {
+        methods.push("GET".to_owned());
+    }
+    for m in &methods {
+        if m != "GET" && m != "HEAD" {
+            bail!(
+                "{name}:{line}: cache `method` {m:?} unsupported; \
+                 only GET and HEAD may be cached"
+            );
+        }
+    }
+    let key = prop_str(node, "key");
+    let honor_client_cache_control =
+        prop_bool(node, "honor-client-cache-control").unwrap_or(false);
+    Ok(crate::config::CacheConfig {
+        ttl_secs,
+        max_object_size,
+        methods,
+        key,
+        honor_client_cache_control,
     })
 }
 

@@ -2865,3 +2865,113 @@ fn server_upgrade_startup_timeout_rejects_negative() {
         "got: {chain}"
     );
 }
+
+#[test]
+fn location_cache_block_parses() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" {
+            location "/" {
+                static root="/tmp"
+                cache ttl=120 max-object-size=2048 key="{host}{path}"
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    let cache = cfg.vhosts[0].locations[0]
+        .cache
+        .as_ref()
+        .expect("cache block parsed");
+    assert_eq!(cache.ttl_secs, 120);
+    assert_eq!(cache.max_object_size, 2048);
+    assert_eq!(cache.methods, vec!["GET".to_owned()]);
+    assert_eq!(cache.key.as_deref(), Some("{host}{path}"));
+    assert!(!cache.honor_client_cache_control);
+}
+
+#[test]
+fn location_without_cache_block_is_none() {
+    // Backward compatibility: a location with no `cache` block must
+    // behave exactly as before (no caching).
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" { location "/" { static root="/tmp" } }
+        "#,
+    )
+    .unwrap();
+    assert!(cfg.vhosts[0].locations[0].cache.is_none());
+}
+
+#[test]
+fn location_cache_defaults_apply() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" {
+            location "/" { static root="/tmp"; cache { } }
+        }
+        "#,
+    )
+    .unwrap();
+    let cache = cfg.vhosts[0].locations[0].cache.as_ref().unwrap();
+    assert_eq!(cache.ttl_secs, 60);
+    assert_eq!(cache.max_object_size, 1024 * 1024);
+    assert_eq!(cache.methods, vec!["GET".to_owned()]);
+}
+
+#[test]
+fn location_cache_method_head_parses() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" {
+            location "/" {
+                static root="/tmp"
+                cache { method "GET"; method "HEAD" }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    let cache = cfg.vhosts[0].locations[0].cache.as_ref().unwrap();
+    assert_eq!(cache.methods, vec!["GET".to_owned(), "HEAD".to_owned()]);
+}
+
+#[test]
+fn location_cache_rejects_unsupported_method() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" {
+            location "/" {
+                static root="/tmp"
+                cache { method "POST" }
+            }
+        }
+        "#,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("only GET and HEAD"),
+        "got: {err:#}"
+    );
+}
+
+#[test]
+fn server_cache_max_size_parses() {
+    let cfg = Config::parse(
+        r#"
+        server { cache max-size=1048576 }
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" { location "/" { static root="/tmp"; cache { } } }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.server.cache.as_ref().map(|c| c.max_size),
+        Some(1048576)
+    );
+}

@@ -308,6 +308,12 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
     let jwt_manager = old_state.jwt_manager.clone();
     let oidc = old_state.oidc.clone();
     let acme_challenges = old_state.acme_challenges.clone();
+    // Carry the shared response cache forward so entries survive the
+    // reload.  Like the authenticator, v1 does not build a store that
+    // didn't already exist, so newly enabling `cache { }` takes effect
+    // on restart; the rebuilt router still updates per-location
+    // policies against the carried-forward store.
+    let cache = old_state.cache.clone();
 
     // Publish the new rate-limit rule set; the eviction task picks
     // it up on its next tick.
@@ -362,6 +368,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
         jwt_manager,
         oidc,
         access_log,
+        cache,
     }));
 
     // Apply listener removals: fire stop_accept_tx so the listener
@@ -748,6 +755,7 @@ mod tests {
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
         let state = Arc::new(ArcSwap::from(app_state));
         let listeners = Arc::new(ArcSwap::from_pointee(cfg.listeners.clone()));

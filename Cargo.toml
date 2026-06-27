@@ -109,6 +109,10 @@ p256       = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 sha2       = "0.10"
 rand_core  = { version = "0.6", features = ["getrandom"] }
 lru        = "0.18"
+# RFC 7231 HTTP-date parsing/formatting for the response cache
+# (Date / Expires / Last-Modified / If-Modified-Since).  Already in
+# the tree transitively via hyper; named directly here for src/cache.
+httpdate   = "1"
 # OAuth/OIDC client used by `auth jwt { wrap oidc { ... } }`.
 # Provides discovery, JWKS fetch, authorization-code + PKCE flow,
 # and ID-token validation.

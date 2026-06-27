@@ -87,6 +87,10 @@ pub struct AppState {
     /// Per-server access logger.  Holds the format choice and (for
     /// non-tracing formats) the file/stdout sink.
     pub access_log: Arc<AccessLogger>,
+    /// Shared response cache; `Some` only when at least one location
+    /// opted in with a `cache { }` block.  Carried forward across
+    /// SIGHUP so entries survive a reload.
+    pub cache: Option<Arc<crate::cache::CacheStore>>,
 }
 
 

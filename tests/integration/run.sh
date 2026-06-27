@@ -68,6 +68,8 @@ source "$TESTS_DIR/suite_proxy_trust.sh"
 source "$TESTS_DIR/suite_proxy_lb.sh"
 # shellcheck source=suite_rate_limit.sh
 source "$TESTS_DIR/suite_rate_limit.sh"
+# shellcheck source=suite_cache.sh
+source "$TESTS_DIR/suite_cache.sh"
 # shellcheck source=suite_security.sh
 source "$TESTS_DIR/suite_security.sh"
 # shellcheck source=suite_matchers.sh
@@ -151,6 +153,11 @@ suite_rate_limit_per_location_body
 suite_rate_limit_per_ip_isolated
 suite_rate_limit_user_key
 suite_rate_limit_header_key
+suite_cache_proxy
+suite_cache_phase3
+suite_cache_static
+suite_cache_extras
+suite_cache_reload
 suite_match_method_dispatch
 suite_match_header_regex
 suite_match_query

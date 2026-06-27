@@ -570,6 +570,7 @@ mod tests {
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
         let state = Arc::new(ArcSwap::from(app_state));
         let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);

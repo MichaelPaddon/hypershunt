@@ -78,6 +78,7 @@ impl TestServer {
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
         let (tx, rx) = watch::channel(false);
         // Per-listener stop-accept channel; tests never trigger it,

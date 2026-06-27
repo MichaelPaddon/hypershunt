@@ -156,6 +156,7 @@
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
         let cfg = cfg.listeners.into_iter().next().unwrap();
 
@@ -237,6 +238,7 @@
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
         let lcfg = cfg.listeners.into_iter().next().unwrap();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -319,6 +321,7 @@
                 access_log: Arc::new(
                     crate::access_log::AccessLogger::tracing_default(),
                 ),
+            cache: None,
             })
         }
         let old = make_state("old");
@@ -632,6 +635,7 @@
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         })
     }
 
@@ -1034,6 +1038,7 @@ index-file "index.html";
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
         let srv = TestServer::start_with_state(state).await;
 
@@ -1203,6 +1208,7 @@ index-file "index.html";
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
         let srv = TestServer::start_with_state(state).await;
 
@@ -1413,6 +1419,7 @@ index-file "index.html";
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         })
     }
 
@@ -1535,6 +1542,7 @@ index-file "index.html";
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
 
         // Bind UDP socket on an ephemeral loopback port; record the
@@ -1718,6 +1726,7 @@ index-file "index.html";
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
 
         // Bind the server on IPv4 loopback and use a literal-IP URL
@@ -1915,6 +1924,7 @@ index-file "index.html";
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
         let server_sock =
             std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2070,6 +2080,7 @@ index-file "index.html";
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
         let server_sock =
             std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2209,6 +2220,7 @@ index-file "index.html";
             access_log: Arc::new(
                 crate::access_log::AccessLogger::tracing_default(),
             ),
+            cache: None,
         });
         let server_sock =
             std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

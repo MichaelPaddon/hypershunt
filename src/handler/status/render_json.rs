@@ -229,6 +229,16 @@ pub(super) fn render_json(
         "triggers":    s.rate_limit.triggers,
         "active_keys": s.rate_limit.active_keys,
     });
+    let cache_json = serde_json::json!({
+        "hits":          s.cache.hits,
+        "misses":        s.cache.misses,
+        "stores":        s.cache.stores,
+        "bypass":        s.cache.bypass,
+        "evictions":     s.cache.evictions,
+        "revalidations": s.cache.revalidations,
+        "entries":       s.cache.entries,
+        "bytes":         s.cache.bytes,
+    });
     let oidc_json = serde_json::json!({
         "refreshes":            s.oidc.refreshes,
         "refresh_failures":     s.oidc.refresh_failures,
@@ -335,6 +345,7 @@ pub(super) fn render_json(
         "proxy_lb":       proxy_lb_json,
         "proxy_upstream": proxy_upstream_json,
         "rate_limit":     rate_limit_json,
+        "cache":          cache_json,
         "oidc":           oidc_json,
         "http_conns":     http_conns_json,
         "backends":       backends_json,

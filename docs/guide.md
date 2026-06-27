@@ -1802,6 +1802,133 @@ a friendly label.
 **See also:** [Reference — rate-limit](reference.md#rate-limit),
 [Status, health, metrics](#status-health-metrics).
 
+## Response caching
+
+A [`cache`](reference.md#cache-location) block on a location stores
+responses in memory and serves repeat requests without re-reading from
+disk or re-fetching from the upstream.  Caching is **opt-in per
+location** — locations without a `cache` block behave exactly as before.
+
+```kdl
+server {
+    cache max-size=268435456   // 256 MiB store, shared by all locations
+}
+listener "tcp://0.0.0.0:80"
+vhost example.com {
+    location "/assets/" {
+        cache ttl=3600
+        static root="/var/www/assets"
+    }
+    location "/api/" {
+        cache ttl=30 max-object-size=65536
+        proxy { upstream "http://api:9000" }
+    }
+}
+```
+
+All cache-enabled locations share **one** in-memory store, bounded by
+[`max-size`](reference.md#max-size) on the server `cache` block (default
+256 MiB).  When the store is full the least-recently-used entries are
+evicted; entries are also dropped once they pass their freshness
+lifetime.
+
+### What gets cached
+
+hypershunt follows RFC 9111.  A response is cacheable only when:
+
+- the request method is `GET` (add `method "HEAD"` to also cache HEAD);
+- the status is one of `200`, `203`, `204`, `300`, `301`, `404`, `410`;
+- the response carries no `Cache-Control: no-store`, `private`, or
+  `no-cache`, and no `Set-Cookie` (per-client responses are never
+  shared);
+- its `Content-Length` is within
+  [`max-object-size`](reference.md#max-object-size) (larger responses
+  stream through uncached);
+- for requests carrying `Authorization`, the response is explicitly
+  shared-cacheable (`Cache-Control: public` or `s-maxage`).
+
+`Vary` is honoured: a stored response is only reused for a request whose
+`Vary`-selected headers match those of the original; `Vary: *` is never
+cached.
+
+### Freshness
+
+[`ttl`](reference.md#ttl) is an **upper bound**, not an override.  The
+effective lifetime is the smaller of `ttl` and any origin-declared
+`s-maxage`, `max-age`, or `Expires`, so a cached response is never served
+staler than the origin permits.  With no origin freshness signal the
+`ttl` is used directly.  Every hit carries an `Age` header.
+
+### Conditional requests
+
+A client revalidating with `If-None-Match` (against the cached `ETag`) or
+`If-Modified-Since` (against `Last-Modified`) gets a `304 Not Modified`
+straight from the cache, with no body transferred.
+
+### Revalidating stale entries
+
+When an entry has gone stale but carries a validator (`ETag` or
+`Last-Modified`), hypershunt revalidates it against the origin rather
+than refetching the whole body: it sends the stored validator as
+`If-None-Match` / `If-Modified-Since`.  If the origin answers `304 Not
+Modified`, the cached body is reused and its freshness is refreshed from
+the 304; if the origin returns a new `200`, that response replaces the
+entry.  This saves the body transfer on the common "still unchanged"
+case and works for any backend that honours conditional requests
+(reverse proxy, static files, the CGI gateways).
+
+### Coalescing concurrent requests
+
+On a cache miss, only the first request for a key contacts the origin;
+other requests that arrive for the same key while that fetch is in
+flight wait for it and are then served from the freshly stored response.
+A burst of identical requests to an empty cache therefore hits a slow
+backend once, not once per request.
+
+### Serving stale content (RFC 5861)
+
+When the origin's `Cache-Control` declares a `stale-while-revalidate=N`
+window, a stale entry within that window is served **immediately** and
+refreshed in the background, so clients never wait for a revalidation.
+When it declares `stale-if-error=N`, a stale entry within that window is
+served if a revalidation to the origin **fails** (a 5xx or an
+unreachable backend), shielding clients from origin blips.  Both windows
+come from the origin response; hypershunt does not synthesise them.
+
+### Client cache-busting
+
+By default a client's request `Cache-Control` is **ignored**, so clients
+cannot force the cache to be bypassed or evicted — the operator's policy
+governs.  Set
+[`honor-client-cache-control`](reference.md#honor-client-cache-control)
+on the location to honour the request directives instead:
+
+- `no-store` — bypass the cache entirely for this request (no lookup,
+  no store).
+- `no-cache` — revalidate with the origin before serving.
+- `max-age=N` / `min-fresh=N` — reject a cached entry that is older than
+  `N` seconds, or that has less than `N` seconds of freshness left.
+- `max-stale[=N]` — accept a stale entry (optionally only within `N`
+  seconds of expiry).
+- `only-if-cached` — serve only from cache; if nothing is cached, return
+  `504 Gateway Timeout` without contacting the origin.
+
+### Cache key
+
+By default the key is method + scheme + host + path + query.  Set
+[`key`](reference.md#key-cache) to a template (the same `{variable}`
+syntax as [header values](#header-manipulation)) to control it — for
+example `key="{host}{path}"` to ignore the query string, or to fold in
+an identity variable.
+
+### Surfacing on `/status`
+
+The status page and its JSON report cache hits, misses, stores,
+bypasses, evictions, revalidations, and the live entry/byte counts.
+
+**See also:** [Reference — cache](reference.md#cache-location),
+[Status, health, metrics](#status-health-metrics).
+
 ## Custom error pages
 
 ```kdl

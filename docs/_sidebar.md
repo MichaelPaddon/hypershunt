@@ -15,6 +15,7 @@
   - [Auth, JWT, OIDC](guide.md#oidc-single-sign-on)
   - [Access policies](guide.md#access-policies)
   - [Rate limiting](guide.md#rate-limiting)
+  - [Response caching](guide.md#response-caching)
   - [Layer-4 proxy](guide.md#layer-4-proxy)
   - [Production checklist](guide.md#production-checklist)
 
@@ -30,6 +31,7 @@
     - [redirect](reference.md#redirect)
     - [fastcgi / scgi / cgi](reference.md#fastcgi)
     - [rate-limit](reference.md#rate-limit)
+    - [cache](reference.md#cache-location)
     - [basic-auth](reference.md#basic-auth)
     - [match](reference.md#match)
 
