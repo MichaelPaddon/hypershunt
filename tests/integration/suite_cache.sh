@@ -463,6 +463,14 @@ def bump(k):
     return counts[k]
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
+        # Only /r counts; the liveness poll of "/" must not advance it.
+        if self.path.split("?")[0] != "/r":
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
         n = bump("r")
         body = ("[count=%d]" % n).encode()
         self.send_response(200)
