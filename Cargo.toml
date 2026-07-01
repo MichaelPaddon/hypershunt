@@ -144,6 +144,10 @@ libc = "0.2"
 pam-client2 = "0.5"
 
 [dev-dependencies]
+# test-util enables tokio's pausable clock (start_paused) used by the
+# OCSP refresh-task regression test to prove the task goes quiescent
+# after a cert rotation instead of busy-looping.
+tokio             = { version = "1",    features = ["full", "test-util"] }
 tempfile          = "3"
 # RS256 signing for the in-process mock IdP in the OIDC tests; the
 # production verifier (openidconnect's default) only accepts RS256,
