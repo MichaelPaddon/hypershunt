@@ -11,8 +11,8 @@
   </p>
 </div>
 
-> **Status:** stable — 1.0.0.  The configuration format is stable and
-> the project follows semantic versioning from this release onward.
+> **Status:** stable — 1.1.0.  The configuration format is stable and
+> the project follows semantic versioning.
 
 hypershunt puts the whole serving stack in one coherent place: a
 modern KDL configuration instead of accreted directive syntax,
