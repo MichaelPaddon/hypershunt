@@ -339,9 +339,15 @@ pub fn spawn_refresh_task(
         return None;
     }
     Some(crate::task::spawn_supervised("ocsp.refresh", async move {
+        // Owned so we can advance its "seen" version each iteration.
+        let mut cert_rx = cert_rx;
         let mut prior_leaf: Option<Vec<u8>> = None;
         loop {
-            let pair = cert_rx.borrow().clone();
+            // borrow_and_update (not borrow) marks the current cert as
+            // seen; otherwise this receiver's version stays frozen at
+            // startup and, once the channel advances (a renewal), every
+            // later changed() returns instantly, spinning the CPU.
+            let pair = cert_rx.borrow_and_update().clone();
             // The cert that we'll be stapling for.  Recapture every
             // iteration so an ACME renewal swaps in seamlessly.
             let leaf_der = match pair.chain.first() {
@@ -387,8 +393,7 @@ pub fn spawn_refresh_task(
                              ACME CAs since 2025)"
                         );
                     }
-                    let mut rx = cert_rx.clone();
-                    let _ = rx.changed().await;
+                    let _ = cert_rx.changed().await;
                     continue;
                 }
                 Err(e) => {
@@ -423,8 +428,7 @@ pub fn spawn_refresh_task(
                          < 2)"
                     );
                     // Wait for a renewal that might bring an issuer.
-                    let mut rx = cert_rx.clone();
-                    let _ = rx.changed().await;
+                    let _ = cert_rx.changed().await;
                     continue;
                 }
             };
@@ -854,6 +858,61 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    // Regression test for the busy-loop that pinned a CPU core after
+    // the first ACME renewal: the refresh task re-borrowed the cert
+    // with `borrow()` (which never advances the receiver's seen
+    // version), so once the channel advanced every subsequent
+    // changed() returned instantly.  Under the paused clock, virtual
+    // time only auto-advances when the runtime is idle; a spinning
+    // task keeps it busy forever, so the long sleep below would hang.
+    // With the fix the task re-parks and the sleep returns at once.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_task_reparks_after_renewal_without_spinning() {
+        let metrics = Arc::new(Metrics::new());
+        // Two distinct URL-less (NotOffered) certs, so the "renewal"
+        // is a genuine version bump on the watch channel.
+        let (leaf1, issuer1) = make_chain(None);
+        let (leaf2, issuer2) = make_chain(None);
+        let pair1 = test_pair(vec![leaf1, issuer1]);
+        let pair2 = test_pair(vec![leaf2, issuer2]);
+
+        let (tx, rx) = tokio::sync::watch::channel(pair1);
+        let tx = Arc::new(ArcSwap::from_pointee(tx));
+        let handle = spawn_refresh_task(
+            "test".into(),
+            OcspConfig::default(),
+            None,
+            rx,
+            tx.clone(),
+            metrics.clone(),
+        )
+        .expect("enabled config must spawn the task");
+
+        // Let the task reach its first park on the initial cert.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Simulate the ACME renewal that triggered the incident.
+        tx.load().send(pair2).unwrap();
+
+        // If the task busy-loops, the runtime never goes idle and this
+        // sleep can never auto-advance -> the test hangs (regression).
+        // If it re-parks, virtual time jumps and the sleep returns.
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+
+        assert!(
+            !handle.is_finished(),
+            "refresh task must stay parked, not exit"
+        );
+        assert_eq!(
+            metrics
+                .ocsp_refresh_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "re-parking on a URL-less cert must not count failures"
+        );
+        handle.abort();
     }
 
     #[test]
