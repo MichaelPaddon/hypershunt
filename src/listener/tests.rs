@@ -2826,3 +2826,42 @@ index-file "index.html";
             }
         }
     }
+
+    // A persistent accept() error (fd exhaustion) must pause the loop
+    // before it retries; a transient one must not.  Runs on the paused
+    // clock so the backoff shows up as a deterministic virtual-time
+    // advance rather than a wall-clock sleep.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn accept_backoff_only_pauses_on_resource_exhaustion() {
+        use std::io::{Error, ErrorKind};
+        use tokio::time::Instant;
+
+        // Transient (e.g. client reset between the SYN and accept):
+        // the next accept() will likely succeed, so do not slow down.
+        let t0 = Instant::now();
+        super::backoff_after_accept_error(
+            "test",
+            &Error::from(ErrorKind::ConnectionAborted),
+        )
+        .await;
+        assert_eq!(
+            Instant::now().duration_since(t0),
+            Duration::ZERO,
+            "transient accept errors must not slow the loop"
+        );
+
+        // EMFILE (process descriptor table full): persists until load
+        // drops, so back off before retrying to avoid a hot spin.
+        let t1 = Instant::now();
+        super::backoff_after_accept_error(
+            "test",
+            &Error::from_raw_os_error(libc::EMFILE),
+        )
+        .await;
+        assert_eq!(
+            Instant::now().duration_since(t1),
+            super::ACCEPT_ERROR_BACKOFF,
+            "fd exhaustion must pause before the loop retries"
+        );
+    }

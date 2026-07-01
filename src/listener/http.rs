@@ -150,7 +150,7 @@ pub async fn run_plain(
                         });
                     }
                     Err(e) => {
-                        tracing::error!(bind = %name, "accept error: {e}");
+                        super::backoff_after_accept_error(&name, &e).await;
                     }
                 }
             }
@@ -324,7 +324,7 @@ pub async fn run_tls(
                         });
                     }
                     Err(e) => {
-                        tracing::error!(bind = %name, "accept error: {e}");
+                        super::backoff_after_accept_error(&name, &e).await;
                     }
                 }
             }

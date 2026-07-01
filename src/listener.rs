@@ -52,6 +52,33 @@ pub(super) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 // Set request-header=0 in the config to disable.
 pub(super) const DEFAULT_HEADER_TIMEOUT_SECS: u64 = 30;
 
+// Pause after an `accept()` that failed with a persistent
+// resource-exhaustion error, before the accept loop retries.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+// Log an `accept()` error and, when it is a persistent condition, pause
+// briefly so the caller's loop cannot hot-spin.
+//
+// Most accept errors are per-connection and transient: a client that
+// resets between the SYN and our `accept()` yields ECONNABORTED and the
+// next call succeeds, so those must not slow the loop.  But running out
+// of descriptors (EMFILE for this process, ENFILE system-wide) or
+// kernel buffers (ENOBUFS/ENOMEM) persists until load drops, and
+// `accept()` returns the same error *immediately* on every call.
+// Without a pause the loop pins a CPU core and floods the log until a
+// descriptor happens to free -- starving the very work that would free
+// one.  The short sleep bounds both while barely affecting recovery.
+async fn backoff_after_accept_error(bind: &str, e: &std::io::Error) {
+    tracing::error!(bind = %bind, "accept error: {e}");
+    #[cfg(unix)]
+    if matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    ) {
+        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+    }
+}
+
 
 /// Shared per-listener `AppState` snapshot source.  Accept loops
 /// `load_full()` once per connection to capture a snapshot that the
