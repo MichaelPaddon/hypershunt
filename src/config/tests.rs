@@ -2757,3 +2757,266 @@ mod tls;
 mod auth;
 
 mod policy;
+
+// -- variable definitions -------------------------------------------
+
+// Minimal listener + vhost so validate() passes; the server body is
+// the part under test.
+fn parse_with_server(server: &str) -> anyhow::Result<Config> {
+    Config::parse(&format!(
+        r#"
+        server {{
+            {server}
+        }}
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" {{ location "/" {{ static root="." }}
+}}
+        "#
+    ))
+}
+
+#[test]
+fn variable_constant_form() {
+    let cfg = parse_with_server(
+        r#"variable "cdn" "https://cdn.example.com""#,
+    )
+    .unwrap();
+    let v = &cfg.server.variables[0];
+    assert_eq!(v.name, "cdn");
+    assert!(matches!(
+        &v.body,
+        VariableBody::Constant(t) if t == "https://cdn.example.com"
+    ));
+}
+
+#[test]
+fn variable_match_form() {
+    let cfg = parse_with_server(
+        r##"
+        variable "backend" {
+            match "{host}" {
+                #"^api\."#  "api"
+                "(beta)"    "beta-{1}"
+                _           "main"
+            }
+        }
+        "##,
+    )
+    .unwrap();
+    let v = &cfg.server.variables[0];
+    let VariableBody::Match { input, arms } = &v.body else {
+        panic!("expected match body");
+    };
+    assert_eq!(input, "{host}");
+    assert_eq!(arms.len(), 3);
+    assert_eq!(arms[0].pattern.as_deref(), Some(r"^api\."));
+    assert_eq!(arms[0].value, "api");
+    assert_eq!(arms[1].pattern.as_deref(), Some("(beta)"));
+    assert_eq!(arms[2].pattern, None);
+    assert_eq!(arms[2].value, "main");
+}
+
+#[test]
+fn variable_requires_name() {
+    let err = parse_with_server("variable").unwrap_err().to_string();
+    assert!(err.contains("requires a name argument"), "{err}");
+}
+
+#[test]
+fn variable_rejects_both_constant_and_block() {
+    let err = parse_with_server(
+        r#"
+        variable "v" "x" {
+            match "{host}" { _ "y" }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("cannot have both"), "{err}");
+}
+
+#[test]
+fn variable_rejects_empty_body() {
+    let err = parse_with_server(r#"variable "v""#)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("requires a value argument or a 'match'"),
+        "{err}"
+    );
+}
+
+#[test]
+fn variable_rejects_unknown_child() {
+    let err = parse_with_server(
+        r#"
+        variable "v" {
+            map "{host}" { _ "y" }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("unknown node 'map'"), "{err}");
+    assert!(err.contains("expected 'match'"), "{err}");
+}
+
+#[test]
+fn variable_rejects_two_match_blocks() {
+    let err = parse_with_server(
+        r#"
+        variable "v" {
+            match "{host}" { _ "a" }
+            match "{path}" { _ "b" }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("exactly one 'match' block"), "{err}");
+}
+
+#[test]
+fn match_requires_input_argument() {
+    let err = parse_with_server(
+        r#"
+        variable "v" {
+            match { _ "a" }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("requires an input template"), "{err}");
+}
+
+#[test]
+fn match_requires_at_least_one_arm() {
+    let err = parse_with_server(
+        r#"
+        variable "v" {
+            match "{host}"
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("at least one arm"), "{err}");
+}
+
+#[test]
+fn match_arm_requires_exactly_one_value() {
+    for arm in [r#""x""#, r#""x" "a" "b""#] {
+        let err = parse_with_server(&format!(
+            r#"
+            variable "v" {{
+                match "{{host}}" {{ {arm} }}
+            }}
+            "#
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("exactly one value argument"),
+            "{arm}: {err}"
+        );
+    }
+}
+
+#[test]
+fn match_arm_rejects_properties() {
+    let err = parse_with_server(
+        r#"
+        variable "v" {
+            match "{host}" { "x" "a" code=1 }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("does not accept properties"), "{err}");
+}
+
+#[test]
+fn match_arm_rejects_child_block() {
+    let err = parse_with_server(
+        r#"
+        variable "v" {
+            match "{host}" {
+                "x" "a" { nested }
+            }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("does not accept a child block"), "{err}");
+}
+
+// Semantic checks flow through validate() -> vars::VarTable::build.
+
+#[test]
+fn duplicate_variable_rejected_at_validate() {
+    let err = parse_with_server(
+        r#"
+        variable "v" "a"
+        variable "v" "b"
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("duplicate variable 'v'"), "{err}");
+}
+
+#[test]
+fn builtin_collision_rejected_at_validate() {
+    let err = parse_with_server(r#"variable "host" "x""#)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("built-in or reserved"), "{err}");
+}
+
+#[test]
+fn variable_cycle_rejected_at_validate() {
+    let err = parse_with_server(
+        r#"
+        variable "a" "{b}"
+        variable "b" "{a}"
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("cycle"), "{err}");
+}
+
+#[test]
+fn arm_after_catch_all_rejected_at_validate() {
+    let err = parse_with_server(
+        r#"
+        variable "v" {
+            match "{host}" {
+                _   "main"
+                "x" "x"
+            }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("unreachable"), "{err}");
+}
+
+#[test]
+fn variable_bad_regex_rejected_at_validate() {
+    let err = parse_with_server(
+        r#"
+        variable "v" {
+            match "{host}" { "(unclosed" "x" }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("invalid pattern"), "{err}");
+}

@@ -14,6 +14,73 @@ the parent.
 
 ---
 
+## Variables
+
+Many string-valued directives are **templates**: literal text mixed
+with `{variable}` tokens that render per request.  The same engine
+and the same variable set apply everywhere templates are accepted,
+so a value learned in one directive works in all the others.
+
+Syntax inside a template:
+
+- `{name}` — replaced with the variable's value for this request.
+- `{name|fallback}` — the literal `fallback` text is used when the
+  value is empty (anonymous user, absent header, no GeoIP match,
+  no matching arm...).
+- Any other `{...}` token — emitted verbatim.  Braces that are not
+  variable references (JSON bodies, regex text) pass through
+  untouched.  A token that *looks* like a variable reference but
+  names no variable logs a "no such variable" warning at config
+  load (with a did-you-mean hint), but is never an error.  For a
+  literal brace token inside a URL, percent-encode the braces
+  (`%7B`/`%7D`) — the encoded form never enters the template
+  engine, silences the warning, and is the valid URL spelling of a
+  brace anyway.
+
+### Built-in variables
+
+| Variable                | Substitution                                   |
+|-------------------------|------------------------------------------------|
+| `{client_ip}`           | Peer address (post-PROXY-protocol).            |
+| `{username}`            | Authenticated username; empty for anonymous.   |
+| `{groups}`              | Comma-joined groups; empty for anonymous.      |
+| `{method}`              | Request method (`GET`, `POST`, ...).           |
+| `{path}`                | Request URI path.                              |
+| `{query}`               | Query string without the `?`; empty if absent. |
+| `{path_and_query}`      | Path plus original query (`/a?x=1`).           |
+| `{host}`                | Request `Host` header, port stripped.          |
+| `{scheme}`              | `http` or `https`.                             |
+| `{country}`             | ISO 3166-1 code from [`geoip`](#geoip); empty when unconfigured or unmatched. |
+| `{client_cert_subject}` | Verified mTLS client-cert subject DN; empty if none. |
+| `{client_cert_sans}`    | Comma-joined client-cert SANs; empty if none.  |
+| `{header:<name>}`       | First value of the named request header, as sent by the client; empty if absent. |
+
+Referencing `{username}` or `{groups}` anywhere in a route's
+templates makes hypershunt run the authenticator for matching
+requests even when the location has no access policy; referencing
+`{country}` triggers the GeoIP lookup the same way.
+
+Custom, request-derived variables are defined with the server-level
+[`variable`](#variable) directive and referenced with the same
+`{name}` syntax.
+
+### Where templates render
+
+Templated today: [`request-headers` / `response-headers`
+`set`/`add` values](#request-headers), [`redirect
+to=`](#to-redirect), [`respond body=`](#body-respond),
+[`cache key=`](#cache-location), [`policy redirect
+to=`](#policy-location), [`try-files`](#try-files),
+[`fallback-redirect`](#fallback-redirect), and [`proxy
+group-by`](#group-by).
+
+Two look-alikes are **not** request templates: [`rewrite`](#rewrite)
+`to=` uses regex `$1`/`$name` capture replacement, and the LDAP
+`bind-dn` / `search-filter` `{user}`/`{dn}` markers are substituted
+at authentication time with LDAP escaping.
+
+---
+
 ## server
 
 The `server` node carries process-wide settings: privilege drop,
@@ -1161,6 +1228,64 @@ vhost "internal.example.com" {
 }
 ```
 
+### variable
+
+**Child** of [`server`](#server).  Optional, repeatable.
+
+Defines a custom [variable](#variables), referenced anywhere
+templates render as `{<name>}`.  Names are global to the config,
+must match `[a-z][a-z0-9_]*`, and must not collide with a
+[built-in](#built-in-variables) or another definition.
+
+Two forms.  The **constant** form gives the name a template value:
+
+```kdl
+server {
+    variable "cdn" "https://cdn.example.com"
+}
+```
+
+The **match** form derives the value per request, in the style of a
+Rust `match`: render the input template, test each arm's regex in
+declaration order (unanchored search — anchor with `^`/`$` for
+whole-value matches), and yield the first matching arm's value.
+The arm's node name is the pattern; `_` is the catch-all and must
+be last.  When nothing matches, the variable renders empty, so a
+reference site's `{name|fallback}` takes over.
+
+```kdl
+server {
+    variable "backend" {
+        match "{host}" {
+            #"^api\."#              "api"
+            #"^(?<lane>beta|rc)\."# "canary-{lane}"
+            _                       "main"
+        }
+    }
+}
+```
+
+Notes:
+
+- Write patterns as raw strings (`#"..."#`) so regex escapes like
+  `\.` need no doubling.
+- The winning arm's capture groups are available in that arm's
+  value: `{1}`..`{9}` for numbered groups, `{name}` for
+  `(?<name>...)` named groups.  A capture name must not collide
+  with any variable name; a numbered reference beyond the
+  pattern's group count is a config error.
+- Both the match input and arm values are full templates, so
+  variables can reference other variables; multi-input matching is
+  plain composition (`match "{scheme}:{host}"`).  Reference cycles
+  are rejected at config load with the chain printed.
+- Values are computed **lazily**: the first time a request renders
+  a template referencing the variable, the result is computed and
+  frozen for the rest of that request.  Evaluation can never fail
+  a request.
+- A variable whose definition reads `{username}`/`{groups}` or
+  `{country}` forces authentication / GeoIP exactly as a direct
+  reference would, but only on routes that actually use it.
+
 ### cache (server)
 
 **Guide:** [Response caching](guide.md#response-caching).
@@ -2118,7 +2243,9 @@ Each statement is one of:
 - `deny [code=<integer>] [<predicate>]` — reject with the given
   status (default `403`).
 - `redirect to=<url> [code=<integer>] [<predicate>]` — 30x
-  redirect (default `302`).
+  redirect (default `302`).  The URL is a template (see
+  [Variables](#variables)), so e.g.
+  `to="https://sso.example.com/login?rt={path_and_query}"` works.
 - `apply "<name>"` — splice the rules of a server-level named
   [`policy`](#policy-server) at this point.  First-match semantics
   continue across the inlined rules.  Cycles are rejected at
@@ -2211,13 +2338,10 @@ location "/api/" {
 }
 ```
 
-Template variables available inside `set` / `add` values:
-
-| Variable        | Substitution                                       |
-|-----------------|----------------------------------------------------|
-| `{client_ip}`   | Peer address (post-PROXY-protocol).                |
-| `{user}`        | Authenticated username, or empty.                  |
-| `{request_id}`  | Per-request UUIDv4 generated by hypershunt.             |
+`set` / `add` values are templates; see [Variables](#variables)
+for the full built-in set (`{client_ip}`, `{username}`,
+`{header:<name>}`, ...), the `{name|fallback}` syntax, and how to
+define custom variables.
 
 ##### set (request-headers)
 
@@ -2606,12 +2730,13 @@ Filenames tried, in order, when the resolved path is a directory.
 
 **Repeated child** of [`static`](#static).  Optional.
 
-Ordered list of candidate filename templates.  Each template may
-contain `{path}` (the request path with the location prefix
-stripped) and `{query}` (the query string).  The first existing
-regular file is served.  When no candidate exists, the response
-is `404` — the [`index-file`](#index-file) flow is bypassed.
-Useful for SPA-style fallbacks.
+Ordered list of candidate filename templates (see
+[Variables](#variables)); the first candidate that exists as a
+regular file is served.  Inside try-files, `{path}` means the
+request path *with the location prefix stripped*, not the raw URI
+path.  When no candidate exists, the response is `404` — the
+[`index-file`](#index-file) flow is bypassed.  Useful for
+SPA-style fallbacks and per-request file selection.
 
 ```kdl
 static root="/var/www/spa" {
@@ -2628,9 +2753,10 @@ When set and a request resolves to a directory with no matching
 [`index-file`](#index-file) or [`try-files`](#try-files) candidate
 *and* [`directory-listing`](#directory-listing) is `#false`, the
 handler emits a `302 Found` to the named URL with
-`Cache-Control: no-store` instead of a `404`.  Requests to
-non-existent paths still produce `404` — only the "directory
-with no index" case is redirected.
+`Cache-Control: no-store` instead of a `404`.  The URL is a
+template (see [Variables](#variables)).  Requests to non-existent
+paths still produce `404` — only the "directory with no index"
+case is redirected.
 
 The packaged default config uses this to point `/` at `/docs/`
 while the operator's webroot is empty; the moment an
@@ -2677,7 +2803,8 @@ Handler-mode `proxy` carries:
   [`pool-max-idle=`](#pool-max-idle),
   [`connect-timeout=`](#connect-timeout).
 - Children: [`upstream`](#upstream), [`tls`](#tls-proxy-upstream),
-  [`lb-policy`](#lb-policy), [`active-health`](#active-health),
+  [`lb-policy`](#lb-policy), [`group-by`](#group-by),
+  [`active-health`](#active-health),
   [`passive-health`](#passive-health), [`retry`](#retry).
 
 ##### upstream
@@ -2690,11 +2817,45 @@ Single positional argument: the upstream URL.  Scheme is one of
 upstream is reached via `http://localhost` over the socket,
 regardless of the path used).  Optional `weight=<integer>`
 property; `0` parks the upstream (it stays in the pool but
-receives no traffic until the weight is raised).
+receives no traffic until the weight is raised).  Optional
+`group="<name>"` label targeted by [`group-by`](#group-by).
 
 ```kdl
 upstream "http://backend.internal:9000"
 upstream "http://backup.internal:9000" weight=0
+```
+
+##### group-by
+
+**Child** of [`proxy`](#proxy-handler).  Optional.
+
+Single positional argument: a template (see
+[Variables](#variables)) rendered per request.  Picking is
+restricted to the upstreams whose `group=` label equals the
+rendered value; within the group the configured
+[`lb-policy`](#lb-policy), weights, and health checks apply
+unchanged.  When the rendered value is empty, names no declared
+group, or every member of the group is unavailable, selection
+falls back to the whole pool — a `group-by` template can never
+cause a `502` that the pool would not have produced anyway.
+Requires at least one labelled upstream.
+
+```kdl
+server {
+    variable "lane" {
+        match "{header:x-lane}" {
+            "^beta$" "beta"
+            _        "main"
+        }
+    }
+}
+// ... in a location:
+proxy {
+    upstream "http://app1.internal:9000"  group="main"
+    upstream "http://app2.internal:9000"  group="main"
+    upstream "http://beta1.internal:9000" group="beta"
+    group-by "{lane}"
+}
 ```
 
 ##### strip-prefix (proxy)
@@ -2915,10 +3076,8 @@ location "/old/" {
 
 **Property** on [`redirect`](#redirect).  Required string.
 
-Target URL.  Supports the same template variables as
-[`request-headers`](#request-headers) `set`, plus `{host}` (the
-request's `Host` header) and `{path_and_query}` (the request URI
-path with the original query string).
+Target URL template; see [Variables](#variables).  `{host}` and
+`{path_and_query}` cover the common canonicalisation shapes.
 
 ```kdl
 redirect to="https://{host}{path_and_query}" code=301

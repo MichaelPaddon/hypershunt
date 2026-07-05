@@ -161,6 +161,7 @@ Examples:
 - `"health"` ( `enabled=`[`<boolean>`](#boolean) )? ( `{`
   [`<health-child>`](#health-child)* `}` )?
 - [`<policy-def>`](#policy-def)
+- [`<variable-def>`](#variable-def)
 - [`<error-page-def>`](#error-page-def)
 - [`<access-log-block>`](#access-log-block)
 
@@ -215,6 +216,24 @@ listener-level [`<tls-node>`](#tls-node).
 
 `"policy"` [`<string>`](#string) `{`
 [`<policy-statement>`](#policy-statement)* `}`
+
+### `variable-def`
+
+- `"variable"` [`<string>`](#string) [`<string>`](#string)
+- `"variable"` [`<string>`](#string) `{`
+  [`<variable-match>`](#variable-match) `}`
+
+### `variable-match`
+
+`"match"` [`<string>`](#string) `{`
+[`<match-arm>`](#match-arm)+ `}`
+
+### `match-arm`
+
+( [`<string>`](#string) | `_` ) [`<string>`](#string)
+
+The arm's node name is the regex pattern (`_` = catch-all, must be
+last); the single argument is the value template.
 
 ### `error-page-def`
 
@@ -573,9 +592,11 @@ All repeating single-argument children (rule 4).
 
 - `"upstream"` [`<string>`](#string)
   ( `weight=`[`<integer>`](#integer) )?
+  ( `group=`[`<string>`](#string) )?
 - `"tls"` ( `skip-verify=`[`<boolean>`](#boolean) )?
 - `"lb-policy"` [`<lb-policy-kind>`](#lb-policy-kind)
   ( `header=`[`<string>`](#string) )?
+- `"group-by"` [`<string>`](#string)
 - [`<active-health-block>`](#active-health-block)
 - [`<passive-health-block>`](#passive-health-block)
 - [`<retry-block>`](#retry-block)

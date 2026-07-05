@@ -75,14 +75,23 @@ pub enum Lookup {
 }
 
 impl CachePolicy {
-    pub fn compile(cfg: &CacheConfig) -> CachePolicy {
-        CachePolicy {
-            key: CacheKey::compile(cfg.key.as_deref()),
+    pub fn compile(
+        cfg: &CacheConfig,
+        names: &crate::vars::VarNames,
+    ) -> anyhow::Result<CachePolicy> {
+        Ok(CachePolicy {
+            key: CacheKey::compile(cfg.key.as_deref(), names)?,
             ttl: Duration::from_secs(cfg.ttl_secs),
             max_object_size: cfg.max_object_size,
             methods: cfg.methods.clone(),
             honor_client_cache_control: cfg.honor_client_cache_control,
-        }
+        })
+    }
+
+    /// The operator key template (if any), for build-time needs
+    /// analysis.
+    pub fn key_template(&self) -> Option<&crate::headers::Template> {
+        self.key.template()
     }
 
     /// True when this request's method is eligible for caching.  The
@@ -538,13 +547,17 @@ mod tests {
     use hyper::header::HeaderValue;
 
     fn policy(ttl: u64, max_obj: u64) -> CachePolicy {
-        CachePolicy::compile(&CacheConfig {
-            ttl_secs: ttl,
-            max_object_size: max_obj,
-            methods: vec!["GET".to_owned()],
-            key: None,
-            honor_client_cache_control: false,
-        })
+        CachePolicy::compile(
+            &CacheConfig {
+                ttl_secs: ttl,
+                max_object_size: max_obj,
+                methods: vec!["GET".to_owned()],
+                key: None,
+                honor_client_cache_control: false,
+            },
+            &crate::vars::VarNames::default(),
+        )
+        .expect("static test config")
     }
 
     fn hmap(pairs: &[(&str, &str)]) -> HeaderMap {

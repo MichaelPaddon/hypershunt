@@ -28,6 +28,9 @@ use policy::parse_policy_statements;
 mod matcher;
 use matcher::parse_matcher;
 
+mod vars;
+use vars::parse_variable;
+
 /// Byte offset -> 1-based line number, counting raw '\n'.  Line
 /// continuations are handled automatically: newlines are counted in the
 /// source text, so a `\`-continued logical line still maps to the
@@ -68,7 +71,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// of some candidate, else an empty string (so it can be appended to an
 /// error message unconditionally).  Picks the closest candidate; ties
 /// resolve to declaration order.
-pub(super) fn did_you_mean(word: &str, candidates: &[&str]) -> String {
+pub(crate) fn did_you_mean(word: &str, candidates: &[&str]) -> String {
     candidates
         .iter()
         .map(|c| (edit_distance(word, c), *c))
@@ -229,6 +232,15 @@ pub(super) fn parse_server(
         }
     }
 
+    // Collect `variable` definitions in declaration order; semantic
+    // validation happens in vars::VarTable::build via validate().
+    let mut variables = Vec::new();
+    for child in node.children().map(|d| d.nodes()).unwrap_or_default() {
+        if child.name().value() == "variable" {
+            variables.push(parse_variable(child, src, name)?);
+        }
+    }
+
     // Collect error-page entries from the server node.
     let mut error_pages = Vec::new();
     for child in node.children().map(|d| d.nodes()).unwrap_or_default() {
@@ -307,6 +319,7 @@ pub(super) fn parse_server(
         geoip,
         health,
         policies,
+        variables,
         cache,
         error_pages,
         cert_key_mode: parse_file_mode(node, "cert-key-mode")

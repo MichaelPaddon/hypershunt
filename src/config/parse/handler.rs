@@ -164,7 +164,21 @@ fn parse_proxy(
                 .and_then(|e| e.as_integer())
                 .map(|n| n as u32)
                 .unwrap_or(1);
-            upstreams.push(crate::config::UpstreamConfig { url, weight });
+            let group = child
+                .get("group")
+                .and_then(|e| e.as_string())
+                .map(String::from);
+            if group.as_deref() == Some("") {
+                bail!(
+                    "{name}:{}: upstream group must not be empty",
+                    node_line(src, child)
+                );
+            }
+            upstreams.push(crate::config::UpstreamConfig {
+                url,
+                weight,
+                group,
+            });
         }
     }
     if upstreams.is_empty() {
@@ -292,6 +306,32 @@ fn parse_proxy(
             (policy, header)
         }
     };
+    // `group-by "<template>"` -- per-request upstream group
+    // selection.  Requires at least one labelled upstream, otherwise
+    // the template could never match anything.
+    let group_by = node
+        .children()
+        .and_then(|d| {
+            d.nodes().iter().find(|n| n.name().value() == "group-by")
+        })
+        .map(|n| {
+            let t = req_arg_str(n, 0).map_err(|_| {
+                anyhow!(
+                    "{name}:{}: 'group-by' requires a template \
+                     argument",
+                    node_line(src, n)
+                )
+            })?;
+            if upstreams.iter().all(|u| u.group.is_none()) {
+                bail!(
+                    "{name}:{}: 'group-by' requires at least one \
+                     upstream with a group=\"...\" label",
+                    node_line(src, n)
+                );
+            }
+            Ok(t)
+        })
+        .transpose()?;
     let active_health = parse_active_health(node, src, name)?;
     let passive_health = parse_passive_health(node);
     let retry = parse_retry(node, src, name)?;
@@ -299,6 +339,7 @@ fn parse_proxy(
         upstreams,
         lb_policy,
         lb_hash_header,
+        group_by,
         active_health,
         passive_health,
         retry,

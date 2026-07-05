@@ -3,24 +3,35 @@
 // client IP, authenticated identity, and request metadata.
 
 use crate::auth::Principal;
+use crate::vars::{VarId, VarNames, VarScope};
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
+use regex::Captures;
 
 // -- Template -------------------------------------------------------
 
 /// A value template: literal text mixed with variable slots.
+#[derive(Debug)]
 pub struct Template {
     parts: Vec<TemplatePart>,
 }
 
+#[derive(Debug)]
 enum TemplatePart {
     Literal(String),
     // Known variable + optional fallback text used when the value is empty.
     Var(KnownVar, Option<String>),
+    // Config-defined variable from a server `variable` block.
+    Custom(VarId, Option<String>),
+    // Request-header lookup: `{header:<name>}`.
+    Header(HeaderName, Option<String>),
+    // Capture group of the enclosing match arm's pattern; named groups
+    // resolve to their index.  Only produced by compile_with_captures.
+    Capture(usize, Option<String>),
     // Unrecognised {name} or {name|default} -- preserved verbatim.
     Unknown(String),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum KnownVar {
     ClientIp,
     Username,
@@ -33,75 +44,298 @@ enum KnownVar {
     Scheme,
     ClientCertSubject,
     ClientCertSans,
+    Country,
+}
+
+/// Built-in variable names, in documentation order.  User-defined
+/// variables must not collide with these (checked at config load).
+pub const BUILTIN_VARS: &[&str] = &[
+    "client_ip",
+    "username",
+    "groups",
+    "method",
+    "path",
+    "query",
+    "path_and_query",
+    "host",
+    "scheme",
+    "client_cert_subject",
+    "client_cert_sans",
+    "country",
+];
+
+fn known_var(name: &str) -> Option<KnownVar> {
+    match name {
+        "client_ip" => Some(KnownVar::ClientIp),
+        "username" => Some(KnownVar::Username),
+        "groups" => Some(KnownVar::Groups),
+        "method" => Some(KnownVar::Method),
+        "path" => Some(KnownVar::Path),
+        "query" => Some(KnownVar::Query),
+        "path_and_query" => Some(KnownVar::PathAndQuery),
+        "host" => Some(KnownVar::Host),
+        "scheme" => Some(KnownVar::Scheme),
+        "client_cert_subject" => Some(KnownVar::ClientCertSubject),
+        "client_cert_sans" => Some(KnownVar::ClientCertSans),
+        "country" => Some(KnownVar::Country),
+        _ => None,
+    }
+}
+
+// One raw `{...}` token or literal run, before name resolution.
+enum RawTok<'s> {
+    Literal(&'s str),
+    Token {
+        name: &'s str,
+        fallback: Option<&'s str>,
+        // Original text including braces, for verbatim pass-through.
+        raw: &'s str,
+    },
+}
+
+fn lex(s: &str) -> Vec<RawTok<'_>> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(open) = rest.find('{') {
+        if open > 0 {
+            out.push(RawTok::Literal(&rest[..open]));
+        }
+        let after = &rest[open + 1..];
+        if let Some(close) = after.find('}') {
+            let token = &after[..close];
+            let raw = &rest[open..=open + close + 1];
+            // Split on the first '|' to get an optional fallback.
+            let (name, fallback) = match token.find('|') {
+                Some(p) => (&token[..p], Some(&token[p + 1..])),
+                None => (token, None),
+            };
+            out.push(RawTok::Token {
+                name,
+                fallback,
+                raw,
+            });
+            rest = &after[close + 1..];
+        } else {
+            // No closing brace: treat remainder as literal.
+            out.push(RawTok::Literal(&rest[open..]));
+            rest = "";
+        }
+    }
+    if !rest.is_empty() {
+        out.push(RawTok::Literal(rest));
+    }
+    out
+}
+
+/// Capture groups available to a match-arm value template.
+pub struct CaptureScope {
+    // Number of capture groups in the pattern, group 0 excluded.
+    groups: usize,
+    names: Vec<(String, usize)>,
+}
+
+impl CaptureScope {
+    pub fn from_regex(re: &regex::Regex) -> Self {
+        let names = re
+            .capture_names()
+            .enumerate()
+            .filter_map(|(i, n)| n.map(|n| (n.to_owned(), i)))
+            .collect();
+        CaptureScope {
+            groups: re.captures_len() - 1,
+            names,
+        }
+    }
+
+    /// No captures in scope (the `_` catch-all arm).
+    pub fn empty() -> Self {
+        CaptureScope {
+            groups: 0,
+            names: Vec::new(),
+        }
+    }
+
+    /// Named groups, for collision checks against variable names.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.names.iter().map(|(n, _)| n.as_str())
+    }
+
+    fn lookup(&self, token: &str) -> Option<usize> {
+        if let Some((_, i)) = self.names.iter().find(|(n, _)| n == token) {
+            return Some(*i);
+        }
+        digit_group(token).filter(|i| *i <= self.groups)
+    }
+}
+
+// `{1}`..`{9}`: single-digit numbered capture reference.
+fn digit_group(token: &str) -> Option<usize> {
+    match token.as_bytes() {
+        [b @ b'1'..=b'9'] => Some((b - b'0') as usize),
+        _ => None,
+    }
+}
+
+// Load-time lint: a token that plausibly meant to be a variable (an
+// identifier shape, or a `header:` reference that didn't resolve) is
+// probably a typo.  Other brace content (JSON bodies, regex
+// references) renders literally by design and stays quiet; literal
+// braces wanted inside URLs are best written percent-encoded
+// (%7B/%7D), which bypasses the template engine entirely.
+fn lint_unknown(
+    name: &str,
+    raw: &str,
+    vars: &VarNames,
+    caps: Option<&CaptureScope>,
+) {
+    if !is_identifier(name) && !name.starts_with("header:") {
+        return;
+    }
+    let mut candidates: Vec<&str> = BUILTIN_VARS.to_vec();
+    candidates.extend(vars.iter());
+    if let Some(cs) = caps {
+        candidates.extend(cs.names());
+    }
+    let hint = crate::config::did_you_mean(name, &candidates);
+    tracing::warn!(
+        token = raw,
+        "template: no such variable '{name}'; treating the token \
+         literally{hint}"
+    );
+}
+
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some('a'..='z'))
+        && chars.all(|c| matches!(c, 'a'..='z' | '0'..='9' | '_'))
 }
 
 impl Template {
     /// Parse a template string, recognising `{variable}` tokens.
+    ///
+    /// Legacy lenient mode: only built-in variables resolve; any other
+    /// token (including `{header:...}`) passes through verbatim.  New
+    /// call sites should use `compile`, which also resolves
+    /// config-defined variables and request headers.
     pub fn parse(s: &str) -> Self {
+        Self::build(s, None, None).unwrap_or_else(|_| Template {
+            // build() never fails in lenient mode; keep the raw text
+            // if that invariant is ever broken.
+            parts: vec![TemplatePart::Literal(s.to_owned())],
+        })
+    }
+
+    /// Compile against the config's variable table.  Token contents
+    /// never fail compilation: unknown identifiers and malformed
+    /// `{header:...}` names pass through verbatim with a load-time
+    /// lint warning, so a config that started under an older release
+    /// keeps starting.  (The Result covers capture validation in
+    /// match-arm values, which is new syntax and strict.)
+    pub fn compile(s: &str, vars: &VarNames) -> anyhow::Result<Self> {
+        Self::build(s, Some(vars), None)
+    }
+
+    /// Compile a match-arm value: like `compile`, with the arm
+    /// pattern's capture groups in scope.
+    pub fn compile_with_captures(
+        s: &str,
+        vars: &VarNames,
+        caps: &CaptureScope,
+    ) -> anyhow::Result<Self> {
+        Self::build(s, Some(vars), Some(caps))
+    }
+
+    fn build(
+        s: &str,
+        vars: Option<&VarNames>,
+        caps: Option<&CaptureScope>,
+    ) -> anyhow::Result<Self> {
         let mut parts = Vec::new();
-        let mut rest = s;
-        while let Some(open) = rest.find('{') {
-            if open > 0 {
-                parts.push(TemplatePart::Literal(rest[..open].to_owned()));
+        for tok in lex(s) {
+            let (name, fallback, raw) = match tok {
+                RawTok::Literal(l) => {
+                    parts.push(TemplatePart::Literal(l.to_owned()));
+                    continue;
+                }
+                RawTok::Token {
+                    name,
+                    fallback,
+                    raw,
+                } => (name, fallback, raw),
+            };
+            let fb = fallback.map(str::to_owned);
+            if let Some(v) = known_var(name) {
+                parts.push(TemplatePart::Var(v, fb));
+                continue;
             }
-            let after = &rest[open + 1..];
-            if let Some(close) = after.find('}') {
-                let token = &after[..close];
-                // Split on the first '|' to get an optional fallback.
-                let (var_name, fallback) = if let Some(pipe) = token.find('|') {
-                    (&token[..pipe], Some(token[pipe + 1..].to_owned()))
-                } else {
-                    (token, None)
-                };
-                parts.push(match var_name {
-                    "client_ip" => {
-                        TemplatePart::Var(KnownVar::ClientIp, fallback)
-                    }
-                    "username" => {
-                        TemplatePart::Var(KnownVar::Username, fallback)
-                    }
-                    "groups" => TemplatePart::Var(KnownVar::Groups, fallback),
-                    "method" => TemplatePart::Var(KnownVar::Method, fallback),
-                    "path" => TemplatePart::Var(KnownVar::Path, fallback),
-                    "query" => TemplatePart::Var(KnownVar::Query, fallback),
-                    "path_and_query" => {
-                        TemplatePart::Var(KnownVar::PathAndQuery, fallback)
-                    }
-                    "host" => TemplatePart::Var(KnownVar::Host, fallback),
-                    "scheme" => TemplatePart::Var(KnownVar::Scheme, fallback),
-                    "client_cert_subject" => TemplatePart::Var(
-                        KnownVar::ClientCertSubject,
-                        fallback,
-                    ),
-                    "client_cert_sans" => TemplatePart::Var(
-                        KnownVar::ClientCertSans,
-                        fallback,
-                    ),
-                    // Unknown variable: pass through the original token verbatim.
-                    _ => TemplatePart::Unknown(format!("{{{token}}}")),
-                });
-                rest = &after[close + 1..];
-            } else {
-                // No closing brace: treat remainder as literal.
-                parts.push(TemplatePart::Literal(rest[open..].to_owned()));
-                rest = "";
-                break;
+            let Some(vars) = vars else {
+                parts.push(TemplatePart::Unknown(raw.to_owned()));
+                continue;
+            };
+            // A `header:` token with an invalid name falls through
+            // to the generic no-such-variable handling below --
+            // token contents never fail compilation, so configs from
+            // older releases keep starting.
+            if let Some(h) = name.strip_prefix("header:")
+                && let Ok(hname) = HeaderName::from_bytes(h.as_bytes())
+            {
+                parts.push(TemplatePart::Header(hname, fb));
+                continue;
             }
+            if let Some(cs) = caps {
+                if let Some(i) = cs.lookup(name) {
+                    parts.push(TemplatePart::Capture(i, fb));
+                    continue;
+                }
+                if let Some(n) = digit_group(name) {
+                    anyhow::bail!(
+                        "value references capture {{{n}}} but the \
+                         pattern has only {} capture group(s)",
+                        cs.groups
+                    );
+                }
+            }
+            if let Some(id) = vars.get(name) {
+                parts.push(TemplatePart::Custom(id, fb));
+                continue;
+            }
+            lint_unknown(name, raw, vars, caps);
+            parts.push(TemplatePart::Unknown(raw.to_owned()));
         }
-        if !rest.is_empty() {
-            parts.push(TemplatePart::Literal(rest.to_owned()));
-        }
-        Template { parts }
+        Ok(Template { parts })
     }
 
     /// Render the template against the current request context.
     pub fn render(&self, ctx: &RequestContext<'_>) -> String {
+        self.render_inner(ctx, None)
+    }
+
+    /// Render with the winning match arm's captures in scope.
+    pub fn render_with_captures(
+        &self,
+        ctx: &RequestContext<'_>,
+        caps: &Captures<'_>,
+    ) -> String {
+        self.render_inner(ctx, Some(caps))
+    }
+
+    fn render_inner(
+        &self,
+        ctx: &RequestContext<'_>,
+        caps: Option<&Captures<'_>>,
+    ) -> String {
         let mut out = String::new();
         for part in &self.parts {
-            match part {
-                TemplatePart::Literal(s) => out.push_str(s),
-                TemplatePart::Unknown(s) => out.push_str(s),
-                TemplatePart::Var(v, default) => {
+            let (value, fallback) = match part {
+                TemplatePart::Literal(s) => {
+                    out.push_str(s);
+                    continue;
+                }
+                TemplatePart::Unknown(s) => {
+                    out.push_str(s);
+                    continue;
+                }
+                TemplatePart::Var(v, fb) => {
                     let value = match v {
                         KnownVar::ClientIp => ctx.client_ip,
                         KnownVar::Username => ctx.username,
@@ -116,15 +350,30 @@ impl Template {
                             ctx.client_cert_subject
                         }
                         KnownVar::ClientCertSans => ctx.client_cert_sans,
+                        KnownVar::Country => ctx.country,
                     };
-                    if value.is_empty() {
-                        if let Some(d) = default {
-                            out.push_str(d);
-                        }
-                    } else {
-                        out.push_str(value);
-                    }
+                    (value, fb)
                 }
+                TemplatePart::Custom(id, fb) => {
+                    (ctx.vars.get(*id, ctx), fb)
+                }
+                TemplatePart::Header(name, fb) => {
+                    (ctx.header_value(name), fb)
+                }
+                TemplatePart::Capture(i, fb) => {
+                    let value = caps
+                        .and_then(|c| c.get(*i))
+                        .map(|m| m.as_str())
+                        .unwrap_or("");
+                    (value, fb)
+                }
+            };
+            if value.is_empty() {
+                if let Some(d) = fallback {
+                    out.push_str(d);
+                }
+            } else {
+                out.push_str(value);
             }
         }
         out
@@ -132,6 +381,8 @@ impl Template {
 
     /// True iff the template references `{username}` or `{groups}`,
     /// meaning an authenticated principal is required to render it.
+    /// Direct references only; config-defined variables are resolved
+    /// transitively at router build via `refs()` + the `VarTable`.
     pub fn references_principal(&self) -> bool {
         self.parts.iter().any(|p| {
             matches!(
@@ -141,6 +392,44 @@ impl Template {
             )
         })
     }
+
+    /// Direct references made by this template, for build-time
+    /// dependency analysis (auth forcing, geoip, header snapshots).
+    pub fn refs(&self) -> TemplateRefs {
+        let mut r = TemplateRefs::default();
+        for p in &self.parts {
+            match p {
+                TemplatePart::Var(
+                    KnownVar::Username | KnownVar::Groups,
+                    _,
+                ) => r.principal = true,
+                TemplatePart::Var(KnownVar::Country, _) => {
+                    r.geoip = true;
+                }
+                TemplatePart::Header(n, _) => {
+                    if !r.headers.contains(n) {
+                        r.headers.push(n.clone());
+                    }
+                }
+                TemplatePart::Custom(id, _) => {
+                    if !r.vars.contains(id) {
+                        r.vars.push(*id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        r
+    }
+}
+
+/// Direct references made by one template; see `Template::refs`.
+#[derive(Default)]
+pub struct TemplateRefs {
+    pub principal: bool,
+    pub geoip: bool,
+    pub headers: Vec<HeaderName>,
+    pub vars: Vec<VarId>,
 }
 
 // -- HeaderOp -------------------------------------------------------
@@ -194,6 +483,10 @@ impl HeaderRules {
 // -- RequestContext -------------------------------------------------
 
 /// Runtime values available when rendering header templates.
+/// All fields are borrows, so the context is `Copy`; handlers that
+/// need a tweaked view (e.g. try-files overriding `path`) build one
+/// with struct-update syntax without touching the original.
+#[derive(Clone, Copy)]
 pub struct RequestContext<'a> {
     pub client_ip: &'a str,
     pub username: &'a str,
@@ -211,6 +504,46 @@ pub struct RequestContext<'a> {
     /// Comma-joined client-certificate SANs (DNS, URI, RFC822).
     /// Empty when no client cert was presented.
     pub client_cert_sans: &'a str,
+    /// ISO 3166-1 country code from GeoIP; empty when geoip is
+    /// unconfigured or the lookup found nothing.
+    pub country: &'a str,
+    /// Snapshot of request headers referenced by `{header:...}`
+    /// templates; only names the config mentions are captured.
+    pub headers: &'a [(HeaderName, String)],
+    /// Lazily-evaluated config-defined variables.
+    pub vars: VarScope<'a>,
+}
+
+impl<'a> RequestContext<'a> {
+    /// All-empty context.  Construction sites use struct-update
+    /// syntax (`..RequestContext::empty()`) so adding a context field
+    /// does not touch every one of them.
+    pub fn empty() -> RequestContext<'a> {
+        RequestContext {
+            client_ip: "",
+            username: "",
+            groups: "",
+            method: "",
+            path: "",
+            query: "",
+            path_and_query: "",
+            host: "",
+            scheme: "",
+            client_cert_subject: "",
+            client_cert_sans: "",
+            country: "",
+            headers: &[],
+            vars: VarScope::EMPTY,
+        }
+    }
+
+    fn header_value(&self, name: &HeaderName) -> &'a str {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    }
 }
 
 /// Extract username and pre-joined groups from a `Principal`.
@@ -313,6 +646,7 @@ mod tests {
             scheme: "http",
             client_cert_subject: "",
             client_cert_sans: "",
+            ..RequestContext::empty()
         }
     }
 
@@ -411,6 +745,21 @@ mod tests {
         c.scheme = "https";
         let t = Template::parse("{scheme}");
         assert_eq!(t.render(&c), "https");
+    }
+
+    #[test]
+    fn malformed_header_token_renders_verbatim() {
+        // Compatibility: bad {header:...} names degrade to literal
+        // output instead of failing config load.
+        let t = Template::compile(
+            "see the {header: X} spec",
+            &crate::vars::VarNames::default(),
+        )
+        .expect("must not fail compilation");
+        assert_eq!(
+            t.render(&RequestContext::empty()),
+            "see the {header: X} spec"
+        );
     }
 
     #[test]
@@ -618,6 +967,7 @@ mod tests {
             scheme: "http",
             client_cert_subject: "",
             client_cert_sans: "",
+            ..RequestContext::empty()
         };
         apply_request_headers(&mut h, &ops, &c);
         assert_eq!(h["x-user"], "alice");
@@ -702,6 +1052,7 @@ mod tests {
             scheme: "http",
             client_cert_subject: "",
             client_cert_sans: "",
+            ..RequestContext::empty()
         };
         apply_request_headers(&mut h, &ops, &c);
         assert_eq!(h["x-user"], "anonymous");
@@ -726,6 +1077,7 @@ mod tests {
             scheme: "http",
             client_cert_subject: "",
             client_cert_sans: "",
+            ..RequestContext::empty()
         };
         apply_request_headers(&mut h, &ops, &c);
         assert!(h.get("x-auth-user").is_none());
@@ -750,6 +1102,7 @@ mod tests {
             scheme: "http",
             client_cert_subject: "",
             client_cert_sans: "",
+            ..RequestContext::empty()
         };
         apply_request_headers(&mut h, &ops, &c);
         assert!(h.get("x-auth-groups").is_none());

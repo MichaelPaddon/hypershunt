@@ -4,6 +4,7 @@
 // supplied template rendered against the request context.
 
 use crate::headers::{RequestContext, Template};
+use crate::vars::VarNames;
 
 /// Compiled cache-key recipe for a location.
 pub struct CacheKey {
@@ -15,10 +16,18 @@ impl CacheKey {
     /// Compile the optional operator key template.  Reuses the same
     /// `{var}` engine as header/redirect templates, so the variable
     /// set is identical and documented in one place.
-    pub fn compile(key: Option<&str>) -> Self {
-        CacheKey {
-            template: key.map(Template::parse),
-        }
+    pub fn compile(
+        key: Option<&str>,
+        names: &VarNames,
+    ) -> anyhow::Result<Self> {
+        Ok(CacheKey {
+            template: key.map(|k| Template::compile(k, names)).transpose()?,
+        })
+    }
+
+    /// The operator template, for build-time needs analysis.
+    pub fn template(&self) -> Option<&Template> {
+        self.template.as_ref()
     }
 
     /// Build the primary cache key for a request.
@@ -50,18 +59,19 @@ mod tests {
             scheme: "https",
             client_cert_subject: "",
             client_cert_sans: "",
+            ..RequestContext::empty()
         }
     }
 
     #[test]
     fn default_key_uses_method_scheme_host_path_query() {
-        let k = CacheKey::compile(None);
+        let k = CacheKey::compile(None, &VarNames::default()).unwrap();
         assert_eq!(k.build(&ctx()), "GET https://example.com/a?x=1");
     }
 
     #[test]
     fn method_segregates_otherwise_identical_requests() {
-        let k = CacheKey::compile(None);
+        let k = CacheKey::compile(None, &VarNames::default()).unwrap();
         let mut head = ctx();
         head.method = "HEAD";
         assert_ne!(k.build(&ctx()), k.build(&head));
@@ -69,7 +79,11 @@ mod tests {
 
     #[test]
     fn template_key_renders_and_keeps_method_prefix() {
-        let k = CacheKey::compile(Some("{host}{path}|{username}"));
+        let k = CacheKey::compile(
+            Some("{host}{path}|{username}"),
+            &VarNames::default(),
+        )
+        .unwrap();
         assert_eq!(k.build(&ctx()), "GET example.com/a|alice");
     }
 }

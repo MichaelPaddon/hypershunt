@@ -74,6 +74,7 @@ mod tests {
             scheme: "http",
             client_cert_subject: "",
             client_cert_sans: "",
+            ..RequestContext::empty()
         }
     }
 
