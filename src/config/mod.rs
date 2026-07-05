@@ -16,10 +16,10 @@ mod kdl;
 mod parse;
 mod types_socket;
 pub use types_socket::{AddrLocation, BoundAddr, SocketKind};
+pub(crate) use parse::did_you_mean;
 use parse::{
-    check_misnesting, did_you_mean, line_of_offset, node_line,
-    parse_certificate, parse_listener, parse_server, parse_vhost,
-    TOP_LEVEL_ONLY,
+    check_misnesting, line_of_offset, node_line, parse_certificate,
+    parse_listener, parse_server, parse_vhost, TOP_LEVEL_ONLY,
 };
 #[cfg(test)]
 mod tests;
@@ -47,6 +47,39 @@ pub enum PolicyRuleDef {
     },
     /// Inline the named policy's rules at this point.
     Apply { name: String },
+}
+
+/// One server-level `variable` definition, unresolved.  Compiled and
+/// validated into a `vars::VarTable` at router build (and during
+/// validate() so `--check-config` catches errors).
+#[derive(Debug, Clone)]
+pub struct VariableDef {
+    pub name: String,
+    pub body: VariableBody,
+    /// 1-based source line of the `variable` node, for errors.
+    pub line: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum VariableBody {
+    /// `variable "name" "template"`
+    Constant(String),
+    /// `variable "name" { match "input" { arms } }`
+    Match {
+        input: String,
+        arms: Vec<VariableArm>,
+    },
+}
+
+/// One match arm: the node name is the regex pattern (unanchored
+/// search) and the first argument is the value template.
+#[derive(Debug, Clone)]
+pub struct VariableArm {
+    /// `None` is the `_` catch-all arm.
+    pub pattern: Option<String>,
+    pub value: String,
+    /// 1-based source line of the arm node, for errors.
+    pub line: usize,
 }
 
 /// Source for a custom error page HTML body.
@@ -107,6 +140,9 @@ pub struct ServerConfig {
     pub health: HealthConfig,
     // Named policy blocks available to all vhosts/locations.
     pub policies: HashMap<String, Vec<PolicyRuleDef>>,
+    // Server-level `variable` definitions, in declaration order.
+    // Compiled into a `vars::VarTable` at router build.
+    pub variables: Vec<VariableDef>,
     // Server-wide response-cache settings.  `None` when no `cache { }`
     // block appears in the `server` node; sizes the single shared
     // store when present.  Mere presence does not enable caching --
@@ -158,6 +194,7 @@ impl Default for ServerConfig {
             geoip: None,
             health: Default::default(),
             policies: HashMap::new(),
+            variables: Vec::new(),
             cache: None,
             error_pages: Vec::new(),
             cert_key_mode: None,
@@ -410,6 +447,10 @@ pub struct UpstreamConfig {
     /// Relative pick weight; defaults to 1.  `0` excludes the upstream
     /// from selection (useful for temporarily parking a backend).
     pub weight: u32,
+    /// Selection-group label targeted by the proxy's `group-by`
+    /// template.  `None` means the upstream belongs to no group and
+    /// is only picked when no group restriction applies.
+    pub group: Option<String>,
 }
 
 /// Picker policy for multi-upstream proxy locations.
@@ -804,6 +845,11 @@ pub enum HandlerConfig {
         // `header=` property on the same `lb-policy` node.  Otherwise
         // unused.
         lb_hash_header: Option<String>,
+        // `group-by "<template>"` child: rendered per request to pick
+        // among upstreams sharing the matching `group=` label.  An
+        // empty or unknown rendered value falls back to the whole
+        // pool.
+        group_by: Option<String>,
         // Optional active probe.  `None` disables active health checks
         // entirely; otherwise a background task probes each upstream.
         active_health: Option<ActiveHealthConfig>,
@@ -1024,6 +1070,25 @@ impl Config {
         if has_http && self.vhosts.is_empty() {
             bail!("config must define at least one vhost");
         }
+        // Compile and validate `variable` definitions so
+        // --check-config catches bad names, patterns, captures, and
+        // cycles.  The router rebuilds the table at startup; this
+        // build is throwaway.
+        let var_table = crate::vars::VarTable::build(&self.server.variables)
+            .map_err(|e| {
+                if name.is_empty() {
+                    e
+                } else {
+                    anyhow!("{name}: {e}")
+                }
+            })?;
+        if var_table.any_needs_geoip() && self.server.geoip.is_none() {
+            tracing::warn!(
+                "variables reference {{country}} but no geoip database \
+                 is configured; it will always render empty"
+            );
+        }
+
         // Health paths must be absolute, and a path can't be both a
         // liveness and a readiness check (its drain behaviour would be
         // ambiguous).

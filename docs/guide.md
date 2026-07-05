@@ -994,19 +994,84 @@ location "/api/" {
 - [`remove`](reference.md#remove-request-headers) deletes every
   instance.
 
-Template variables in `set` / `add` values:
-
-| Variable        | Substitution                                       |
-|-----------------|----------------------------------------------------|
-| `{client_ip}`   | Post-PROXY-protocol peer address.                  |
-| `{user}`        | Authenticated username, or empty.                  |
-| `{request_id}`  | UUIDv4 generated per request.                      |
+`set` / `add` values are templates — `{client_ip}`, `{username}`,
+`{host}`, `{header:<name>}`, and friends, with `{name|fallback}`
+for empty values.  The full variable set, and how to define your
+own derived variables, live in [Variables](#variables) below and
+[Reference — Variables](reference.md#variables).
 
 Header rules apply in declaration order; mixing `add` and `set`
 on the same name lets you e.g. `set "X-Forwarded-For"` to the
 client IP and then `add` extra hops.
 
 **See also:** [Reference — request-headers](reference.md#request-headers).
+
+## Variables
+
+Everywhere hypershunt accepts a template — header values, redirect
+targets, respond bodies, cache keys, try-files, fallback-redirect,
+policy redirects, proxy `group-by` — the same `{variable}` syntax
+and the same variable set apply.  Built-ins cover the request
+(`{host}`, `{path}`, `{method}`, `{header:<name>}`, ...), the
+connection (`{client_ip}`, `{scheme}`, `{country}`), and identity
+(`{username}`, `{groups}`).  `{name|fallback}` substitutes the
+fallback text when the value is empty.  The full table is in
+[Reference — Variables](reference.md#variables).
+
+Custom variables derive new values from request attributes with a
+Rust-style match: arms are regexes tried in order against a
+rendered input; the first hit yields the arm's value; `_` is the
+catch-all.
+
+```kdl
+server {
+    // Which backend lane serves this request?
+    variable "lane" {
+        match "{header:x-lane}" {
+            "^beta$" "beta"
+            _        "main"
+        }
+    }
+
+    // Extract the tenant from the subdomain with a named capture.
+    variable "tenant" {
+        match "{host}" {
+            #"^(?<t>[a-z0-9-]+)\.example\.com$"# "{t}"
+            _                                     "www"
+        }
+    }
+}
+```
+
+Reference them like any built-in:
+
+```kdl
+location "/" {
+    request-headers { set "X-Tenant" "{tenant}" }
+    proxy {
+        upstream "http://app1:9000"  group="main"
+        upstream "http://beta1:9000" group="beta"
+        group-by "{lane}"
+    }
+}
+```
+
+Things worth knowing:
+
+- Write regex arms as raw strings (`#"..."#`) to avoid doubling
+  backslashes.  Patterns search anywhere in the input; anchor with
+  `^`/`$` when you mean the whole value.
+- Matching is first-arm-wins; no match (and no `_` arm) renders
+  empty, so `{lane|main}` style fallbacks work at the reference
+  site.
+- Values are per-request and computed lazily on first use, then
+  frozen for that request.  A variable can reference other
+  variables (in its input or values); cycles are a config error.
+- Referencing `{username}`/`{groups}` in a variable makes routes
+  that use it authenticate requests; `{country}` likewise turns on
+  the GeoIP lookup.
+
+**See also:** [Reference — variable](reference.md#variable).
 
 ## URL redirects
 

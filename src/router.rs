@@ -14,6 +14,7 @@ use crate::handler::status::{
 };
 use crate::headers::{HeaderOp, HeaderRules, Template};
 use crate::metrics::{HandlerKind, Metrics};
+use crate::vars::{RouteVars, VarNeeds, VarTable};
 use anyhow::bail;
 use hyper::Request;
 use hyper::header::HeaderName;
@@ -43,6 +44,10 @@ pub struct Route {
     /// has a `cache { }` block.  Drives read-through/write-through at
     /// the dispatch site against the shared `CacheStore`.
     pub cache_policy: Option<Arc<crate::cache::CachePolicy>>,
+    /// Variable table + aggregated needs for every template this
+    /// route can render; `None` when they are all static (the common
+    /// case, zero per-request overhead).
+    pub vars: Option<Arc<RouteVars>>,
 }
 
 // Runtime representation of a virtual host, with handlers pre-built.
@@ -79,6 +84,8 @@ struct Location {
     // Compiled response-cache policy; None when the location has no
     // `cache { }` block (the common case, zero overhead).
     cache_policy: Option<Arc<crate::cache::CachePolicy>>,
+    // See Route::vars.
+    vars: Option<Arc<RouteVars>>,
 }
 
 /// Runtime rewrite: compiled regex plus its replacement template.
@@ -125,6 +132,11 @@ impl Router {
         summary: &Arc<ServerSummary>,
         cert_state: Option<&crate::cert::state::SharedCertState>,
     ) -> anyhow::Result<Self> {
+        // Compile the variable table first: every template compiled
+        // below resolves user variables against it.
+        let var_table =
+            Arc::new(VarTable::build(&config.server.variables)?);
+
         // Inline all named policies first so location blocks can reference
         // them via apply.
         let named_policies = resolve_named_policies(&config.server.policies)?;
@@ -151,6 +163,7 @@ impl Router {
                 &named_policies,
                 &lb_registry,
                 &mut lb_pools,
+                &var_table,
             )?);
             built.push(vhost);
             // Handle uniqueness is enforced by Config::validate; the
@@ -258,6 +271,7 @@ impl Router {
                 rate_limits: loc.rate_limits.clone(),
                 max_request_body: loc.max_request_body,
                 cache_policy: loc.cache_policy.clone(),
+                vars: loc.vars.clone(),
             });
         }
         tracing::warn!(
@@ -561,15 +575,24 @@ fn build_vhost(
     named_policies: &HashMap<String, Vec<PolicyRule>>,
     lb_registry: &SharedLbRegistry,
     lb_pools: &mut Vec<LbPoolEntry>,
+    var_table: &Arc<VarTable>,
 ) -> anyhow::Result<VHost> {
+    let names = var_table.names();
     let mut locations = Vec::with_capacity(vcfg.locations.len());
     for loc in &vcfg.locations {
+        // Aggregate over every template this location can render, so
+        // the listener knows up front whether to run the
+        // authenticator, look up geoip, snapshot headers, or allocate
+        // variable slots.
+        let mut needs = VarNeeds::default();
         let (handler, pool) = crate::handler::build_handler(
             &loc.handler,
             metrics,
             summary,
             cert_state,
             lb_registry,
+            var_table,
+            &mut needs,
         )?;
         // Register any reverse-proxy pool for the status page, labelled
         // by its vhost + location for the per-upstream health table.
@@ -587,18 +610,22 @@ fn build_vhost(
             let req = loc
                 .request_headers
                 .iter()
-                .map(op_from_config)
+                .map(|c| op_from_config(c, var_table, &mut needs))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let resp = loc
                 .response_headers
                 .iter()
-                .map(op_from_config)
+                .map(|c| op_from_config(c, var_table, &mut needs))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             Some(Arc::new(HeaderRules::new(req, resp)))
         };
         let policy = if let Some(defs) = &loc.policy {
             let rules = inline_rules(defs, named_policies, false)?;
-            Some(Arc::new(PolicyBlock::new(rules)))
+            let block = PolicyBlock::with_vars(rules, names)?;
+            for t in block.redirect_templates() {
+                needs.absorb(t, var_table);
+            }
+            Some(Arc::new(block))
         } else {
             None
         };
@@ -619,8 +646,22 @@ fn build_vhost(
             .map(rewrite_from_config)
             .transpose()?
             .map(Arc::new);
-        let cache_policy = loc.cache.as_ref().map(|c| {
-            Arc::new(crate::cache::CachePolicy::compile(c))
+        let cache_policy = loc
+            .cache
+            .as_ref()
+            .map(|c| {
+                let p = crate::cache::CachePolicy::compile(c, names)?;
+                if let Some(t) = p.key_template() {
+                    needs.absorb(t, var_table);
+                }
+                Ok::<_, anyhow::Error>(Arc::new(p))
+            })
+            .transpose()?;
+        let vars = needs.any().then(|| {
+            Arc::new(RouteVars {
+                table: var_table.clone(),
+                needs,
+            })
         });
         locations.push(Location {
             path: loc.path.clone(),
@@ -634,6 +675,7 @@ fn build_vhost(
             matcher,
             rewrite,
             cache_policy,
+            vars,
         });
     }
     Ok(VHost {
@@ -867,18 +909,27 @@ impl Router {
     }
 }
 
-fn op_from_config(cfg: &HeaderOpConfig) -> anyhow::Result<HeaderOp> {
+fn op_from_config(
+    cfg: &HeaderOpConfig,
+    var_table: &VarTable,
+    needs: &mut VarNeeds,
+) -> anyhow::Result<HeaderOp> {
     use crate::config::HeaderOpConfig as C;
+    let mut compile = |value: &str| -> anyhow::Result<Template> {
+        let t = Template::compile(value, var_table.names())?;
+        needs.absorb(&t, var_table);
+        Ok(t)
+    };
     Ok(match cfg {
         C::Set { name, value } => HeaderOp::Set {
             name: HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| anyhow::anyhow!("invalid header name '{name}'"))?,
-            template: Template::parse(value),
+            template: compile(value)?,
         },
         C::Add { name, value } => HeaderOp::Add {
             name: HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| anyhow::anyhow!("invalid header name '{name}'"))?,
-            template: Template::parse(value),
+            template: compile(value)?,
         },
         C::Remove { name } => HeaderOp::Remove {
             name: HeaderName::from_bytes(name.as_bytes())

@@ -2865,3 +2865,282 @@ index-file "index.html";
             "fd exhaustion must pause before the loop retries"
         );
     }
+
+    // -- config-defined variables (server `variable` blocks) ---------
+
+    #[tokio::test]
+    async fn variable_match_drives_response_header() {
+        let template = r#"
+            server {
+                variable "backend" {
+                    match "{path}" {
+                        "^/api" "api"
+                        _       "main"
+                    }
+                }
+            }
+            listener "tcp://{addr}"
+            vhost "example.com" {
+                location "/" {
+                    respond status=200 body="ok"
+                    response-headers {
+                        set "X-Backend" "{backend}"
+                    }
+                }
+            }
+        "#;
+        let srv = TestServer::start(template).await;
+        let (_, headers, _) = srv.get("example.com", "/api/v1").await;
+        assert_eq!(headers["x-backend"], "api");
+        let (_, headers, _) = srv.get("example.com", "/other").await;
+        assert_eq!(headers["x-backend"], "main");
+    }
+
+    #[tokio::test]
+    async fn variable_capture_in_redirect_target() {
+        let template = r##"
+            server {
+                variable "tenant" {
+                    match "{host}" {
+                        #"^(?<t>[a-z0-9-]+)\.example\.com$"# "{t}"
+                        _                                   "www"
+                    }
+                }
+            }
+            listener "tcp://{addr}"
+            vhost "~.*" regex=#true {
+                location "/" {
+                    redirect to="https://portal.example.com/{tenant}" \
+                        code=302
+                }
+            }
+        "##;
+        let srv = TestServer::start(template).await;
+        let (status, headers, _) = srv.get("acme.example.com", "/").await;
+        assert_eq!(status, 302);
+        assert_eq!(
+            headers["location"],
+            "https://portal.example.com/acme"
+        );
+        let (_, headers, _) = srv.get("nomatch.other.org", "/").await;
+        assert_eq!(headers["location"], "https://portal.example.com/www");
+    }
+
+    #[tokio::test]
+    async fn variable_fallback_applies_at_reference_site() {
+        // Anonymous request: {username} is empty, the match has no
+        // catch-all, so {tier} renders empty and the reference-site
+        // fallback fires.
+        let template = r#"
+            server {
+                variable "tier" {
+                    match "{username}" {
+                        ".+" "member"
+                    }
+                }
+            }
+            listener "tcp://{addr}"
+            vhost "example.com" {
+                location "/" {
+                    respond status=200 body="tier={tier|anonymous}"
+                }
+            }
+        "#;
+        let srv = TestServer::start(template).await;
+        let (_, _, body) = srv.get("example.com", "/").await;
+        assert_eq!(&body[..], b"tier=anonymous");
+    }
+
+    #[tokio::test]
+    async fn variable_matches_on_request_header() {
+        let template = r#"
+            server {
+                variable "lane" {
+                    match "{header:x-lane}" {
+                        "^canary$" "canary"
+                        _          "stable"
+                    }
+                }
+            }
+            listener "tcp://{addr}"
+            vhost "example.com" {
+                location "/" {
+                    respond status=200 body="lane={lane}"
+                }
+            }
+        "#;
+        let srv = TestServer::start(template).await;
+        let (_, _, body) = srv
+            .get_h("example.com", "/", &[("x-lane", "canary")])
+            .await;
+        assert_eq!(&body[..], b"lane=canary");
+        let (_, _, body) = srv.get("example.com", "/").await;
+        assert_eq!(&body[..], b"lane=stable");
+    }
+
+    #[tokio::test]
+    async fn policy_redirect_renders_variables() {
+        let template = r#"
+            server {
+                variable "login" "https://sso.example.com/login"
+            }
+            listener "tcp://{addr}"
+            vhost "example.com" {
+                location "/" {
+                    respond status=200 body="never reached"
+                    policy {
+                        redirect to="{login}?rt={path_and_query}" \
+                            code=302
+                    }
+                }
+            }
+        "#;
+        let srv = TestServer::start(template).await;
+        let (status, headers, _) =
+            srv.get("example.com", "/private?x=1").await;
+        assert_eq!(status, 302);
+        assert_eq!(
+            headers["location"],
+            "https://sso.example.com/login?rt=/private?x=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn variables_compose_and_memoize_within_request() {
+        // `tag` references `region` twice; the memoized value must be
+        // consistent, and composition must recurse through the table.
+        let template = r#"
+            server {
+                variable "region" {
+                    match "{host}" {
+                        "^eu" "eu"
+                        _     "us"
+                    }
+                }
+                variable "tag" "{region}-{region}"
+            }
+            listener "tcp://{addr}"
+            vhost "~.*" regex=#true {
+                location "/" {
+                    respond status=200 body="{tag}"
+                }
+            }
+        "#;
+        let srv = TestServer::start(template).await;
+        let (_, _, body) = srv.get("eu.example.com", "/").await;
+        assert_eq!(&body[..], b"eu-eu");
+        let (_, _, body) = srv.get("www.example.com", "/").await;
+        assert_eq!(&body[..], b"us-us");
+    }
+
+    #[tokio::test]
+    async fn fallback_redirect_renders_variables() {
+        // Empty webroot, no index, no listing: the fallback redirect
+        // fires and its template renders per request.
+        let dir = tempfile::tempdir().unwrap();
+        let template = format!(
+            r#"
+            listener "tcp://{{addr}}"
+            vhost "~.*" regex=#true {{
+                location "/" {{
+                    static root="{root}" \
+                        fallback-redirect="https://{{host}}/docs/"
+                }}
+            }}
+            "#,
+            root = dir.path().display()
+        );
+        let srv = TestServer::start(&template).await;
+        let (status, headers, _) = srv.get("example.com", "/").await;
+        assert_eq!(status, 302);
+        assert_eq!(headers["location"], "https://example.com/docs/");
+        let (_, headers, _) = srv.get("other.org", "/").await;
+        assert_eq!(headers["location"], "https://other.org/docs/");
+    }
+
+    #[tokio::test]
+    async fn try_files_renders_variables() {
+        // Language selection via a header-driven variable inside a
+        // try-files candidate; `{path}` keeps its location-relative
+        // meaning alongside it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("en.html"), "hello").unwrap();
+        std::fs::write(dir.path().join("fr.html"), "bonjour").unwrap();
+        let template = format!(
+            r#"
+            server {{
+                variable "lang" {{
+                    match "{{header:x-lang}}" {{
+                        "^fr$" "fr"
+                        _      "en"
+                    }}
+                }}
+            }}
+            listener "tcp://{{addr}}"
+            vhost "example.com" {{
+                location "/" {{
+                    static root="{root}" {{
+                        try-files "{{path}}"
+                        try-files "/{{lang}}.html"
+                    }}
+                }}
+            }}
+            "#,
+            root = dir.path().display()
+        );
+        let srv = TestServer::start(&template).await;
+        let (_, _, body) = srv
+            .get_h("example.com", "/missing", &[("x-lang", "fr")])
+            .await;
+        assert_eq!(&body[..], b"bonjour");
+        let (_, _, body) = srv.get("example.com", "/missing").await;
+        assert_eq!(&body[..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn proxy_group_by_routes_by_variable() {
+        // The proxy client is TLS-capable, so the process-level
+        // rustls provider must be in place like other proxy tests.
+        let _ = rustls::crypto::aws_lc_rs::default_provider()
+            .install_default();
+        let main = TestBackend::start_responding(200, b"main").await;
+        let beta = TestBackend::start_responding(200, b"beta").await;
+        let template = format!(
+            r#"
+            server {{
+                variable "lane" {{
+                    match "{{header:x-lane}}" {{
+                        "^beta$" "beta"
+                        _        "main"
+                    }}
+                }}
+            }}
+            listener "tcp://{{addr}}"
+            vhost "example.com" {{
+                location "/" {{
+                    proxy {{
+                        upstream "http://{main}" group="main"
+                        upstream "http://{beta}" group="beta"
+                        group-by "{{lane}}"
+                    }}
+                }}
+            }}
+            "#,
+            main = main.addr,
+            beta = beta.addr,
+        );
+        let srv = TestServer::start(&template).await;
+        let (_, _, body) = srv
+            .get_h("example.com", "/", &[("x-lane", "beta")])
+            .await;
+        assert_eq!(&body[..], b"beta");
+        let (_, _, body) = srv.get("example.com", "/").await;
+        assert_eq!(&body[..], b"main");
+        // An unrecognised lane value hits the match catch-all and
+        // lands on main.  (Unknown-group fallback to the whole pool
+        // is covered by the lb.rs unit tests.)
+        let (_, _, body) = srv
+            .get_h("example.com", "/", &[("x-lane", "wat")])
+            .await;
+        assert_eq!(&body[..], b"main");
+    }

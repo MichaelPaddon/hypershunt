@@ -151,13 +151,17 @@ impl Handler for RespondHandler {
 pub type BuiltHandler =
     (Arc<dyn Handler>, Option<Arc<crate::lb::UpstreamPool>>);
 
-/// Build one handler from its config.
+/// Build one handler from its config.  Templated fields compile
+/// against `var_table` and fold their references into `needs`, the
+/// per-location aggregate the listener consults at request time.
 pub fn build_handler(
     cfg: &HandlerConfig,
     metrics: &Arc<Metrics>,
     summary: &Arc<status::ServerSummary>,
     cert_state: Option<&crate::cert::state::SharedCertState>,
     lb_registry: &status::SharedLbRegistry,
+    var_table: &crate::vars::VarTable,
+    needs: &mut crate::vars::VarNeeds,
 ) -> anyhow::Result<BuiltHandler> {
     match cfg {
         HandlerConfig::Static {
@@ -170,24 +174,30 @@ pub fn build_handler(
             userdir,
             userdir_allowlist,
             userdir_min_uid,
-        } => Ok((Arc::new(static_files::StaticHandler::new(
-            static_files::StaticConfig {
-                root: root.clone(),
-                index_files: index_files.clone(),
-                strip_prefix: *strip_prefix,
-                try_files: try_files.clone(),
-                directory_listing: *directory_listing,
-                fallback_redirect: fallback_redirect.clone(),
-                userdir: userdir.clone(),
-                userdir_allowlist: userdir_allowlist.clone(),
-                userdir_min_uid: *userdir_min_uid,
-            },
-            metrics.clone(),
-        )) as Arc<dyn Handler>, None)),
+        } => Ok((
+            Arc::new(static_files::StaticHandler::new(
+                static_files::StaticConfig {
+                    root: root.clone(),
+                    index_files: index_files.clone(),
+                    strip_prefix: *strip_prefix,
+                    try_files: try_files.clone(),
+                    directory_listing: *directory_listing,
+                    fallback_redirect: fallback_redirect.clone(),
+                    userdir: userdir.clone(),
+                    userdir_allowlist: userdir_allowlist.clone(),
+                    userdir_min_uid: *userdir_min_uid,
+                },
+                metrics.clone(),
+                var_table,
+                needs,
+            )?) as Arc<dyn Handler>,
+            None,
+        )),
         HandlerConfig::Proxy {
             upstreams,
             lb_policy,
             lb_hash_header,
+            group_by,
             active_health,
             passive_health,
             retry,
@@ -201,10 +211,19 @@ pub fn build_handler(
         } => {
             let skip_verify =
                 upstream_tls.as_ref().map(|t| t.skip_verify).unwrap_or(false);
+            let group_by = group_by
+                .as_deref()
+                .map(|s| {
+                    let t = Template::compile(s, var_table.names())?;
+                    needs.absorb(&t, var_table);
+                    Ok::<_, anyhow::Error>(t)
+                })
+                .transpose()?;
             let h = proxy::ProxyHandler::new_pool(
                 upstreams,
                 lb_policy.clone(),
                 lb_hash_header.clone(),
+                group_by,
                 passive_health.clone(),
                 retry.clone(),
                 *strip_prefix,
@@ -236,13 +255,15 @@ pub fn build_handler(
             let pool = h.pool().clone();
             Ok((Arc::new(h) as Arc<dyn Handler>, Some(pool)))
         }
-        HandlerConfig::Redirect { to, code } => Ok((
-            Arc::new(RedirectHandler {
-                to: Template::parse(to),
-                code: *code,
-            }) as Arc<dyn Handler>,
-            None,
-        )),
+        HandlerConfig::Redirect { to, code } => {
+            let to = Template::compile(to, var_table.names())?;
+            needs.absorb(&to, var_table);
+            Ok((
+                Arc::new(RedirectHandler { to, code: *code })
+                    as Arc<dyn Handler>,
+                None,
+            ))
+        }
         HandlerConfig::Respond {
             status,
             body,
@@ -251,7 +272,9 @@ pub fn build_handler(
             let body = match body {
                 RespondBody::Empty => RespondBodySource::Empty,
                 RespondBody::Inline(s) => {
-                    RespondBodySource::Inline(Template::parse(s))
+                    let t = Template::compile(s, var_table.names())?;
+                    needs.absorb(&t, var_table);
+                    RespondBodySource::Inline(t)
                 }
                 RespondBody::File(p) => {
                     RespondBodySource::File(PathBuf::from(p))
@@ -339,6 +362,7 @@ mod respond_tests {
             scheme: "http",
             client_cert_subject: "",
             client_cert_sans: "",
+            ..RequestContext::empty()
         }
     }
 

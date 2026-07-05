@@ -111,6 +111,58 @@ vhost "app.example.com" {
 [Load balancing](guide.md#load-balancing),
 [Health checks](guide.md#health-checks).
 
+## Canary lane and per-region headers with variables
+
+Route opted-in clients (an `X-Lane: beta` header) to a canary
+backend while everyone else stays on main, and stamp responses with
+an edge region derived from GeoIP.  One `variable` block drives
+both decisions.
+
+```kdl
+server user="hypershunt" state-dir="/var/lib/hypershunt" {
+    geoip db="/var/lib/GeoIP/GeoLite2-Country.mmdb"
+
+    variable "lane" {
+        match "{header:x-lane}" {
+            "^beta$" "beta"
+            _        "main"
+        }
+    }
+    variable "region" {
+        match "{country}" {
+            "^(DE|FR|NL|AT|CH)$" "eu"
+            _                    "us"
+        }
+    }
+}
+
+listener "tcp://[::]:443" {
+    tls "acme" email="ops@example.com" { domain "app.example.com" }
+}
+
+vhost "app.example.com" {
+    location "/" {
+        proxy {
+            upstream "http://10.0.0.11:9000" group="main"
+            upstream "http://10.0.0.12:9000" group="main"
+            upstream "http://10.0.0.21:9000" group="beta"
+            group-by "{lane}"
+        }
+        response-headers {
+            set "X-Served-Lane" "{lane}"
+            set "X-Edge-Region" "{region}"
+        }
+    }
+}
+```
+
+An unknown lane value (or an unhealthy canary) falls back to the
+whole pool, so a bad header can never take the site down.
+
+**See also:** [Variables](guide.md#variables),
+[Reference — variable](reference.md#variable),
+[Reference — group-by](reference.md#group-by).
+
 ## PHP application (FastCGI / PHP-FPM)
 
 Serve static assets directly and hand `.php` requests to a PHP-FPM

@@ -14,11 +14,14 @@
 // "not authenticated").
 
 use crate::auth::Principal;
+use crate::headers::Template;
+use crate::vars::VarNames;
 use async_trait::async_trait;
 use ipnet::IpNet;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 
 // -- Auth provider ------------------------------------------------
 
@@ -124,14 +127,64 @@ pub struct PolicyBlock {
     pub rules: Vec<PolicyRule>,
     /// True iff any predicate in any rule uses Country.
     pub needs_geoip: bool,
+    /// Compiled `redirect to=` templates, index-aligned with `rules`
+    /// (`None` for non-redirect rules).
+    redirect_templates: Vec<Option<Arc<Template>>>,
 }
 
 impl PolicyBlock {
+    /// Build without a variable table (stream listeners, tests):
+    /// redirect targets get the lenient built-ins-only template.
     pub fn new(rules: Vec<PolicyRule>) -> Self {
+        let redirect_templates = rules
+            .iter()
+            .map(|r| match &r.action {
+                PolicyAction::Redirect { to, .. } => {
+                    Some(Arc::new(Template::parse(to)))
+                }
+                _ => None,
+            })
+            .collect();
+        Self::assemble(rules, redirect_templates)
+    }
+
+    /// Build against the config's variable table so redirect targets
+    /// can reference config-defined variables.
+    pub fn with_vars(
+        rules: Vec<PolicyRule>,
+        names: &VarNames,
+    ) -> anyhow::Result<Self> {
+        let redirect_templates = rules
+            .iter()
+            .map(|r| match &r.action {
+                PolicyAction::Redirect { to, .. } => {
+                    Ok(Some(Arc::new(Template::compile(to, names)?)))
+                }
+                _ => Ok(None),
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Self::assemble(rules, redirect_templates))
+    }
+
+    fn assemble(
+        rules: Vec<PolicyRule>,
+        redirect_templates: Vec<Option<Arc<Template>>>,
+    ) -> Self {
         let needs_geoip = rules
             .iter()
             .any(|r| r.predicate.as_ref().is_some_and(|p| p.needs_geoip()));
-        PolicyBlock { rules, needs_geoip }
+        PolicyBlock {
+            rules,
+            needs_geoip,
+            redirect_templates,
+        }
+    }
+
+    /// Compiled redirect targets, for build-time needs analysis.
+    pub fn redirect_templates(&self) -> impl Iterator<Item = &Template> {
+        self.redirect_templates
+            .iter()
+            .filter_map(|t| t.as_deref())
     }
 
     /// Evaluate the policy against the request context.  The first rule
@@ -139,7 +192,7 @@ impl PolicyBlock {
     /// signalled by an auth predicate, a 401 is returned immediately.
     /// If no rule matches, the default is Deny(403).
     pub async fn evaluate(&self, ctx: &mut EvalContext<'_>) -> PolicyOutcome {
-        for rule in &self.rules {
+        for (i, rule) in self.rules.iter().enumerate() {
             let result = match &rule.predicate {
                 None => PredicateResult::Match,
                 Some(pred) => eval_predicate(pred, ctx).await,
@@ -152,7 +205,18 @@ impl PolicyBlock {
                             PolicyOutcome::Deny(*code)
                         }
                         PolicyAction::Redirect { to, code } => {
-                            PolicyOutcome::Redirect(to.clone(), *code)
+                            // Constructors keep the template table
+                            // aligned; the fallback only fires for a
+                            // hand-assembled block.
+                            let t = self
+                                .redirect_templates
+                                .get(i)
+                                .cloned()
+                                .flatten()
+                                .unwrap_or_else(|| {
+                                    Arc::new(Template::parse(to))
+                                });
+                            PolicyOutcome::Redirect(t, *code)
                         }
                     };
                 }
@@ -172,7 +236,9 @@ impl PolicyBlock {
 pub enum PolicyOutcome {
     Allow,
     Deny(u16),
-    Redirect(String, u16),
+    /// Compiled redirect target; the caller renders it against the
+    /// request context it has at the outcome site.
+    Redirect(Arc<Template>, u16),
 }
 
 // -- Evaluation context --------------------------------------------
@@ -426,7 +492,9 @@ mod tests {
         let mut c = ctx("1.2.3.4", None, &a);
         match b.evaluate(&mut c).await {
             PolicyOutcome::Redirect(to, code) => {
-                assert_eq!(to, "/login");
+                let rendered =
+                    to.render(&crate::headers::RequestContext::empty());
+                assert_eq!(rendered, "/login");
                 assert_eq!(code, 302);
             }
             _ => panic!("expected redirect"),

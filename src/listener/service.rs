@@ -23,6 +23,7 @@ use crate::geoip;
 use crate::metrics::HandlerKind;
 use crate::headers::principal_strings;
 use crate::headers::{self, RequestContext};
+use crate::vars::VarScope;
 use crate::oidc::routes::{
     build_login_redirect, clear_refresh_cookie, cookie_value, extract_bearer,
     handle_oidc_backchannel_logout, handle_oidc_callback, handle_oidc_login,
@@ -32,12 +33,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use hyper::header::HeaderName;
 use hyper::{Request, Response, StatusCode};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -633,12 +635,63 @@ impl HypershuntService {
                             route.vhost_name.clone(),
                             route.handler_kind,
                         ));
-                        // Look up country only when the policy needs it.
+                        // Variable machinery for this route:
+                        // memoization slots plus a snapshot of the
+                        // header values its templates reference.
+                        // Allocated on this stack frame so every
+                        // context built below (policy redirect,
+                        // request context, SWR snapshot) can borrow
+                        // them; empty for routes with static
+                        // templates.
+                        let var_slots = route
+                            .vars
+                            .as_ref()
+                            .filter(|v| v.needs.uses_vars)
+                            .map(|v| v.table.new_slots())
+                            .unwrap_or_default();
+                        // First value wins for multi-valued headers,
+                        // matching `{header:...}` semantics.
+                        let var_headers: Vec<(HeaderName, String)> =
+                            route
+                                .vars
+                                .as_ref()
+                                .map(|v| {
+                                    v.needs
+                                        .headers
+                                        .iter()
+                                        .map(|n| {
+                                            let val = req
+                                                .headers()
+                                                .get(n)
+                                                .and_then(|v| {
+                                                    v.to_str().ok()
+                                                })
+                                                .unwrap_or("");
+                                            (n.clone(), val.to_owned())
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                        let var_scope = match route.vars.as_ref() {
+                            Some(v) if v.needs.uses_vars => {
+                                VarScope::new(&v.table, &var_slots)
+                            }
+                            _ => VarScope::EMPTY,
+                        };
+
+                        // Look up country only when the policy or a
+                        // referenced variable needs it.
+                        let wants_country = route
+                            .policy
+                            .as_ref()
+                            .is_some_and(|p| p.needs_geoip)
+                            || route
+                                .vars
+                                .as_ref()
+                                .is_some_and(|v| v.needs.geoip);
                         let country: Option<String> =
-                            match (&state.geoip, &route.policy) {
-                                (Some(reader), Some(policy))
-                                    if policy.needs_geoip =>
-                                {
+                            match &state.geoip {
+                                Some(reader) if wants_country => {
                                     state
                                         .metrics
                                         .geoip_lookups_total
@@ -758,8 +811,39 @@ impl HypershuntService {
                                     );
                                 }
                                 PolicyOutcome::Redirect(to, code) => {
+                                    // Policy redirects fire before the
+                                    // full request context exists, so
+                                    // render with what is known this
+                                    // early.
+                                    let peer_ip = peer.ip().to_string();
+                                    let (username, groups) =
+                                        principal_strings(&principal);
+                                    let rctx = RequestContext {
+                                        client_ip: &peer_ip,
+                                        username,
+                                        groups: &groups,
+                                        method: method.as_str(),
+                                        path: &path,
+                                        query: &query,
+                                        path_and_query: &path_and_query,
+                                        host: &host,
+                                        scheme: if is_tls {
+                                            "https"
+                                        } else {
+                                            "http"
+                                        },
+                                        country: country
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        headers: &var_headers,
+                                        vars: var_scope,
+                                        ..RequestContext::empty()
+                                    };
                                     return (
-                                        response_redirect(&to, code),
+                                        response_redirect(
+                                            &to.render(&rctx),
+                                            code,
+                                        ),
                                         String::from("-"),
                                     );
                                 }
@@ -769,16 +853,22 @@ impl HypershuntService {
                             Principal::Anonymous
                         };
 
-                        // If header rules need the principal and auth
-                        // was not triggered by the access policy
-                        // (principal is still Anonymous), resolve it now.
-                        // JWT identity takes precedence; credential
-                        // back-end is the fallback.
-                        let principal = if route
+                        // If header rules or variable templates need
+                        // the principal and auth was not triggered by
+                        // the access policy (principal is still
+                        // Anonymous), resolve it now.  JWT identity
+                        // takes precedence; credential back-end is the
+                        // fallback.
+                        let templates_need_principal = route
                             .header_rules
                             .as_ref()
                             .map(|r| r.needs_principal)
                             .unwrap_or(false)
+                            || route
+                                .vars
+                                .as_ref()
+                                .is_some_and(|v| v.needs.principal);
+                        let principal = if templates_need_principal
                             && matches!(principal, Principal::Anonymous)
                         {
                             if let Some(id) = jwt_identity.clone() {
@@ -819,6 +909,9 @@ impl HypershuntService {
                             scheme: if is_tls { "https" } else { "http" },
                             client_cert_subject: cc_subject,
                             client_cert_sans: &cc_sans,
+                            country: country.as_deref().unwrap_or(""),
+                            headers: &var_headers,
+                            vars: var_scope,
                         };
 
                         // Per-location max-request-body override:
@@ -912,6 +1005,7 @@ impl HypershuntService {
                                 &route.handler,
                                 &route.matched_prefix,
                                 &req_ctx,
+                                route.vars.as_ref(),
                                 store,
                                 policy,
                                 &state.metrics,
@@ -1095,6 +1189,7 @@ async fn serve_with_cache(
     handler: &Arc<dyn crate::handler::Handler>,
     prefix: &str,
     ctx: &RequestContext<'_>,
+    route_vars: Option<&Arc<crate::vars::RouteVars>>,
     store: &Arc<crate::cache::CacheStore>,
     policy: &Arc<crate::cache::CachePolicy>,
     metrics: &Arc<crate::metrics::Metrics>,
@@ -1130,7 +1225,7 @@ async fn serve_with_cache(
                 key,
                 entry,
                 req.headers().clone(),
-                OwnedCtx::from(ctx),
+                OwnedCtx::from(ctx, route_vars),
             );
             resp
         }
@@ -1246,10 +1341,23 @@ struct OwnedCtx {
     scheme: &'static str,
     cert_subject: String,
     cert_sans: String,
+    country: String,
+    // Header snapshot referenced by `{header:...}` templates.
+    headers: Vec<(HeaderName, String)>,
+    // Variable table + fresh memoization slots.  Values re-derive
+    // identically because every input (identity, country, header
+    // snapshot) is preserved above.
+    vars: Option<(Arc<crate::vars::VarTable>, Vec<OnceLock<String>>)>,
 }
 
 impl OwnedCtx {
-    fn from(ctx: &RequestContext<'_>) -> Self {
+    fn from(
+        ctx: &RequestContext<'_>,
+        route_vars: Option<&Arc<crate::vars::RouteVars>>,
+    ) -> Self {
+        let vars = route_vars
+            .filter(|v| v.needs.uses_vars)
+            .map(|v| (v.table.clone(), v.table.new_slots()));
         OwnedCtx {
             client_ip: ctx.client_ip.to_owned(),
             username: ctx.username.to_owned(),
@@ -1261,6 +1369,9 @@ impl OwnedCtx {
             scheme: if ctx.scheme == "https" { "https" } else { "http" },
             cert_subject: ctx.client_cert_subject.to_owned(),
             cert_sans: ctx.client_cert_sans.to_owned(),
+            country: ctx.country.to_owned(),
+            headers: ctx.headers.to_vec(),
+            vars,
         }
     }
 
@@ -1277,6 +1388,12 @@ impl OwnedCtx {
             scheme: self.scheme,
             client_cert_subject: &self.cert_subject,
             client_cert_sans: &self.cert_sans,
+            country: &self.country,
+            headers: &self.headers,
+            vars: match &self.vars {
+                Some((t, slots)) => VarScope::new(t, slots),
+                None => VarScope::EMPTY,
+            },
         }
     }
 }

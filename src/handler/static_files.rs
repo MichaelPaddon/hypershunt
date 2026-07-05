@@ -8,7 +8,7 @@ use crate::error::{
 };
 use crate::error::ReqBody;
 use crate::handler::Handler;
-use crate::headers::RequestContext;
+use crate::headers::{RequestContext, Template};
 use crate::metrics::Metrics;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -37,14 +37,16 @@ pub(crate) struct StaticHandler {
     // resolves the served file by trying each template in turn
     // and serving the first that exists as a regular file.  No
     // hit yields 404; the default index-file flow is bypassed.
-    try_files: Vec<String>,
+    // `{path}` renders as the location-relative request path.
+    try_files: Vec<Template>,
     /// Render an HTML directory listing when no index matches.
     directory_listing: bool,
-    /// Optional URL the handler 302-redirects to when the resolved
-    /// path is a directory with no matching index and no listing.
-    /// Lets `hypershunt.kdl`'s default `/` location point at `/docs/`
-    /// until the operator drops an `index.html` into the webroot.
-    fallback_redirect: Option<String>,
+    /// Optional URL template the handler 302-redirects to when the
+    /// resolved path is a directory with no matching index and no
+    /// listing.  Lets `hypershunt.kdl`'s default `/` location point
+    /// at `/docs/` until the operator drops an `index.html` into the
+    /// webroot.
+    fallback_redirect: Option<Template>,
     /// Per-user mode: the subdirectory under HOME (e.g.
     /// "public_html").  `None` disables ~user resolution.
     userdir: Option<String>,
@@ -69,21 +71,41 @@ pub struct StaticConfig {
 }
 
 impl StaticHandler {
-    pub(crate) fn new(cfg: StaticConfig, metrics: Arc<Metrics>) -> Self {
-        Self {
+    pub(crate) fn new(
+        cfg: StaticConfig,
+        metrics: Arc<Metrics>,
+        var_table: &crate::vars::VarTable,
+        needs: &mut crate::vars::VarNeeds,
+    ) -> anyhow::Result<Self> {
+        let names = var_table.names();
+        let mut compile = |s: &str| -> anyhow::Result<Template> {
+            let t = Template::compile(s, names)?;
+            needs.absorb(&t, var_table);
+            Ok(t)
+        };
+        let try_files = cfg
+            .try_files
+            .iter()
+            .map(|s| compile(s))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let fallback_redirect = cfg
+            .fallback_redirect
+            .as_deref()
+            .map(&mut compile)
+            .transpose()?;
+        Ok(Self {
             root: cfg.root.map(PathBuf::from),
             index_files: cfg.index_files,
             strip_prefix: cfg.strip_prefix,
-            try_files: cfg.try_files,
+            try_files,
             directory_listing: cfg.directory_listing,
-            fallback_redirect: cfg.fallback_redirect,
+            fallback_redirect,
             userdir: cfg.userdir,
             userdir_allowlist: cfg.userdir_allowlist,
             userdir_min_uid: cfg.userdir_min_uid,
             metrics,
-        }
+        })
     }
-
 }
 
 #[async_trait]
@@ -92,7 +114,7 @@ impl Handler for StaticHandler {
         &self,
         req: Request<ReqBody>,
         matched_prefix: &str,
-        _ctx: &RequestContext<'_>,
+        ctx: &RequestContext<'_>,
     ) -> HttpResponse {
         let uri_path = req.uri().path();
 
@@ -137,7 +159,10 @@ impl Handler for StaticHandler {
         let relative: &str = if self.try_files.is_empty() {
             relative
         } else {
-            match self.try_files_resolve(effective_root, relative).await {
+            match self
+                .try_files_resolve(effective_root, relative, ctx)
+                .await
+            {
                 Some(r) => {
                     resolved = r;
                     resolved.as_str()
@@ -212,7 +237,7 @@ impl Handler for StaticHandler {
                     // Empty directory, no index, no listing: bounce
                     // to the configured URL.  Used by the default
                     // config to point an empty webroot at /docs/.
-                    return self.emit_fallback_redirect();
+                    return self.emit_fallback_redirect(ctx);
                 }
                 // Directory exists but has no index.  Status stays 403
                 // (not 404), but the body explains how to serve content
@@ -330,15 +355,33 @@ impl StaticHandler {
     /// Build the 302 response emitted when a directory has no
     /// matching index, no listing is enabled, and
     /// `fallback_redirect` is set.  The `Location` header carries
-    /// the configured URL verbatim -- the operator chose the form.
-    fn emit_fallback_redirect(&self) -> HttpResponse {
-        let url = self
-            .fallback_redirect
-            .as_deref()
-            .expect("fallback_redirect set when this method runs");
+    /// the rendered template -- the operator chose the form.
+    fn emit_fallback_redirect(
+        &self,
+        ctx: &RequestContext<'_>,
+    ) -> HttpResponse {
+        let url = match &self.fallback_redirect {
+            Some(t) => t.render(ctx),
+            None => return response_500(),
+        };
+        // A rendered value can carry arbitrary variable content, so
+        // an invalid header value is handled rather than expected
+        // away.
+        let location =
+            match hyper::header::HeaderValue::from_str(&url) {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(
+                        url = %url,
+                        "fallback-redirect rendered an invalid \
+                         Location value"
+                    );
+                    return response_500();
+                }
+            };
         let mut resp = Response::builder()
             .status(StatusCode::FOUND)
-            .header(hyper::header::LOCATION, url)
+            .header(hyper::header::LOCATION, location)
             .header(hyper::header::CONTENT_LENGTH, "0")
             .body(bytes_body(Bytes::new()))
             .expect("static Location header always builds");
@@ -363,9 +406,17 @@ impl StaticHandler {
         &self,
         root: &Path,
         relative: &str,
+        ctx: &RequestContext<'_>,
     ) -> Option<String> {
+        // `{path}` in a try-files entry means the location-relative
+        // path (post strip-prefix / userdir), not the raw URI path,
+        // so render against a view with `path` overridden.
+        let tf_ctx = RequestContext {
+            path: relative,
+            ..*ctx
+        };
         for template in &self.try_files {
-            let candidate = expand_try_files_template(template, relative);
+            let candidate = template.render(&tf_ctx);
             let joined = match safe_join(root, &candidate) {
                 Some(p) => p,
                 None => continue,
@@ -664,20 +715,6 @@ fn render_listing_html(
     out
 }
 
-/// Expand a try-files template against the current request
-/// path.  The only supported substitution is `{path}`; every
-/// other character is copied verbatim.  Operators include
-/// literal fallbacks (`/index.html`) by simply omitting the
-/// template variable.
-fn expand_try_files_template(template: &str, path: &str) -> String {
-    // The common case is "literal fallback" (e.g. /index.html);
-    // skip the allocation when no substitution is needed.
-    if !template.contains("{path}") {
-        return template.to_owned();
-    }
-    template.replace("{path}", path)
-}
-
 // -- Range parsing -------------------------------------------------
 //
 // Parses a single `Range: bytes=start-end` header value.
@@ -902,6 +939,7 @@ mod tests {
             scheme: "http",
             client_cert_subject: "",
             client_cert_sans: "",
+            ..RequestContext::empty()
         }
     }
 
@@ -1122,23 +1160,30 @@ mod tests {
 
     #[test]
     fn try_files_template_expands_path() {
+        // {path} parity with the pre-Template expansion: it renders
+        // as the location-relative path handed to the resolver.
+        let ctx = RequestContext {
+            path: "/foo/bar",
+            ..RequestContext::empty()
+        };
+        assert_eq!(Template::parse("{path}").render(&ctx), "/foo/bar");
         assert_eq!(
-            expand_try_files_template("{path}", "/foo/bar"),
-            "/foo/bar"
-        );
-        assert_eq!(
-            expand_try_files_template("{path}.html", "/foo/bar"),
+            Template::parse("{path}.html").render(&ctx),
             "/foo/bar.html"
         );
     }
 
     #[test]
     fn try_files_template_passes_through_literals() {
+        let ctx = RequestContext {
+            path: "/foo",
+            ..RequestContext::empty()
+        };
         assert_eq!(
-            expand_try_files_template("/index.html", "/foo"),
+            Template::parse("/index.html").render(&ctx),
             "/index.html"
         );
-        assert_eq!(expand_try_files_template("", "/foo"), "");
+        assert_eq!(Template::parse("").render(&ctx), "");
     }
 
     #[tokio::test]
@@ -1151,9 +1196,9 @@ mod tests {
             index_files: vec![],
             strip_prefix: false,
             try_files: vec![
-                "{path}".into(),
-                "{path}.html".into(),
-                "/index.html".into(),
+                Template::parse("{path}"),
+                Template::parse("{path}.html"),
+                Template::parse("/index.html"),
             ],
         
             directory_listing: false,
@@ -1165,7 +1210,12 @@ mod tests {
         };
         // Request for /missing -> first two miss, third (literal
         // /index.html) hits the SPA fallback.
-        let got = handler.try_files_resolve(handler.root.as_deref().unwrap(), "/missing").await;
+        let got = handler.try_files_resolve(
+            handler.root.as_deref().unwrap(),
+            "/missing",
+            &dummy_ctx(),
+        )
+        .await;
         assert_eq!(got.as_deref(), Some("/index.html"));
     }
 
@@ -1179,8 +1229,8 @@ mod tests {
             index_files: vec![],
             strip_prefix: false,
             try_files: vec![
-                "{path}".into(),
-                "/index.html".into(),
+                Template::parse("{path}"),
+                Template::parse("/index.html"),
             ],
         
             directory_listing: false,
@@ -1192,7 +1242,12 @@ mod tests {
         };
         // The first template matches the existing file, so the
         // fallback is never visited.
-        let got = handler.try_files_resolve(handler.root.as_deref().unwrap(), "/real.txt").await;
+        let got = handler.try_files_resolve(
+            handler.root.as_deref().unwrap(),
+            "/real.txt",
+            &dummy_ctx(),
+        )
+        .await;
         assert_eq!(got.as_deref(), Some("/real.txt"));
     }
 
@@ -1207,8 +1262,8 @@ mod tests {
             index_files: vec![],
             strip_prefix: false,
             try_files: vec![
-                "{path}".into(),
-                "/index.html".into(),
+                Template::parse("{path}"),
+                Template::parse("/index.html"),
             ],
         
             directory_listing: false,
@@ -1221,7 +1276,12 @@ mod tests {
         // `/sub` exists as a directory -- try-files must skip
         // it and fall through to /index.html so the SPA route
         // works.
-        let got = handler.try_files_resolve(handler.root.as_deref().unwrap(), "/sub").await;
+        let got = handler.try_files_resolve(
+            handler.root.as_deref().unwrap(),
+            "/sub",
+            &dummy_ctx(),
+        )
+        .await;
         assert_eq!(got.as_deref(), Some("/index.html"));
     }
 
@@ -1238,7 +1298,7 @@ mod tests {
             root: Some(root.clone()),
             index_files: vec![],
             strip_prefix: true,
-            try_files: vec!["{path}".into()],
+            try_files: vec![Template::parse("{path}")],
         
             directory_listing: false,
             fallback_redirect: None,
@@ -1249,7 +1309,12 @@ mod tests {
         };
         // The resolver gets the already-stripped relative,
         // which mirrors the runtime contract from serve().
-        let got = handler.try_files_resolve(handler.root.as_deref().unwrap(), "/foo").await;
+        let got = handler.try_files_resolve(
+            handler.root.as_deref().unwrap(),
+            "/foo",
+            &dummy_ctx(),
+        )
+        .await;
         assert_eq!(got.as_deref(), Some("/foo"));
     }
 
@@ -1274,7 +1339,9 @@ mod tests {
             userdir: None,
             userdir_allowlist: vec![],
             userdir_min_uid: 1000,
-        }, test_metrics())
+        }, test_metrics(), &crate::vars::VarTable::empty(),
+            &mut crate::vars::VarNeeds::default())
+        .unwrap()
     }
 
     fn fallback_handler(root: &Path, target: &str) -> StaticHandler {
@@ -1288,7 +1355,9 @@ mod tests {
             userdir: None,
             userdir_allowlist: vec![],
             userdir_min_uid: 1000,
-        }, test_metrics())
+        }, test_metrics(), &crate::vars::VarTable::empty(),
+            &mut crate::vars::VarNeeds::default())
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1377,7 +1446,9 @@ mod tests {
             userdir: None,
             userdir_allowlist: vec![],
             userdir_min_uid: 1000,
-        }, test_metrics());
+        }, test_metrics(), &crate::vars::VarTable::empty(),
+            &mut crate::vars::VarNeeds::default())
+        .unwrap();
         let req = Request::builder()
             .uri("/")
             .body(empty_req_body())
@@ -1504,7 +1575,9 @@ mod tests {
             userdir: Some("public_html".into()),
             userdir_allowlist: allowlist,
             userdir_min_uid: min_uid,
-        }, test_metrics())
+        }, test_metrics(), &crate::vars::VarTable::empty(),
+            &mut crate::vars::VarNeeds::default())
+        .unwrap()
     }
 
     #[cfg(unix)]
@@ -1565,8 +1638,10 @@ mod tests {
             root: Some(root.clone()),
             index_files: vec![],
             strip_prefix: false,
-            try_files: vec!["{path}".into(), "/missing.html".into()],
-        
+            try_files: vec![
+                Template::parse("{path}"),
+                Template::parse("/missing.html"),
+            ],
             directory_listing: false,
             fallback_redirect: None,
             userdir: None,
@@ -1574,7 +1649,12 @@ mod tests {
             userdir_min_uid: 1000,
             metrics: test_metrics(),
         };
-        let got = handler.try_files_resolve(handler.root.as_deref().unwrap(), "/nope").await;
+        let got = handler.try_files_resolve(
+            handler.root.as_deref().unwrap(),
+            "/nope",
+            &dummy_ctx(),
+        )
+        .await;
         assert!(got.is_none());
     }
 }

@@ -34,6 +34,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct Upstream {
     pub url: String,
     pub weight: u32,
+    /// Selection-group label targeted by `group-by`; `None` = no
+    /// group.
+    pub group: Option<String>,
     in_flight: AtomicU32,
     consecutive_errors: AtomicU32,
     /// Unix-time milliseconds at which a passive ejection lifts.
@@ -45,10 +48,15 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub fn new(url: String, weight: u32) -> Self {
+    pub fn new(
+        url: String,
+        weight: u32,
+        group: Option<String>,
+    ) -> Self {
         Upstream {
             url,
             weight,
+            group,
             in_flight: AtomicU32::new(0),
             consecutive_errors: AtomicU32::new(0),
             ejected_until_ms: AtomicU64::new(0),
@@ -98,6 +106,9 @@ impl Drop for InFlightGuard {
 pub struct PickCtx<'a> {
     pub peer_ip: Option<IpAddr>,
     pub headers: &'a HeaderMap,
+    /// Rendered `group-by` value; `None` or an unknown group means
+    /// no restriction.
+    pub group: Option<&'a str>,
 }
 
 /// Pool of upstreams plus the picker policy.  Shared across requests
@@ -163,11 +174,46 @@ impl UpstreamPool {
         if self.upstreams.is_empty() {
             return None;
         }
+        // Group restriction: when the request names a group that at
+        // least one upstream declares, prefer that subset; when the
+        // group is unknown or none of its members are available, fall
+        // back to the whole pool so a group-by template can never
+        // make selection worse than having no group-by at all.
+        if let Some(g) = ctx.group {
+            let declared = self
+                .upstreams
+                .iter()
+                .any(|u| u.group.as_deref() == Some(g));
+            if declared
+                && let Some(u) = self.pick_where(ctx, Some(g))
+            {
+                return Some(u);
+            }
+        }
+        let picked = self.pick_where(ctx, None);
+        if picked.is_none()
+            && let Some(m) = &self.metrics
+        {
+            m.proxy_lb_no_upstream.fetch_add(1, Ordering::Relaxed);
+        }
+        picked
+    }
+
+    /// One selection pass, optionally restricted to a group.
+    fn pick_where(
+        &self,
+        ctx: &PickCtx<'_>,
+        group: Option<&str>,
+    ) -> Option<Arc<Upstream>> {
         let now_ms = now_unix_ms();
+        let eligible = |u: &Upstream| {
+            u.is_available(now_ms)
+                && group.is_none_or(|g| u.group.as_deref() == Some(g))
+        };
         // LeastConn doesn't use the weighted ring -- it iterates
         // upstreams directly and compares in_flight / weight.
         if self.policy == LbPolicy::LeastConn {
-            return self.pick_least_conn(now_ms);
+            return self.pick_least_conn(&eligible);
         }
         if self.weighted_ring.is_empty() {
             return None;
@@ -198,23 +244,23 @@ impl UpstreamPool {
             let pos = (start.wrapping_add(offset)) % ring.len();
             let idx = ring[pos];
             let u = &self.upstreams[idx];
-            if u.is_available(now_ms) {
+            if eligible(u) {
                 return Some(u.clone());
             }
-        }
-        if let Some(m) = &self.metrics {
-            m.proxy_lb_no_upstream.fetch_add(1, Ordering::Relaxed);
         }
         None
     }
 
-    fn pick_least_conn(&self, now_ms: u64) -> Option<Arc<Upstream>> {
+    fn pick_least_conn(
+        &self,
+        eligible: &dyn Fn(&Upstream) -> bool,
+    ) -> Option<Arc<Upstream>> {
         // Tie-break with the rr_counter so equal-load upstreams get
         // spread across calls instead of always falling on the first.
         let salt = self.rr_counter.fetch_add(1, Ordering::Relaxed);
         let mut best: Option<(u64, usize)> = None;
         for (i, u) in self.upstreams.iter().enumerate() {
-            if !u.is_available(now_ms) {
+            if !eligible(u) {
                 continue;
             }
             // Cost = in_flight / weight, scaled to integer for
@@ -232,16 +278,7 @@ impl UpstreamPool {
                 }
             });
         }
-        match best {
-            Some((_, i)) => Some(self.upstreams[i].clone()),
-            None => {
-                if let Some(m) = &self.metrics {
-                    m.proxy_lb_no_upstream
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                None
-            }
-        }
+        best.map(|(_, i)| self.upstreams[i].clone())
     }
 
     /// Record a successful request — clears the consecutive-error
@@ -366,7 +403,13 @@ pub fn build_upstreams(
     cfgs: &[UpstreamConfig],
 ) -> Vec<Arc<Upstream>> {
     cfgs.iter()
-        .map(|c| Arc::new(Upstream::new(c.url.clone(), c.weight)))
+        .map(|c| {
+            Arc::new(Upstream::new(
+                c.url.clone(),
+                c.weight,
+                c.group.clone(),
+            ))
+        })
         .collect()
 }
 
@@ -428,7 +471,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, w)| {
-                Arc::new(Upstream::new(format!("http://h{i}/"), *w))
+                Arc::new(Upstream::new(format!("http://h{i}/"), *w, None))
             })
             .collect();
         Arc::new(UpstreamPool::new(
@@ -452,8 +495,117 @@ mod tests {
             PickCtx {
                 peer_ip: None,
                 headers: leaked,
+                group: None,
             },
         )
+    }
+
+    fn make_grouped_pool(
+        specs: &[(u32, Option<&str>)],
+        policy: LbPolicy,
+    ) -> Arc<UpstreamPool> {
+        let upstreams: Vec<Arc<Upstream>> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, (w, g))| {
+                Arc::new(Upstream::new(
+                    format!("http://h{i}/"),
+                    *w,
+                    g.map(String::from),
+                ))
+            })
+            .collect();
+        Arc::new(UpstreamPool::new(
+            upstreams,
+            policy,
+            None,
+            PassiveHealthConfig {
+                eject_after: 2,
+                eject_for_secs: 60,
+            },
+            None,
+        ))
+    }
+
+    fn ctx_with_group(group: Option<&'static str>) -> PickCtx<'static> {
+        let leaked: &'static HeaderMap = Box::leak(Box::new(
+            HeaderMap::new(),
+        ));
+        PickCtx {
+            peer_ip: None,
+            headers: leaked,
+            group,
+        }
+    }
+
+    #[test]
+    fn group_restricts_selection_to_members() {
+        let pool = make_grouped_pool(
+            &[(1, Some("main")), (1, Some("main")), (1, Some("beta"))],
+            LbPolicy::RoundRobin,
+        );
+        let ctx = ctx_with_group(Some("beta"));
+        for _ in 0..8 {
+            let p = pool.pick(&ctx).unwrap();
+            assert_eq!(p.url, "http://h2/");
+        }
+    }
+
+    #[test]
+    fn unknown_group_falls_back_to_whole_pool() {
+        let pool = make_grouped_pool(
+            &[(1, Some("main")), (1, Some("beta"))],
+            LbPolicy::RoundRobin,
+        );
+        let ctx = ctx_with_group(Some("nope"));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(pool.pick(&ctx).unwrap().url.clone());
+        }
+        assert_eq!(seen.len(), 2, "both upstreams picked: {seen:?}");
+    }
+
+    #[test]
+    fn ungrouped_upstream_not_picked_under_restriction() {
+        let pool = make_grouped_pool(
+            &[(1, None), (1, Some("beta"))],
+            LbPolicy::RoundRobin,
+        );
+        let ctx = ctx_with_group(Some("beta"));
+        for _ in 0..8 {
+            assert_eq!(pool.pick(&ctx).unwrap().url, "http://h1/");
+        }
+    }
+
+    #[test]
+    fn exhausted_group_falls_back_to_whole_pool() {
+        let pool = make_grouped_pool(
+            &[(1, Some("main")), (1, Some("beta"))],
+            LbPolicy::RoundRobin,
+        );
+        // Eject the sole beta member via passive failures.
+        let beta = pool.upstreams()[1].clone();
+        pool.record_failure(&beta);
+        pool.record_failure(&beta);
+        let ctx = ctx_with_group(Some("beta"));
+        for _ in 0..4 {
+            assert_eq!(pool.pick(&ctx).unwrap().url, "http://h0/");
+        }
+    }
+
+    #[test]
+    fn group_restriction_applies_to_least_conn() {
+        let pool = make_grouped_pool(
+            &[(1, Some("main")), (1, Some("beta"))],
+            LbPolicy::LeastConn,
+        );
+        // Load up the beta member; restriction must still pick it.
+        let _g1 = pool.upstreams()[1].in_flight_guard();
+        let _g2 = pool.upstreams()[1].in_flight_guard();
+        let ctx = ctx_with_group(Some("beta"));
+        for _ in 0..4 {
+            assert_eq!(pool.pick(&ctx).unwrap().url, "http://h1/");
+        }
     }
 
     #[test]
@@ -495,6 +647,7 @@ mod tests {
         let ctx = PickCtx {
             peer_ip: ip,
             headers: &headers,
+            group: None,
         };
         let first = pool.pick(&ctx).unwrap().url.clone();
         for _ in 0..20 {
@@ -512,6 +665,7 @@ mod tests {
             let ctx = PickCtx {
                 peer_ip: ip,
                 headers: &headers,
+                group: None,
             };
             seen.insert(pool.pick(&ctx).unwrap().url.clone());
         }
@@ -527,10 +681,12 @@ mod tests {
             UpstreamConfig {
                 url: "http://h0/".into(),
                 weight: 1,
+                group: None,
             },
             UpstreamConfig {
                 url: "http://h1/".into(),
                 weight: 1,
+                group: None,
             },
         ]);
         let pool = Arc::new(UpstreamPool::new(
@@ -546,6 +702,7 @@ mod tests {
         let ctx = PickCtx {
             peer_ip: None,
             headers: &headers,
+            group: None,
         };
         let a = pool.pick(&ctx).unwrap().url.clone();
         let b = pool.pick(&ctx).unwrap().url.clone();
@@ -558,10 +715,12 @@ mod tests {
             UpstreamConfig {
                 url: "http://h0/".into(),
                 weight: 1,
+                group: None,
             },
             UpstreamConfig {
                 url: "http://h1/".into(),
                 weight: 1,
+                group: None,
             },
         ]);
         let pool = Arc::new(UpstreamPool::new(
@@ -579,6 +738,7 @@ mod tests {
         let ctx = PickCtx {
             peer_ip: None,
             headers: &headers,
+            group: None,
         };
         let first = pool.pick(&ctx).unwrap().url.clone();
         for _ in 0..10 {

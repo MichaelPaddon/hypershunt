@@ -12,6 +12,7 @@
   - [HTTP/3](guide.md#http3)
   - [Reverse proxy](guide.md#reverse-proxy)
   - [Load balancing](guide.md#load-balancing)
+  - [Variables](guide.md#variables)
   - [Auth, JWT, OIDC](guide.md#oidc-single-sign-on)
   - [Access policies](guide.md#access-policies)
   - [Rate limiting](guide.md#rate-limiting)
@@ -22,6 +23,7 @@
 - Reference
 
   - [Reference overview](reference.md)
+  - [Variables](reference.md#variables)
   - [server](reference.md#server)
   - [certificate](reference.md#certificate)
   - [listener](reference.md#listener)

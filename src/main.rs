@@ -38,6 +38,7 @@ mod security;
 mod task;
 #[cfg(test)]
 mod test;
+mod vars;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;

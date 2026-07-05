@@ -112,6 +112,9 @@ pub(crate) struct ProxyHandler {
     inners: Vec<InnerProxyClient>,
     /// Picker + per-upstream health state.
     pool: Arc<crate::lb::UpstreamPool>,
+    /// Rendered per request to restrict picking to upstreams whose
+    /// `group=` label matches; `None` disables group selection.
+    group_by: Option<crate::headers::Template>,
     /// Retry config; `max == 0` disables retries.
     retry: crate::config::RetryConfig,
     /// Status codes that trigger a retry attempt.  Empty means "any
@@ -151,6 +154,7 @@ impl ProxyHandler {
         let upstreams = vec![Arc::new(crate::lb::Upstream::new(
             upstream_str.to_string(),
             1,
+            None,
         ))];
         let pool = Arc::new(crate::lb::UpstreamPool::new(
             upstreams,
@@ -162,6 +166,7 @@ impl ProxyHandler {
         Ok(ProxyHandler {
             inners: vec![inner],
             pool,
+            group_by: None,
             retry: crate::config::RetryConfig::default(),
             retry_on_status: std::collections::HashSet::new(),
             metrics: None,
@@ -178,6 +183,7 @@ impl ProxyHandler {
         upstreams_cfg: &[crate::config::UpstreamConfig],
         lb_policy: crate::config::LbPolicy,
         lb_hash_header: Option<String>,
+        group_by: Option<crate::headers::Template>,
         passive: crate::config::PassiveHealthConfig,
         retry: crate::config::RetryConfig,
         strip_prefix: bool,
@@ -218,6 +224,7 @@ impl ProxyHandler {
         let mut handler = ProxyHandler {
             inners,
             pool,
+            group_by,
             retry,
             retry_on_status,
             metrics: Some(metrics.clone()),
@@ -268,12 +275,17 @@ impl Handler for ProxyHandler {
         &self,
         mut req: Request<ReqBody>,
         matched_prefix: &str,
-        _ctx: &RequestContext<'_>,
+        ctx: &RequestContext<'_>,
     ) -> HttpResponse {
         let peer_ip = req
             .extensions()
             .get::<SocketAddr>()
             .map(|a| a.ip());
+        // Render the group-by template once per request; an empty
+        // result means no restriction.
+        let group_val =
+            self.group_by.as_ref().map(|t| t.render(ctx));
+        let group = group_val.as_deref().filter(|s| !s.is_empty());
 
         // Upgrade requests (h1 `Upgrade:`, h2/h3 extended CONNECT)
         // bypass retry + body buffering: once a tunnel is open, an
@@ -285,6 +297,7 @@ impl Handler for ProxyHandler {
             let ctx = crate::lb::PickCtx {
                 peer_ip,
                 headers: req.headers(),
+                group,
             };
             let Some(upstream) = self.pool.pick(&ctx) else {
                 return response_502();
@@ -305,6 +318,7 @@ impl Handler for ProxyHandler {
             let ctx = crate::lb::PickCtx {
                 peer_ip,
                 headers: req.headers(),
+                group,
             };
             let Some(upstream) = self.pool.pick(&ctx) else {
                 return response_502();
@@ -339,6 +353,7 @@ impl Handler for ProxyHandler {
             let ctx = crate::lb::PickCtx {
                 peer_ip,
                 headers: &parts.headers,
+                group,
             };
             let Some(upstream) = self.pool.pick(&ctx) else {
                 break;
@@ -719,6 +734,7 @@ mod tests {
             scheme: "http",
             client_cert_subject: "",
             client_cert_sans: "",
+            ..RequestContext::empty()
         }
     }
 
@@ -1192,13 +1208,16 @@ mod tests {
                 crate::config::UpstreamConfig {
                     url: format!("http://{bad}"),
                     weight: 1,
+                    group: None,
                 },
                 crate::config::UpstreamConfig {
                     url: format!("http://{good}"),
                     weight: 1,
+                    group: None,
                 },
             ],
             crate::config::LbPolicy::RoundRobin,
+            None,
             None,
             crate::config::PassiveHealthConfig::default(),
             crate::config::RetryConfig {
@@ -1243,8 +1262,10 @@ mod tests {
             &[crate::config::UpstreamConfig {
                 url: format!("http://{bad}"),
                 weight: 1,
+                group: None,
             }],
             crate::config::LbPolicy::RoundRobin,
+            None,
             None,
             crate::config::PassiveHealthConfig::default(),
             crate::config::RetryConfig {
@@ -1290,8 +1311,10 @@ mod tests {
             &[crate::config::UpstreamConfig {
                 url: format!("http://{backend}"),
                 weight: 1,
+                group: None,
             }],
             crate::config::LbPolicy::RoundRobin,
+            None,
             None,
             crate::config::PassiveHealthConfig::default(),
             crate::config::RetryConfig {
@@ -1413,13 +1436,16 @@ mod tests {
                 crate::config::UpstreamConfig {
                     url: format!("http://{bad}"),
                     weight: 1,
+                    group: None,
                 },
                 crate::config::UpstreamConfig {
                     url: format!("http://{good}"),
                     weight: 1,
+                    group: None,
                 },
             ],
             crate::config::LbPolicy::RoundRobin,
+            None,
             None,
             crate::config::PassiveHealthConfig::default(),
             crate::config::RetryConfig {
@@ -1472,13 +1498,16 @@ mod tests {
                 crate::config::UpstreamConfig {
                     url: format!("http://{a}"),
                     weight: 1,
+                    group: None,
                 },
                 crate::config::UpstreamConfig {
                     url: format!("http://{b}"),
                     weight: 1,
+                    group: None,
                 },
             ],
             crate::config::LbPolicy::RoundRobin,
+            None,
             None,
             crate::config::PassiveHealthConfig {
                 eject_after: 1,
@@ -1540,13 +1569,16 @@ mod tests {
                 crate::config::UpstreamConfig {
                     url: format!("http://{dead_addr}"),
                     weight: 1,
+                    group: None,
                 },
                 crate::config::UpstreamConfig {
                     url: format!("http://{good}"),
                     weight: 1,
+                    group: None,
                 },
             ],
             crate::config::LbPolicy::RoundRobin,
+            None,
             None,
             crate::config::PassiveHealthConfig::default(),
             crate::config::RetryConfig {

@@ -1383,3 +1383,142 @@
             Some("/".into())
         );
     }
+
+    // -- variable needs aggregation ---------------------------------
+
+    fn route_vars(
+        router: &Router,
+        host: &str,
+        path: &str,
+        bind: &str,
+    ) -> Option<Arc<crate::vars::RouteVars>> {
+        let vhost = router.resolve_vhost(Some(host), bind)?;
+        vhost
+            .locations
+            .iter()
+            .filter(|loc| path.starts_with(loc.path.as_str()))
+            .max_by_key(|loc| loc.path.len())
+            .and_then(|loc| loc.vars.clone())
+    }
+
+    #[test]
+    fn static_location_carries_no_var_machinery() {
+        let config = make_config(
+            r#"
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/" { static root="." }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        assert!(
+            route_vars(&router, "a.com", "/", "tcp://0.0.0.0:80")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn variable_needing_principal_propagates_to_route() {
+        let config = make_config(
+            r#"
+            server {
+                variable "who" {
+                    match "{username}" {
+                        ".+" "user"
+                        _    "anon"
+                    }
+                }
+            }
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/" {
+                    redirect to="/hello/{who}" code=302
+                }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        let vars = route_vars(&router, "a.com", "/", "tcp://0.0.0.0:80")
+            .expect("route must carry var machinery");
+        assert!(vars.needs.principal);
+        assert!(vars.needs.uses_vars);
+        assert!(!vars.needs.geoip);
+    }
+
+    #[test]
+    fn header_variable_reference_propagates_snapshot_need() {
+        let config = make_config(
+            r#"
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/" {
+                    static root="."
+                    request-headers {
+                        set "X-Lane" "{header:x-lane|stable}"
+                    }
+                }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        let vars = route_vars(&router, "a.com", "/", "tcp://0.0.0.0:80")
+            .expect("route must carry var machinery");
+        assert_eq!(vars.needs.headers, vec!["x-lane"]);
+        // A direct {header:...} reference alone does not require the
+        // variable table.
+        assert!(!vars.needs.uses_vars);
+    }
+
+    #[test]
+    fn policy_redirect_template_absorbs_variable_needs() {
+        let config = make_config(
+            r#"
+            server {
+                variable "login" "https://sso.{host}/login"
+            }
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/" {
+                    static root="."
+                    policy {
+                        redirect to="{login}" code=302 \
+                            not address "10.0.0.0/8"
+                        allow
+                    }
+                }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        let vars = route_vars(&router, "a.com", "/", "tcp://0.0.0.0:80")
+            .expect("route must carry var machinery");
+        assert!(vars.needs.uses_vars);
+    }
+
+    #[test]
+    fn invalid_header_token_degrades_to_verbatim() {
+        // Backwards compatibility: a malformed {header:...} token in
+        // a pre-existing config must not stop the server from
+        // building -- it warns and renders verbatim instead.
+        let config = make_config(
+            r#"
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/" {
+                    static root="."
+                    request-headers {
+                        set "X-Bad" "{header:not a name}"
+                    }
+                }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        // The route builds and carries no header-snapshot need,
+        // since the malformed token resolved to a literal.
+        assert!(
+            route_vars(&router, "a.com", "/", "tcp://0.0.0.0:80")
+                .is_none()
+        );
+    }
