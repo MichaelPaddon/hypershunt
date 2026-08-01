@@ -18,7 +18,9 @@ jobs:
 
     - name: Install system dependencies
       # pandoc: build.rs regenerates docs/manual.md from docs/hypershunt.1.
-      run: sudo apt-get install -y libpam0g-dev pandoc
+      # apt-get update first: the runner image's baked-in package index
+      # goes stale and 404s on superseded package versions.
+      run: sudo apt-get update && sudo apt-get install -y libpam0g-dev pandoc
 
     # Cache the compiled dependency graph (heavy: aws-lc-rs/cmake, quinn,
     # rustls, …).  On a warm cache the deps are restored instead of
@@ -51,7 +53,7 @@ jobs:
     - uses: actions/checkout@v6
 
     - name: Install system dependencies
-      run: sudo apt-get install -y libpam0g-dev podman
+      run: sudo apt-get update && sudo apt-get install -y libpam0g-dev podman
 
     # Distinct key from the build job: smoke.sh compiles in the release
     # profile (lto=thin, opt-level=3), so its dep artifacts differ and
