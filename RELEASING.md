@@ -48,6 +48,20 @@ The last command is the same gate CI enforces in
 `.github/workflows/build.yml`: a non-empty diff means the man page or its
 Markdown mirror is stale and was not rebuilt + committed.
 
+Then check for known-vulnerable dependencies, so a release is never cut
+with an open advisory that a `cargo update` would fix:
+
+```sh
+cargo audit                         # needs cargo-audit (cargo install cargo-audit)
+gh api repos/{owner}/{repo}/dependabot/alerts --jq '.[] | select(.state == "open")'
+```
+
+If either reports an open advisory against a locked dependency, bump it
+(`cargo update -p <crate>`), re-run the checks above, and commit the
+lockfile change before tagging.  This is checklist, not CI: a tag pushed
+with a vulnerable lockfile ships that version in the packages and
+container images.
+
 ## Cut the release
 
 1. Edit `Cargo.toml` — set the new `version`.
