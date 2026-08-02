@@ -49,9 +49,10 @@ pub enum PolicyRuleDef {
     Apply { name: String },
 }
 
-/// One server-level `variable` definition, unresolved.  Compiled and
-/// validated into a `vars::VarTable` at router build (and during
-/// validate() so `--check-config` catches errors).
+/// One `variable` definition (server, vhost, or location scope),
+/// unresolved.  Compiled and validated into a `vars::VarTable` at
+/// router build (and during validate() so `--check-config` catches
+/// errors).  Inner scopes shadow outer ones per name.
 #[derive(Debug, Clone)]
 pub struct VariableDef {
     pub name: String,
@@ -601,6 +602,9 @@ pub struct VHostConfig {
     // the listener's default ALPN.  Has no effect on QUIC listeners
     // (quinn 0.11 doesn't expose ClientHello before handshake).
     pub alpn: Option<Vec<String>>,
+    // Vhost-scoped `variable` definitions; shadow server-level names
+    // for every location under this vhost.
+    pub variables: Vec<VariableDef>,
     // 1-based source line of this vhost's node, for error messages.
     pub line: usize,
 }
@@ -671,6 +675,9 @@ pub struct LocationConfig {
     // the location opts that location into caching; `None` keeps the
     // historical behaviour (no caching).
     pub cache: Option<CacheConfig>,
+    // Location-scoped `variable` definitions; shadow vhost- and
+    // server-level names for routes through this location.
+    pub variables: Vec<VariableDef>,
     // 1-based source line of this location's node, for error messages.
     pub line: usize,
 }
@@ -1074,15 +1081,45 @@ impl Config {
         // --check-config catches bad names, patterns, captures, and
         // cycles.  The router rebuilds the table at startup; this
         // build is throwaway.
+        let prefix = |e: anyhow::Error| {
+            if name.is_empty() { e } else { anyhow!("{name}: {e}") }
+        };
         let var_table = crate::vars::VarTable::build(&self.server.variables)
-            .map_err(|e| {
-                if name.is_empty() {
-                    e
-                } else {
-                    anyhow!("{name}: {e}")
+            .map_err(prefix)?;
+        // Every scope chain that defines variables gets its own
+        // effective table; build each so scope-specific errors
+        // (duplicates, cycles through an override) surface here.
+        let mut any_geoip = var_table.any_needs_geoip();
+        for v in &self.vhosts {
+            let vhost_layers: &[&[VariableDef]] =
+                &[&self.server.variables, &v.variables];
+            if !v.variables.is_empty() {
+                let t = crate::vars::VarTable::build_layered(vhost_layers)
+                    .map_err(|e| {
+                        prefix(anyhow!("vhost '{}': {e}", v.name.value))
+                    })?;
+                any_geoip = any_geoip || t.any_needs_geoip();
+            }
+            for loc in &v.locations {
+                if loc.variables.is_empty() {
+                    continue;
                 }
-            })?;
-        if var_table.any_needs_geoip() && self.server.geoip.is_none() {
+                let t = crate::vars::VarTable::build_layered(&[
+                    &self.server.variables,
+                    &v.variables,
+                    &loc.variables,
+                ])
+                .map_err(|e| {
+                    prefix(anyhow!(
+                        "vhost '{}' location '{}': {e}",
+                        v.name.value,
+                        loc.path
+                    ))
+                })?;
+                any_geoip = any_geoip || t.any_needs_geoip();
+            }
+        }
+        if any_geoip && self.server.geoip.is_none() {
             tracing::warn!(
                 "variables reference {{country}} but no geoip database \
                  is configured; it will always render empty"

@@ -1071,6 +1071,32 @@ Things worth knowing:
   that use it authenticate requests; `{country}` likewise turns on
   the GeoIP lookup.
 
+### Per-site overrides
+
+`variable` also nests inside `vhost` and `location`.  An inner
+definition shadows the outer one for requests routed there, so a
+site's values live with the site instead of accumulating host
+conditions in `server`.  Shadowing is late-bound: outer variables
+derived from an overridden name re-render through the override.
+
+```kdl
+server {
+    variable "tier" "prod"
+    variable "portal" "https://portal.{tier}.example.com"
+}
+
+vhost "staging.example.com" {
+    variable "tier" "staging"
+    location "/portal/" {
+        // -> https://portal.staging.example.com
+        redirect to="{portal}" code=302
+    }
+}
+```
+
+Redefining a name twice in the same scope is an error; across
+scopes it is shadowing, and the innermost definition wins.
+
 **See also:** [Reference — variable](reference.md#variable).
 
 ## URL redirects

@@ -1496,6 +1496,94 @@
         assert!(vars.needs.uses_vars);
     }
 
+    // -- scoped variables (vhost / location layers) ------------------
+
+    #[test]
+    fn scoped_tables_reused_when_no_local_definitions() {
+        // Locations that define no variables must share their vhost's
+        // table Arc (and, transitively, the server's) rather than
+        // paying for a rebuilt copy.
+        let config = make_config(
+            r#"
+            server {
+                variable "who" "world"
+            }
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/x/" {
+                    respond status=200 body="{who}"
+                }
+                location "/y/" {
+                    respond status=200 body="{who}"
+                }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        let x = route_vars(&router, "a.com", "/x/", "tcp://0.0.0.0:80")
+            .expect("x carries vars");
+        let y = route_vars(&router, "a.com", "/y/", "tcp://0.0.0.0:80")
+            .expect("y carries vars");
+        assert!(Arc::ptr_eq(&x.table, &y.table));
+    }
+
+    #[test]
+    fn location_variables_get_their_own_table() {
+        let config = make_config(
+            r#"
+            server {
+                variable "who" "world"
+            }
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/x/" {
+                    respond status=200 body="{who}"
+                }
+                location "/y/" {
+                    variable "who" "yonder"
+                    respond status=200 body="{who}"
+                }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        let x = route_vars(&router, "a.com", "/x/", "tcp://0.0.0.0:80")
+            .expect("x carries vars");
+        let y = route_vars(&router, "a.com", "/y/", "tcp://0.0.0.0:80")
+            .expect("y carries vars");
+        assert!(!Arc::ptr_eq(&x.table, &y.table));
+    }
+
+    #[test]
+    fn location_override_drops_inherited_geoip_need() {
+        // The server-level definition needs geoip; the location
+        // override is a constant, so this route must not force a
+        // per-request geoip lookup.
+        let config = make_config(
+            r#"
+            server {
+                variable "region" {
+                    match "{country}" {
+                        "AU" "apac"
+                        _    "global"
+                    }
+                }
+            }
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/" {
+                    variable "region" "pinned"
+                    respond status=200 body="{region}"
+                }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        let vars = route_vars(&router, "a.com", "/", "tcp://0.0.0.0:80")
+            .expect("route carries vars");
+        assert!(!vars.needs.geoip);
+    }
+
     #[test]
     fn invalid_header_token_degrades_to_verbatim() {
         // Backwards compatibility: a malformed {header:...} token in

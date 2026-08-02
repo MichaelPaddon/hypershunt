@@ -3020,3 +3020,104 @@ fn variable_bad_regex_rejected_at_validate() {
     .to_string();
     assert!(err.contains("invalid pattern"), "{err}");
 }
+
+// -- scoped variable definitions ------------------------------------
+
+#[test]
+fn vhost_and_location_variables_parse() {
+    let cfg = Config::parse(
+        r#"
+        server { variable "a" "1" }
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" {
+            variable "a" "2"
+            location "/" {
+                variable "a" "3"
+                static root="."
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(cfg.vhosts[0].variables.len(), 1);
+    assert_eq!(cfg.vhosts[0].locations[0].variables.len(), 1);
+}
+
+#[test]
+fn duplicate_variable_in_vhost_names_the_vhost() {
+    let err = Config::parse(
+        r#"
+        server { }
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" {
+            variable "a" "1"
+            variable "a" "2"
+            location "/" { static root="." }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("vhost 'h'"), "{err}");
+    assert!(err.contains("duplicate variable 'a'"), "{err}");
+}
+
+#[test]
+fn cross_scope_cycle_names_the_location() {
+    let err = Config::parse(
+        r#"
+        server {
+            variable "a" "{b}"
+            variable "b" "x"
+        }
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" {
+            location "/" {
+                variable "b" "{a}"
+                static root="."
+            }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("location '/'"), "{err}");
+    assert!(err.contains("cycle"), "{err}");
+}
+
+#[test]
+fn shadowing_across_scopes_validates() {
+    assert!(
+        Config::parse(
+            r#"
+            server { variable "a" "1" }
+            listener "tcp://0.0.0.0:8080"
+            vhost "h" {
+                variable "a" "2"
+                location "/" {
+                    variable "a" "3"
+                    static root="."
+                }
+            }
+            "#,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn vhost_unknown_node_suggests_variable() {
+    let err = Config::parse(
+        r#"
+        server { }
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" {
+            variabel "a" "1"
+            location "/" { static root="." }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("did you mean 'variable'"), "{err}");
+}

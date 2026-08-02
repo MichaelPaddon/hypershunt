@@ -740,11 +740,13 @@ pub(super) fn parse_vhost(
     let children = node.children().map(|d| d.nodes()).unwrap_or_default();
     let mut aliases = Vec::new();
     let mut locations = Vec::new();
+    let mut variables = Vec::new();
     for child in children {
         let child_line = node_line(src, child);
         match child.name().value() {
             "alias" => aliases.push(parse_vhost_name(child)?),
             "location" => locations.push(parse_location(child, src, name)?),
+            "variable" => variables.push(parse_variable(child, src, name)?),
             "alpn" => {
                 // Single-arg repeating child (rule 4); collected
                 // below via repeated_strs.  An `alpn` child with no
@@ -762,7 +764,7 @@ pub(super) fn parse_vhost(
                 "{name}:{child_line}: unknown node '{other}' \
                  in vhost '{}'{}",
                 vhost_name.value,
-                did_you_mean(other, &["alias", "location", "alpn"])
+                did_you_mean(other, &["alias", "location", "alpn", "variable"])
             ),
         }
     }
@@ -782,6 +784,7 @@ pub(super) fn parse_vhost(
         ref_name,
         explicit_only,
         alpn,
+        variables,
         line: node_line(src, node),
     })
 }
@@ -876,6 +879,10 @@ fn parse_location(
         .find(|n| n.name().value() == "cache")
         .map(|n| parse_cache(n, src, name))
         .transpose()?;
+    let mut variables = Vec::new();
+    for n in children.iter().filter(|n| n.name().value() == "variable") {
+        variables.push(parse_variable(n, src, name)?);
+    }
     Ok(LocationConfig {
         path,
         handler,
@@ -888,6 +895,7 @@ fn parse_location(
         matcher,
         rewrite,
         cache,
+        variables,
         line,
     })
 }
