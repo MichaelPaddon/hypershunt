@@ -139,6 +139,21 @@ pub(super) fn render_json(
         .iter()
         .map(|(name, c)| labelled("vhost", name, c))
         .collect();
+    let by_listener_json: Vec<_> = s
+        .by_listener
+        .iter()
+        .map(|(bind, l)| {
+            serde_json::json!({
+                "listener":       bind,
+                "requests":       l.requests_total,
+                "conns_total":    l.conns_total,
+                "conns_active":   l.conns_active,
+                "tls_handshakes": l.tls_handshakes,
+                "tls_failures":   l.tls_handshake_failures,
+                "tls_timeouts":   l.tls_handshake_timeouts,
+            })
+        })
+        .collect();
     let upstreams_json: Vec<_> = upstreams
         .iter()
         .map(|u| {
@@ -149,6 +164,11 @@ pub(super) fn render_json(
                 "in_flight": u.in_flight,
                 "healthy":   u.healthy,
                 "ejected":   u.ejected,
+                "group":     u.group,
+                "consecutive_errors": u.consecutive_errors,
+                "ejected_remaining_ms": u.ejected_remaining_ms,
+                "requests":  u.requests,
+                "errors":    u.errors,
             })
         })
         .collect();
@@ -212,17 +232,23 @@ pub(super) fn render_json(
         "health_recoveries": s.lb.health_recoveries,
         "health_checks":     s.lb.health_checks,
     });
+    let up_lat6 = crate::metrics::legacy6(&s.upstream.latency);
     let proxy_upstream_json = serde_json::json!({
         "bytes_in":       s.upstream.bytes_in,
         "bytes_out":      s.upstream.bytes_out,
         "connect_errors": s.upstream.connect_errors,
         "latency_ms": {
-            "lt_1":    s.upstream.latency[0],
-            "lt_10":   s.upstream.latency[1],
-            "lt_50":   s.upstream.latency[2],
-            "lt_200":  s.upstream.latency[3],
-            "lt_1000": s.upstream.latency[4],
-            "ge_1000": s.upstream.latency[5],
+            "lt_1":    up_lat6[0],
+            "lt_10":   up_lat6[1],
+            "lt_50":   up_lat6[2],
+            "lt_200":  up_lat6[3],
+            "lt_1000": up_lat6[4],
+            "ge_1000": up_lat6[5],
+        },
+        "latency_hist": {
+            "bounds_us": crate::metrics::LATENCY_BOUNDS_US,
+            "buckets":   s.upstream.latency,
+            "sum_us":    s.upstream.latency_sum_us,
         },
     });
     let rate_limit_json = serde_json::json!({
@@ -283,6 +309,9 @@ pub(super) fn render_json(
         },
     });
 
+    // Legacy 6-bucket latency shape; the fine 13-bucket histogram is
+    // published alongside under "latency_hist".
+    let lat6 = crate::metrics::legacy6(&s.latency);
     let body = serde_json::json!({
         "version":              sum.version,
         "pid":                  std::process::id(),
@@ -303,13 +332,19 @@ pub(super) fn render_json(
             "avg_15min":       s.rate_15min,
         },
         "latency_ms": {
-            "lt_1":    s.latency[0],
-            "lt_10":   s.latency[1],
-            "lt_50":   s.latency[2],
-            "lt_200":  s.latency[3],
-            "lt_1000": s.latency[4],
-            "ge_1000": s.latency[5],
+            "lt_1":    lat6[0],
+            "lt_10":   lat6[1],
+            "lt_50":   lat6[2],
+            "lt_200":  lat6[3],
+            "lt_1000": lat6[4],
+            "ge_1000": lat6[5],
         },
+        "latency_hist": {
+            "bounds_us": crate::metrics::LATENCY_BOUNDS_US,
+            "buckets":   s.latency,
+            "sum_us":    s.latency_sum_us,
+        },
+        "by_listener": by_listener_json,
         "memory_kb":            s.memory_kb,
         "cpu_percent":          s.cpu_percent,
         "auth_failures_total":   s.auth_failures_total,

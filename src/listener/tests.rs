@@ -867,6 +867,126 @@ index-file "index.html";
         assert!(std::str::from_utf8(&body).unwrap_or("").contains("ok"),);
     }
 
+    /// Built-in endpoints are attributed to the synthetic "_builtin"
+    /// vhost and their own handler kind, so global totals reconcile
+    /// with the by-handler/by-vhost breakdowns.
+    #[tokio::test]
+    async fn builtin_endpoints_reconcile_with_breakdowns() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "example.com" {
+                location "/status" { status }
+                location "/" { respond status=200 body="ok" }
+            }
+            "#,
+        )
+        .await;
+
+        let (status, _, _) = srv.get("example.com", "/healthz").await;
+        assert_eq!(status, 200);
+        let (_, _, body) =
+            srv.get("example.com", "/status?format=json").await;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).expect("status JSON");
+        let total = v["requests_total"].as_u64().unwrap();
+        let by_handler = v["by_handler"].as_array().unwrap();
+        let sum: u64 = by_handler
+            .iter()
+            .map(|h| h["total"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total, sum, "totals must reconcile: {v}");
+        let health = by_handler
+            .iter()
+            .find(|h| h["handler"] == "health")
+            .expect("health row present");
+        assert_eq!(health["total"].as_u64().unwrap(), 1);
+        assert!(
+            v["by_vhost"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["vhost"] == "_builtin"),
+            "_builtin vhost row present: {v}"
+        );
+    }
+
+    /// The metrics handler serves Prometheus text exposition.
+    #[tokio::test]
+    async fn metrics_endpoint_serves_prometheus_text() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "example.com" {
+                location "/metrics" { metrics }
+                location "/" { respond status=200 body="ok" }
+            }
+            "#,
+        )
+        .await;
+
+        let (status, _, _) = srv.get("example.com", "/").await;
+        assert_eq!(status, 200);
+        let (status, headers, body) =
+            srv.get("example.com", "/metrics").await;
+        assert_eq!(status, 200);
+        let ct = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("text/plain"), "ct: {ct}");
+        assert!(ct.contains("version=0.0.4"), "ct: {ct}");
+        let text = std::str::from_utf8(&body).expect("utf8");
+        assert!(
+            text.contains("hypershunt_requests_total 1"),
+            "{text}"
+        );
+        assert!(text.contains(
+            "hypershunt_vhost_requests_total\
+{vhost=\"example.com\",code=\"2xx\"} 1"
+        ));
+        assert!(
+            text.contains("hypershunt_listener_requests_total"),
+        );
+        assert!(text.contains(
+            "hypershunt_request_duration_seconds_bucket"
+        ));
+    }
+
+    /// Non-GET/HEAD on the metrics endpoint returns 405.
+    #[tokio::test]
+    async fn metrics_endpoint_rejects_post() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "example.com" {
+                location "/metrics" { metrics }
+            }
+            "#,
+        )
+        .await;
+        let stream =
+            tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri("/metrics")
+            .header("host", "example.com")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 405);
+        assert_eq!(
+            resp.headers()
+                .get("allow")
+                .and_then(|v| v.to_str().ok()),
+            Some("GET, HEAD")
+        );
+    }
+
     /// When health is disabled, /healthz falls through to the router.
     #[tokio::test]
     async fn health_endpoint_disabled_falls_through_to_router() {

@@ -43,7 +43,7 @@ Configuration is written in KDL. The top-level nodes are:
 > Maps one or more hostnames to URL routing rules. Names are matched against the **Host** request header; a leading **~** treats the name as a regular expression.
 >
 > **location**  
-> Maps a URL path prefix to a handler: **static**, **proxy**, **redirect**, **respond**, **fastcgi**, **scgi**, **cgi**, **status**, or **auth-request**.
+> Maps a URL path prefix to a handler: **static**, **proxy**, **redirect**, **respond**, **fastcgi**, **scgi**, **cgi**, **status**, **metrics**, or **auth-request**.
 
 See the configuration reference for the full directive list: [](https://github.com/MichaelPaddon/hypershunt/blob/main/docs/reference.md)
 

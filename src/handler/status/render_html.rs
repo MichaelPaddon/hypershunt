@@ -498,8 +498,14 @@ function updateUpstreams(ups){
   tbody.innerHTML=ups.map(function(u){
     var cls=u.ejected?'cert-crit':(u.healthy?'cert-ok':'cert-warn');
     var st=u.ejected?'Ejected':(u.healthy?'Healthy':'Unhealthy');
+    if(u.ejected&&u.ejected_remaining_ms>0){
+      st+=' ('+Math.ceil(u.ejected_remaining_ms/1000)+'s)';}
+    var errs=u.errors;
+    if(u.consecutive_errors>0){errs+=' ('+u.consecutive_errors+' consec)';}
     return'<tr><td>'+escHtml(u.label)+'</td><td class="mono">'+escHtml(u.url)+
+      (u.group?'<span class="muted"> ['+escHtml(u.group)+']</span>':'')+
       '</td><td>'+u.weight+'</td><td>'+u.in_flight+
+      '</td><td>'+fmt(u.requests)+'</td><td>'+errs+
       '</td><td><span class="badge '+cls+'">'+st+'</span></td></tr>';
   }).join('');
 }
@@ -607,7 +613,8 @@ pub(super) fn render_html(
     upstreams: &[UpstreamRow],
     matched_prefix: &str,
 ) -> HttpResponse {
-    let total_lat: u64 = s.latency.iter().sum();
+    let lat6 = crate::metrics::legacy6(&s.latency);
+    let total_lat: u64 = lat6.iter().sum();
     // Brand assets served from a sub-path relative to wherever the
     // status location is mounted (/, /status, /.hypershunt/status, …):
     // the wide lockup for the sidebar image, the square crop for the
@@ -936,7 +943,7 @@ pub(super) fn render_html(
         s3xx = fmt_num(s.status_3xx),
         s4xx = fmt_num(s.status_4xx),
         s5xx = fmt_num(s.status_5xx),
-        latency_bars = latency_bars_html(&s.latency, total_lat),
+        latency_bars = latency_bars_html(&lat6, total_lat),
         resource_sec = resource_sec,
         auth_sec = auth_sec,
         certs_sec = certs_sec,
@@ -1436,7 +1443,7 @@ fn upstream_health_table(upstreams: &[UpstreamRow]) -> String {
         r#"<div class="card" id="upstreams-card"{hidden} style="margin-top:1rem">
   <h2>Upstream Health</h2>
   <table class="info-table">
-    <thead><tr><th>Location</th><th>Upstream</th><th>Weight</th><th>In flight</th><th>State</th></tr></thead>
+    <thead><tr><th>Location</th><th>Upstream</th><th>Weight</th><th>In flight</th><th>Requests</th><th>Errors</th><th>State</th></tr></thead>
     <tbody id="upstreams-tbody">{rows}</tbody>
   </table>
 </div>"#
@@ -1452,12 +1459,24 @@ fn upstream_row_html(u: &UpstreamRow) -> String {
     } else {
         ("cert-warn", "Unhealthy")
     };
+    let group = u
+        .group
+        .as_deref()
+        .map(|g| {
+            format!(
+                r#"<span class="muted"> [{}]</span>"#,
+                html_escape(g)
+            )
+        })
+        .unwrap_or_default();
     format!(
-        r#"<tr><td>{label}</td><td class="mono">{url}</td><td>{weight}</td><td>{inflight}</td><td><span class="badge {cls}">{state}</span></td></tr>"#,
+        r#"<tr><td>{label}</td><td class="mono">{url}{group}</td><td>{weight}</td><td>{inflight}</td><td>{requests}</td><td>{errors}</td><td><span class="badge {cls}">{state}</span></td></tr>"#,
         label = html_escape(&u.label),
         url = html_escape(&u.url),
         weight = u.weight,
         inflight = u.in_flight,
+        requests = fmt_num(u.requests),
+        errors = fmt_num(u.errors),
     )
 }
 
@@ -1840,6 +1859,7 @@ mod tests {
             s3xx: 0,
             s4xx: 1,
             s5xx: 0,
+            ..Default::default()
         };
         let s = Snapshot {
             by_handler: vec![("static", cls)],
@@ -1912,6 +1932,7 @@ mod tests {
 
     #[test]
     fn upstream_row_html_reflects_state() {
+        #[allow(clippy::needless_update)]
         let row = |healthy, ejected| UpstreamRow {
             label: "api".into(),
             url: "http://up:80".into(),
@@ -1919,6 +1940,7 @@ mod tests {
             in_flight: 0,
             healthy,
             ejected,
+            ..Default::default()
         };
         assert!(upstream_row_html(&row(true, false)).contains("Healthy"));
         // Ejected wins over a stale healthy flag.

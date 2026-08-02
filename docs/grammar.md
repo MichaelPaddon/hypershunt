@@ -556,6 +556,7 @@ value set IS the predicate's content (rule 4, exception clause).
 - [`<scgi-handler>`](#scgi-handler)
 - [`<cgi-handler>`](#cgi-handler)
 - `"status"`
+- `"metrics"`
 - `"auth-request"`
 
 ### `static-handler`

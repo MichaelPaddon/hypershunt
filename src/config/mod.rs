@@ -924,6 +924,7 @@ pub enum HandlerConfig {
         root: String,
     },
     Status,
+    Metrics,
     /// Return 200 + identity headers; the surrounding `access` block
     /// handles the actual authentication and authorisation decision
     /// before this handler is reached.

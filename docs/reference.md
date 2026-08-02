@@ -2220,7 +2220,8 @@ Matches a URL path prefix and runs a handler (one of
 [`static`](#static), [`proxy`](#proxy-handler),
 [`redirect`](#redirect), [`respond`](#respond),
 [`fastcgi`](#fastcgi), [`scgi`](#scgi),
-[`cgi`](#cgi), [`status`](#status), [`auth-request`](#auth-request)).
+[`cgi`](#cgi), [`status`](#status), [`metrics`](#metrics),
+[`auth-request`](#auth-request)).
 Locations are matched by longest-prefix; the longest matching
 prefix among the vhost's locations wins.
 
@@ -3275,6 +3276,56 @@ location "/.hypershunt/status" {
 
 The status endpoint exposes operational detail — gate it behind
 a policy in production.
+
+#### metrics
+
+**Handler** child of [`location`](#location).  No properties or
+children.
+
+Serves the server's metrics in Prometheus text exposition format
+(v0.0.4) for scraping.  `GET`/`HEAD` only; other methods get a
+405.  Being an ordinary location handler, the endpoint's path is
+whatever the location says, and [`policy`](#policy-location),
+[`basic-auth`](#basic-auth), and [`rate-limit`](#rate-limit)
+apply as on any other location.
+
+```kdl
+location "/metrics" {
+    policy { allow address "10.0.0.0/8"; deny code=403 }
+    metrics
+}
+```
+
+All metric names carry the `hypershunt_` prefix.  Headline
+series:
+
+| Series | Type | Labels |
+|---|---|---|
+| `hypershunt_requests_total` / `_active` | counter / gauge | — |
+| `hypershunt_responses_total` | counter | `code` (class: `2xx`..`5xx`) |
+| `hypershunt_request_duration_seconds` | histogram | — |
+| `hypershunt_vhost_requests_total` | counter | `vhost`, `code` |
+| `hypershunt_vhost_request_duration_seconds` | histogram | `vhost` |
+| `hypershunt_handler_requests_total` | counter | `handler`, `code` |
+| `hypershunt_listener_requests_total`, `_connections_total`, `_connections_active` | counter / gauge | `listener` |
+| `hypershunt_listener_tls_handshakes_total` | counter | `listener`, `result` (`ok`/`error`/`timeout`) |
+| `hypershunt_upstream_requests_total`, `_errors_total`, `_request_duration_seconds`, `_bytes_total`, `_in_flight`, `_healthy`, `_ejected`, `_consecutive_errors`, `_eject_remaining_seconds` | counters / gauges / histogram | `pool`, `upstream` (+`direction`) |
+| `hypershunt_proxy_upstream_duration_seconds`, `_bytes_total`, `_connect_errors_total` | histogram / counters | — (`direction`) |
+| plus one series per existing counter group | | TLS, QUIC, cache, rate-limit, compression, streams, datagrams, auth/JWT/OIDC, ACME, OCSP, backends, static, geoip, shutdown, process |
+
+Notes:
+
+- Status codes are exported as classes (`code="4xx"`), matching
+  the internal tallies; individual codes are not tracked.
+- Label cardinality is bounded by the configuration: vhost names,
+  listener bind strings, and pool/upstream URLs.  Each vhost adds
+  about 20 series (histogram buckets included).
+- Per-upstream counters reset on config reload (the pool registry
+  is rebuilt); Prometheus `rate()`/`increase()` absorb counter
+  resets.  Requests served by built-in endpoints (health probes,
+  ACME challenges, JWKS, OIDC routes) are attributed to the
+  synthetic vhost `_builtin`.
+- Histograms bucket from 0.5ms to 10s; `_sum` is in seconds.
 
 #### auth-request
 

@@ -129,11 +129,15 @@ impl tokio::io::AsyncWrite for BackendStream {
 /// ends, however it ends (proxy-proto/TLS failure, access deny, upstream
 /// connect failure, or clean close).  Created once per accepted
 /// connection so the gauge can never leak.
-struct StreamConnGuard(Arc<Metrics>);
+struct StreamConnGuard(
+    Arc<Metrics>,
+    Arc<crate::metrics::ListenerMetrics>,
+);
 
 impl Drop for StreamConnGuard {
     fn drop(&mut self) {
         self.0.stream_conns_active.fetch_sub(1, Ordering::Relaxed);
+        self.1.conns_active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -150,6 +154,7 @@ pub async fn run_stream_proxy(
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let name = cfg.local_name();
+    let lmetrics = metrics.listener(&name);
     let proxy_cfg = cfg.proxy.as_ref().expect("proxy config required");
     let accept_proxy_protocol = cfg.accept_proxy_protocol;
     let trusted_proxies: Arc<[ipnet::IpNet]> =
@@ -184,6 +189,7 @@ pub async fn run_stream_proxy(
                         let proxy_ver = accept_proxy_protocol;
                         let trusted_p = trusted_proxies.clone();
                         let conn_metrics = metrics.clone();
+                        let lm = lmetrics.clone();
                         // load_full() cheaply bumps the Arc refcount,
                         // picking up any hot-swapped cert since last accept.
                         let acc = acceptor.as_ref().map(|a| a.load_full());
@@ -194,9 +200,15 @@ pub async fn run_stream_proxy(
                             conn_metrics
                                 .stream_conns_active
                                 .fetch_add(1, Ordering::Relaxed);
+                            lm.conns_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            lm.conns_active
+                                .fetch_add(1, Ordering::Relaxed);
                             // Drops at task end on every path below.
-                            let _guard =
-                                StreamConnGuard(conn_metrics.clone());
+                            let _guard = StreamConnGuard(
+                                conn_metrics.clone(),
+                                lm.clone(),
+                            );
                             // PROXY protocol header (if any) is always
                             // plaintext, even when TLS follows.
                             let peer_addr = match proxy_ver {
@@ -214,6 +226,8 @@ pub async fn run_stream_proxy(
                                     acc.accept(stream),
                                 ).await {
                                     Ok(Ok(tls)) => {
+                                        lm.tls_handshakes_total
+                                            .fetch_add(1, Ordering::Relaxed);
                                         conn_metrics
                                             .tls_handshakes_total
                                             .fetch_add(1, Ordering::Relaxed);
@@ -228,6 +242,8 @@ pub async fn run_stream_proxy(
                                         ).await
                                     }
                                     Ok(Err(e)) => {
+                                        lm.tls_handshake_failures_total
+                                            .fetch_add(1, Ordering::Relaxed);
                                         conn_metrics
                                             .tls_handshake_failures_total
                                             .fetch_add(1, Ordering::Relaxed);
@@ -243,6 +259,8 @@ pub async fn run_stream_proxy(
                                         Ok(())
                                     }
                                     Err(_) => {
+                                        lm.tls_handshake_timeouts_total
+                                            .fetch_add(1, Ordering::Relaxed);
                                         conn_metrics
                                             .tls_handshake_timeouts_total
                                             .fetch_add(1, Ordering::Relaxed);

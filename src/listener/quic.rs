@@ -59,12 +59,18 @@ pub async fn run_quic(
 /// RAII guard that decrements the `quic_connections_active` gauge when
 /// dropped.  Used to keep the gauge consistent even when a connection
 /// task panics mid-flight.
-struct QuicConnGuard(Arc<Metrics>);
+struct QuicConnGuard(
+    Arc<Metrics>,
+    Arc<crate::metrics::ListenerMetrics>,
+);
 
 impl Drop for QuicConnGuard {
     fn drop(&mut self) {
         self.0
             .quic_connections_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.1
+            .conns_active
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -85,6 +91,8 @@ async fn run_quic_inner(
     mut stop_accept: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     use crate::cert::tls::build_quic_server_config;
+
+    let lmetrics = state.load().metrics.listener(&name);
 
     // Seed the endpoint with the current cert.  cert_rx is always
     // populated (CertSource invariant), so borrow().clone() yields the
@@ -202,6 +210,7 @@ async fn run_quic_inner(
                         None
                     };
                 let state = state.load_full();
+                let lm = lmetrics.clone();
                 let bind = name.clone();
                 let timeouts = cfg.timeouts.clone();
                 let max_body = cfg.max_request_body;
@@ -213,6 +222,10 @@ async fn run_quic_inner(
                         Ok(c) => {
                             state.metrics.quic_handshakes_total
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            lm.conns_total.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             c
                         }
                         Err(e) => {
@@ -224,7 +237,12 @@ async fn run_quic_inner(
                     };
                     state.metrics.quic_connections_active
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let _conn_guard = QuicConnGuard(state.metrics.clone());
+                    lm.conns_active.fetch_add(
+                        1,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    let _conn_guard =
+                        QuicConnGuard(state.metrics.clone(), lm.clone());
                     let peer = PeerAddr::Tcp(conn.remote_address());
                     let h3q = h3_quinn::Connection::new(conn);
                     // Build with RFC 9220 extended CONNECT enabled
@@ -248,10 +266,11 @@ async fn run_quic_inner(
                         let bind = bind.clone();
                         let timeouts = timeouts.clone();
                         let auto_alt_svc = auto_alt_svc.clone();
+                        let lm = lm.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_h3_request(
                                 state, bind, peer, timeouts,
-                                max_body, auto_alt_svc, resolver,
+                                max_body, auto_alt_svc, lm, resolver,
                             ).await {
                                 tracing::debug!("h3 request error: {e:#}");
                             }
@@ -401,6 +420,7 @@ async fn handle_h3_request(
     timeouts: Timeouts,
     max_body: Option<u64>,
     auto_alt_svc: Option<Arc<str>>,
+    lmetrics: Arc<crate::metrics::ListenerMetrics>,
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
 ) -> anyhow::Result<()> {
     use http_body_util::BodyExt;
@@ -464,7 +484,7 @@ async fn handle_h3_request(
     }
 
     let svc = HypershuntService::new_h3(
-        state, bind, peer, timeouts, max_body, auto_alt_svc,
+        state, bind, peer, timeouts, max_body, auto_alt_svc, lmetrics,
     );
     let resp = svc.dispatch(req).await?;
     send_h3_response(&mut send_half, resp).await
