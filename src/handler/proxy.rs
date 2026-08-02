@@ -304,9 +304,14 @@ impl Handler for ProxyHandler {
             };
             let idx = self.upstream_index(&upstream);
             let _guard = upstream.in_flight_guard();
+            let start = std::time::Instant::now();
             let resp = self.inners[idx]
                 .serve_upgrade(req, matched_prefix, upgrade_marker)
                 .await;
+            // Latency here is time-to-switch-protocols; relayed
+            // bytes are not tracked for upgraded streams.
+            let ok = !(500..600).contains(&resp.status().as_u16());
+            upstream.record_request(ok, start.elapsed());
             self.record_outcome(&upstream, resp.status().as_u16());
             return resp;
         }
@@ -328,7 +333,7 @@ impl Handler for ProxyHandler {
             let req_bytes = content_length(req.headers());
             let start = std::time::Instant::now();
             let resp = self.inners[idx].serve(req, matched_prefix).await;
-            self.record_upstream(start, req_bytes, &resp);
+            self.record_upstream(&upstream, start, req_bytes, &resp);
             self.record_outcome(&upstream, resp.status().as_u16());
             return resp;
         }
@@ -373,7 +378,12 @@ impl Handler for ProxyHandler {
             let resp = self.inners[idx]
                 .serve(attempt_req, matched_prefix)
                 .await;
-            self.record_upstream(start, collected.len() as u64, &resp);
+            self.record_upstream(
+                &upstream,
+                start,
+                collected.len() as u64,
+                &resp,
+            );
             let status = resp.status().as_u16();
             self.record_outcome(&upstream, status);
             let trigger = self.should_retry(status);
@@ -413,16 +423,22 @@ impl ProxyHandler {
     /// avoids wrapping every body in a counting adapter.
     fn record_upstream(
         &self,
+        upstream: &crate::lb::Upstream,
         start: std::time::Instant,
         req_bytes: u64,
         resp: &HttpResponse,
     ) {
+        let elapsed = start.elapsed();
+        let resp_bytes = content_length(resp.headers());
+        let ok = !(500..600).contains(&resp.status().as_u16());
+        upstream.record_request(ok, elapsed);
+        upstream.record_bytes(req_bytes, resp_bytes);
         if let Some(m) = &self.metrics {
-            m.record_proxy_upstream_latency(start.elapsed());
+            m.record_proxy_upstream_latency(elapsed);
             m.proxy_upstream_bytes_out_total
                 .fetch_add(req_bytes, std::sync::atomic::Ordering::Relaxed);
             m.proxy_upstream_bytes_in_total.fetch_add(
-                content_length(resp.headers()),
+                resp_bytes,
                 std::sync::atomic::Ordering::Relaxed,
             );
         }

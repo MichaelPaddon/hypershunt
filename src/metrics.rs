@@ -606,7 +606,7 @@ pub const LATENCY_BOUNDS_US: [u64; LATENCY_BUCKETS - 1] = [
 ];
 
 /// Bucket index for a request latency.
-fn latency_bucket_us(us: u128) -> usize {
+pub(crate) fn latency_bucket_us(us: u128) -> usize {
     LATENCY_BOUNDS_US
         .iter()
         .position(|&b| us < u128::from(b))

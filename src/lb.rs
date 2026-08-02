@@ -45,6 +45,26 @@ pub struct Upstream {
     /// Latest active-probe verdict.  `true` when no probe has run yet
     /// so a freshly-built pool is usable before the first tick.
     healthy: AtomicBool,
+    // Per-upstream traffic counters.  These live on the pool entry,
+    // which is rebuilt on config reload, so they reset with the
+    // registry; Prometheus rate()/increase() handle counter resets.
+    requests_total: AtomicU64,
+    errors_total: AtomicU64,
+    latency: [AtomicU64; crate::metrics::LATENCY_BUCKETS],
+    latency_sum_us: AtomicU64,
+    bytes_in_total: AtomicU64,
+    bytes_out_total: AtomicU64,
+}
+
+/// Plain-data copy of one upstream's counters for the renderers.
+#[derive(Clone, Copy, Default)]
+pub struct UpstreamCounters {
+    pub requests_total: u64,
+    pub errors_total: u64,
+    pub latency: [u64; crate::metrics::LATENCY_BUCKETS],
+    pub latency_sum_us: u64,
+    pub bytes_in_total: u64,
+    pub bytes_out_total: u64,
 }
 
 impl Upstream {
@@ -61,6 +81,59 @@ impl Upstream {
             consecutive_errors: AtomicU32::new(0),
             ejected_until_ms: AtomicU64::new(0),
             healthy: AtomicBool::new(true),
+            requests_total: AtomicU64::new(0),
+            errors_total: AtomicU64::new(0),
+            latency: std::array::from_fn(|_| AtomicU64::new(0)),
+            latency_sum_us: AtomicU64::new(0),
+            bytes_in_total: AtomicU64::new(0),
+            bytes_out_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one completed request against this upstream.
+    pub fn record_request(&self, ok: bool, latency: Duration) {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        if !ok {
+            self.errors_total.fetch_add(1, Ordering::Relaxed);
+        }
+        let us = latency.as_micros();
+        self.latency[crate::metrics::latency_bucket_us(us)]
+            .fetch_add(1, Ordering::Relaxed);
+        self.latency_sum_us
+            .fetch_add(us.min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed);
+    }
+
+    /// Upstream-side request/response bytes (Content-Length derived,
+    /// so chunked bodies undercount — same caveat as the globals).
+    pub fn record_bytes(&self, bytes_out: u64, bytes_in: u64) {
+        self.bytes_out_total.fetch_add(bytes_out, Ordering::Relaxed);
+        self.bytes_in_total.fetch_add(bytes_in, Ordering::Relaxed);
+    }
+
+    pub fn consecutive_errors(&self) -> u32 {
+        self.consecutive_errors.load(Ordering::Relaxed)
+    }
+
+    /// Milliseconds until a passive ejection lifts; 0 when not
+    /// ejected (or already lifted).
+    pub fn ejected_remaining_ms(&self, now_ms: u64) -> u64 {
+        let until = self.ejected_until_ms.load(Ordering::Relaxed);
+        if until > now_ms { until - now_ms } else { 0 }
+    }
+
+    pub fn counters(&self) -> UpstreamCounters {
+        UpstreamCounters {
+            requests_total: self.requests_total.load(Ordering::Relaxed),
+            errors_total: self.errors_total.load(Ordering::Relaxed),
+            latency: std::array::from_fn(|i| {
+                self.latency[i].load(Ordering::Relaxed)
+            }),
+            latency_sum_us: self.latency_sum_us.load(Ordering::Relaxed),
+            bytes_in_total: self.bytes_in_total.load(Ordering::Relaxed),
+            bytes_out_total: self
+                .bytes_out_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -946,5 +1019,54 @@ mod tests {
         }
 
         handle.abort();
+    }
+
+    // -- per-upstream counters -------------------------------------
+
+    #[test]
+    fn record_request_counts_and_buckets() {
+        let u = Upstream::new("http://a:1".into(), 1, None);
+        u.record_request(true, Duration::from_millis(30));
+        u.record_request(false, Duration::from_millis(30));
+        let c = u.counters();
+        assert_eq!(c.requests_total, 2);
+        assert_eq!(c.errors_total, 1);
+        assert_eq!(c.latency.iter().sum::<u64>(), 2);
+        assert_eq!(c.latency_sum_us, 60_000);
+    }
+
+    #[test]
+    fn record_bytes_accumulates_directions() {
+        let u = Upstream::new("http://a:1".into(), 1, None);
+        u.record_bytes(100, 2000);
+        u.record_bytes(50, 1000);
+        let c = u.counters();
+        assert_eq!(c.bytes_out_total, 150);
+        assert_eq!(c.bytes_in_total, 3000);
+    }
+
+    #[test]
+    fn ejected_remaining_ms_reports_deadline() {
+        let pool = UpstreamPool::new(
+            vec![Arc::new(Upstream::new("http://a:1".into(), 1, None))],
+            LbPolicy::RoundRobin,
+            None,
+            PassiveHealthConfig {
+                eject_after: 1,
+                eject_for_secs: 30,
+            },
+            None,
+        );
+        let u = &pool.upstreams()[0];
+        assert_eq!(u.ejected_remaining_ms(now_unix_ms()), 0);
+        pool.record_failure(u);
+        let rem = u.ejected_remaining_ms(now_unix_ms());
+        assert!(rem > 0 && rem <= 30_000, "remaining {rem}ms");
+        assert_eq!(u.consecutive_errors(), 1);
+        // Well past the deadline the remaining time clamps to zero.
+        assert_eq!(
+            u.ejected_remaining_ms(now_unix_ms() + 60_000),
+            0
+        );
     }
 }
