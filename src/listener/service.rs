@@ -176,6 +176,7 @@ impl HypershuntService {
         mut req: Request<ReqBody>,
     ) -> Result<Response<BoxBody>, anyhow::Error> {
         let state = self.state.clone();
+        let lmetrics = self.lmetrics.clone();
         let bind = self.bind.clone();
         let peer = self.peer_addr;
         let local_addr = self.local_addr;
@@ -289,6 +290,14 @@ impl HypershuntService {
                     let ms = elapsed.as_millis();
                     state.metrics.dec_active();
                     state.metrics.record(resp.status().as_u16(), elapsed);
+                    state.metrics.record_class(
+                        crate::metrics::HandlerKind::Acme,
+                        crate::metrics::BUILTIN_VHOST,
+                        resp.status().as_u16(),
+                        elapsed,
+                    );
+                    lmetrics.requests_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     state.metrics.record_path(&path);
                     log_access(
                         &state, &method, &path, &resp, ms, peer, &host,
@@ -313,6 +322,14 @@ impl HypershuntService {
                 let ms = elapsed.as_millis();
                 state.metrics.dec_active();
                 state.metrics.record(resp.status().as_u16(), elapsed);
+                state.metrics.record_class(
+                    crate::metrics::HandlerKind::Health,
+                    crate::metrics::BUILTIN_VHOST,
+                    resp.status().as_u16(),
+                    elapsed,
+                );
+                lmetrics.requests_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 state.metrics.record_path(&path);
                 log_access(
                     &state, &method, &path, &resp, ms, peer, &host, "-",
@@ -339,6 +356,14 @@ impl HypershuntService {
                 let ms = elapsed.as_millis();
                 state.metrics.dec_active();
                 state.metrics.record(resp.status().as_u16(), elapsed);
+                state.metrics.record_class(
+                    crate::metrics::HandlerKind::Jwks,
+                    crate::metrics::BUILTIN_VHOST,
+                    resp.status().as_u16(),
+                    elapsed,
+                );
+                lmetrics.requests_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 state.metrics.record_path(&path);
                 log_access(
                     &state, &method, &path, &resp, ms, peer, &host, "-",
@@ -369,6 +394,14 @@ impl HypershuntService {
                     let ms = elapsed.as_millis();
                     state.metrics.dec_active();
                     state.metrics.record(resp.status().as_u16(), elapsed);
+                    state.metrics.record_class(
+                        crate::metrics::HandlerKind::Oidc,
+                        crate::metrics::BUILTIN_VHOST,
+                        resp.status().as_u16(),
+                        elapsed,
+                    );
+                    lmetrics.requests_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     state.metrics.record_path(&path);
                     log_access(
                         &state, &method, &path, &resp, ms, peer, &host,
@@ -395,6 +428,14 @@ impl HypershuntService {
                     let ms = elapsed.as_millis();
                     state.metrics.dec_active();
                     state.metrics.record(resp.status().as_u16(), elapsed);
+                    state.metrics.record_class(
+                        crate::metrics::HandlerKind::Oidc,
+                        crate::metrics::BUILTIN_VHOST,
+                        resp.status().as_u16(),
+                        elapsed,
+                    );
+                    lmetrics.requests_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     state.metrics.record_path(&path);
                     log_access(
                         &state, &method, &path, &resp, ms, peer, &host,
@@ -416,6 +457,14 @@ impl HypershuntService {
                         let ms = elapsed.as_millis();
                         state.metrics.dec_active();
                         state.metrics.record(resp.status().as_u16(), elapsed);
+                        state.metrics.record_class(
+                            crate::metrics::HandlerKind::Oidc,
+                            crate::metrics::BUILTIN_VHOST,
+                            resp.status().as_u16(),
+                            elapsed,
+                        );
+                        lmetrics.requests_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         state.metrics.record_path(&path);
                         log_access(
                             &state, &method, &path, &resp, ms, peer,
@@ -438,6 +487,14 @@ impl HypershuntService {
                     let ms = elapsed.as_millis();
                     state.metrics.dec_active();
                     state.metrics.record(resp.status().as_u16(), elapsed);
+                    state.metrics.record_class(
+                        crate::metrics::HandlerKind::Oidc,
+                        crate::metrics::BUILTIN_VHOST,
+                        resp.status().as_u16(),
+                        elapsed,
+                    );
+                    lmetrics.requests_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     state.metrics.record_path(&path);
                     log_access(
                         &state, &method, &path, &resp, ms, peer, &host,
@@ -464,6 +521,14 @@ impl HypershuntService {
                     let ms = elapsed.as_millis();
                     state.metrics.dec_active();
                     state.metrics.record(resp.status().as_u16(), elapsed);
+                    state.metrics.record_class(
+                        crate::metrics::HandlerKind::Oidc,
+                        crate::metrics::BUILTIN_VHOST,
+                        resp.status().as_u16(),
+                        elapsed,
+                    );
+                    lmetrics.requests_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     state.metrics.record_path(&path);
                     log_access(
                         &state, &method, &path, &resp, ms, peer, &host,
@@ -1144,6 +1209,8 @@ impl HypershuntService {
             let ms = elapsed.as_millis();
             state.metrics.dec_active();
             state.metrics.record(status, elapsed);
+            lmetrics.requests_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             state.metrics.record_path(&path);
             // Per-vhost / per-handler breakdown for routed requests.
             if let Some((vhost, kind)) = &matched_class {

@@ -867,6 +867,50 @@ index-file "index.html";
         assert!(std::str::from_utf8(&body).unwrap_or("").contains("ok"),);
     }
 
+    /// Built-in endpoints are attributed to the synthetic "_builtin"
+    /// vhost and their own handler kind, so global totals reconcile
+    /// with the by-handler/by-vhost breakdowns.
+    #[tokio::test]
+    async fn builtin_endpoints_reconcile_with_breakdowns() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "example.com" {
+                location "/status" { status }
+                location "/" { respond status=200 body="ok" }
+            }
+            "#,
+        )
+        .await;
+
+        let (status, _, _) = srv.get("example.com", "/healthz").await;
+        assert_eq!(status, 200);
+        let (_, _, body) =
+            srv.get("example.com", "/status?format=json").await;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).expect("status JSON");
+        let total = v["requests_total"].as_u64().unwrap();
+        let by_handler = v["by_handler"].as_array().unwrap();
+        let sum: u64 = by_handler
+            .iter()
+            .map(|h| h["total"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total, sum, "totals must reconcile: {v}");
+        let health = by_handler
+            .iter()
+            .find(|h| h["handler"] == "health")
+            .expect("health row present");
+        assert_eq!(health["total"].as_u64().unwrap(), 1);
+        assert!(
+            v["by_vhost"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["vhost"] == "_builtin"),
+            "_builtin vhost row present: {v}"
+        );
+    }
+
     /// When health is disabled, /healthz falls through to the router.
     #[tokio::test]
     async fn health_endpoint_disabled_falls_through_to_router() {
