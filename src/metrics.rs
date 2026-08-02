@@ -228,7 +228,8 @@ pub struct UpstreamSnap {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub connect_errors: u64,
-    pub latency: [u64; 6],
+    pub latency: [u64; LATENCY_BUCKETS],
+    pub latency_sum_us: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -320,8 +321,9 @@ pub struct Snapshot {
     pub status_3xx: u64,
     pub status_4xx: u64,
     pub status_5xx: u64,
-    /// Counts per latency bucket: <1ms <10ms <50ms <200ms <1s >=1s
-    pub latency: [u64; 6],
+    /// Counts per fine latency bucket (see LATENCY_BOUNDS_US).
+    pub latency: [u64; LATENCY_BUCKETS],
+    pub latency_sum_us: u64,
     /// Requests/second: partial current window and 1/5/15-min averages.
     pub rate_current: f64,
     pub rate_1min: f64,
@@ -373,6 +375,8 @@ pub struct Snapshot {
     /// breakdown (map order); rendered as tables.
     pub by_handler: Vec<(&'static str, ClassSnapshot)>,
     pub by_vhost: Vec<(String, ClassSnapshot)>,
+    /// Per-listener counters, keyed by bind string (map order).
+    pub by_listener: Vec<(String, ListenerSnap)>,
 }
 
 impl Snapshot {
@@ -468,8 +472,6 @@ struct PathData {
     slots: Vec<HashMap<String, u64>>,
     /// Live accumulator for the current in-progress slot.
     current: HashMap<String, u64>,
-    /// All-time path totals (bounded by MAX_TRACKED_PATHS).
-    total: HashMap<String, u64>,
     head: usize,
 }
 
@@ -529,10 +531,18 @@ pub enum HandlerKind {
     Cgi,
     Status,
     AuthRequest,
+    Metrics,
+    // Built-in endpoints served before vhost routing.  Attributed
+    // under the synthetic vhost "_builtin" so global totals reconcile
+    // with the by-handler/by-vhost breakdowns.
+    Acme,
+    Health,
+    Jwks,
+    Oidc,
 }
 
 /// Number of `HandlerKind` variants; sizes the `per_kind` array.
-pub const HANDLER_KINDS: usize = 9;
+pub const HANDLER_KINDS: usize = 14;
 
 /// All kinds in discriminant order — used to label the per-handler
 /// snapshot without reflection.
@@ -546,6 +556,11 @@ pub const HANDLER_KIND_ALL: [HandlerKind; HANDLER_KINDS] = [
     HandlerKind::Cgi,
     HandlerKind::Status,
     HandlerKind::AuthRequest,
+    HandlerKind::Metrics,
+    HandlerKind::Acme,
+    HandlerKind::Health,
+    HandlerKind::Jwks,
+    HandlerKind::Oidc,
 ];
 
 impl HandlerKind {
@@ -565,12 +580,55 @@ impl HandlerKind {
             Self::Cgi => "cgi",
             Self::Status => "status",
             Self::AuthRequest => "auth-request",
+            Self::Metrics => "metrics",
+            Self::Acme => "acme",
+            Self::Health => "health",
+            Self::Jwks => "jwks",
+            Self::Oidc => "oidc",
         }
     }
 }
 
-/// One request tally broken down by status class.  Used per-vhost and
-/// per-handler-type.  All atomics so the hot path never locks.
+/// Synthetic vhost name for requests served by built-in endpoints
+/// before vhost routing (health probes, ACME challenges, JWKS, OIDC).
+pub const BUILTIN_VHOST: &str = "_builtin";
+
+/// Number of latency-histogram buckets (last bucket is unbounded).
+pub const LATENCY_BUCKETS: usize = 13;
+
+/// Upper bounds (exclusive) of the finite latency buckets, in
+/// microseconds.  Chosen so the legacy 6-bucket view (<1ms <10ms
+/// <50ms <200ms <1s >=1s) is an exact summation — every legacy
+/// boundary appears here (see `legacy6`).
+pub const LATENCY_BOUNDS_US: [u64; LATENCY_BUCKETS - 1] = [
+    500, 1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 200_000,
+    500_000, 1_000_000, 2_500_000, 10_000_000,
+];
+
+/// Bucket index for a request latency.
+fn latency_bucket_us(us: u128) -> usize {
+    LATENCY_BOUNDS_US
+        .iter()
+        .position(|&b| us < u128::from(b))
+        .unwrap_or(LATENCY_BUCKETS - 1)
+}
+
+/// Collapse the 13-bucket histogram into the legacy 6-bucket shape
+/// (<1ms <10ms <50ms <200ms <1s >=1s) used by the status page JSON.
+pub fn legacy6(buckets: &[u64; LATENCY_BUCKETS]) -> [u64; 6] {
+    [
+        buckets[0] + buckets[1],
+        buckets[2] + buckets[3],
+        buckets[4] + buckets[5],
+        buckets[6] + buckets[7],
+        buckets[8] + buckets[9],
+        buckets[10] + buckets[11] + buckets[12],
+    ]
+}
+
+/// One request tally broken down by status class, plus a latency
+/// histogram.  Used per-vhost and per-handler-type.  All atomics so
+/// the hot path never locks.
 #[derive(Default)]
 pub struct ClassCounters {
     pub total: AtomicU64,
@@ -578,10 +636,12 @@ pub struct ClassCounters {
     pub s3xx: AtomicU64,
     pub s4xx: AtomicU64,
     pub s5xx: AtomicU64,
+    pub latency: [AtomicU64; LATENCY_BUCKETS],
+    pub latency_sum_us: AtomicU64,
 }
 
 impl ClassCounters {
-    fn record(&self, status: u16) {
+    fn record(&self, status: u16, latency: Duration) {
         self.total.fetch_add(1, Ordering::Relaxed);
         match status / 100 {
             2 => self.s2xx.fetch_add(1, Ordering::Relaxed),
@@ -590,15 +650,27 @@ impl ClassCounters {
             5 => self.s5xx.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
+        let us = latency.as_micros();
+        self.latency[latency_bucket_us(us)]
+            .fetch_add(1, Ordering::Relaxed);
+        self.latency_sum_us
+            .fetch_add(us.min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> ClassSnapshot {
+        let mut latency = [0u64; LATENCY_BUCKETS];
+        for (out, b) in latency.iter_mut().zip(self.latency.iter()) {
+            *out = b.load(Ordering::Relaxed);
+        }
         ClassSnapshot {
             total: self.total.load(Ordering::Relaxed),
             s2xx: self.s2xx.load(Ordering::Relaxed),
             s3xx: self.s3xx.load(Ordering::Relaxed),
             s4xx: self.s4xx.load(Ordering::Relaxed),
             s5xx: self.s5xx.load(Ordering::Relaxed),
+            latency,
+            latency_sum_us: self.latency_sum_us.load(Ordering::Relaxed),
         }
     }
 }
@@ -616,6 +688,55 @@ pub struct ClassSnapshot {
     pub s3xx: u64,
     pub s4xx: u64,
     pub s5xx: u64,
+    pub latency: [u64; LATENCY_BUCKETS],
+    pub latency_sum_us: u64,
+}
+
+// -- Per-listener counters ----------------------------------------
+
+/// Counters split by listener bind string.  A listener task resolves
+/// its `Arc<ListenerMetrics>` once at spawn (never per request or
+/// per connection) and increments these alongside the process-global
+/// counters.  Cardinality is bounded by the number of configured
+/// listeners.
+#[derive(Default)]
+pub struct ListenerMetrics {
+    pub tls_handshakes_total: AtomicU64,
+    pub tls_handshake_failures_total: AtomicU64,
+    pub tls_handshake_timeouts_total: AtomicU64,
+    pub conns_total: AtomicU64,
+    pub conns_active: AtomicI64,
+    pub requests_total: AtomicU64,
+}
+
+/// Plain-data copy of a `ListenerMetrics` for the renderers.
+#[derive(Clone, Copy, Default)]
+pub struct ListenerSnap {
+    pub tls_handshakes: u64,
+    pub tls_handshake_failures: u64,
+    pub tls_handshake_timeouts: u64,
+    pub conns_total: u64,
+    pub conns_active: i64,
+    pub requests_total: u64,
+}
+
+impl ListenerMetrics {
+    fn snapshot(&self) -> ListenerSnap {
+        ListenerSnap {
+            tls_handshakes: self
+                .tls_handshakes_total
+                .load(Ordering::Relaxed),
+            tls_handshake_failures: self
+                .tls_handshake_failures_total
+                .load(Ordering::Relaxed),
+            tls_handshake_timeouts: self
+                .tls_handshake_timeouts_total
+                .load(Ordering::Relaxed),
+            conns_total: self.conns_total.load(Ordering::Relaxed),
+            conns_active: self.conns_active.load(Ordering::Relaxed),
+            requests_total: self.requests_total.load(Ordering::Relaxed),
+        }
+    }
 }
 
 // -- Public Metrics struct ----------------------------------------
@@ -630,7 +751,8 @@ pub struct Metrics {
     pub status_4xx: AtomicU64,
     pub status_5xx: AtomicU64,
     // Latency histogram: <1ms <10ms <50ms <200ms <1s >=1s
-    pub latency: [AtomicU64; 6],
+    pub latency: [AtomicU64; LATENCY_BUCKETS],
+    pub latency_sum_us: AtomicU64,
     // Auth and JWT failure counters; deltas written to archives each tick.
     pub auth_failures: AtomicU64,
     // JWT bad-signature failures (wrong kid, malformed, bad sig).
@@ -740,7 +862,6 @@ pub struct Metrics {
     /// be dropped here.  Today the raw datagram path passes payloads
     /// of any size, so this counter stays at zero.
     #[allow(dead_code)]
-    pub datagrams_dropped_oversize_total: AtomicU64,
     pub datagram_flow_create_total: AtomicU64,
     pub datagram_flow_evict_total: AtomicU64,
     // -- TCP stream-proxy counters.  Zero unless a byte-stream
@@ -794,7 +915,8 @@ pub struct Metrics {
     pub proxy_upstream_bytes_in_total: AtomicU64,
     pub proxy_upstream_bytes_out_total: AtomicU64,
     pub proxy_upstream_connect_errors_total: AtomicU64,
-    pub proxy_upstream_latency: [AtomicU64; 6],
+    pub proxy_upstream_latency: [AtomicU64; LATENCY_BUCKETS],
+    pub proxy_upstream_latency_sum_us: AtomicU64,
     // -- HTTP connection-level gauge/counter (distinct from
     // requests_active, which counts in-flight requests, not sockets).
     pub http_conns_active: AtomicI64,
@@ -825,6 +947,9 @@ pub struct Metrics {
     // hot path takes a read lock and bumps atomics; only the first
     // sighting of a vhost takes the write lock.
     pub per_vhost: RwLock<HashMap<String, Arc<ClassCounters>>>,
+    // Per-listener counters keyed by bind string; entries created at
+    // listener spawn via `listener()`.
+    listeners: RwLock<HashMap<String, Arc<ListenerMetrics>>>,
     // Ring-buffer archives (all written by tick_loop only).
     fine: Mutex<FineHistory>,
     paths: Mutex<PathData>,
@@ -834,20 +959,6 @@ pub struct Metrics {
 }
 
 // -- Metrics implementation ----------------------------------------
-
-/// Bucket index for a latency in milliseconds, shared by the global
-/// request histogram and the reverse-proxy upstream histogram:
-/// <1ms <10ms <50ms <200ms <1s >=1s.
-fn latency_bucket(latency_ms: u128) -> usize {
-    match latency_ms {
-        ms if ms < 1 => 0,
-        ms if ms < 10 => 1,
-        ms if ms < 50 => 2,
-        ms if ms < 200 => 3,
-        ms if ms < 1000 => 4,
-        _ => 5,
-    }
-}
 
 impl Metrics {
     pub fn new() -> Self {
@@ -860,6 +971,7 @@ impl Metrics {
             status_4xx: AtomicU64::new(0),
             status_5xx: AtomicU64::new(0),
             latency: std::array::from_fn(|_| AtomicU64::new(0)),
+            latency_sum_us: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
             jwt_failures: AtomicU64::new(0),
             jwt_expiries: AtomicU64::new(0),
@@ -905,7 +1017,6 @@ impl Metrics {
             datagrams_out_total: AtomicU64::new(0),
             bytes_in_total: AtomicU64::new(0),
             bytes_out_total: AtomicU64::new(0),
-            datagrams_dropped_oversize_total: AtomicU64::new(0),
             datagram_flow_create_total: AtomicU64::new(0),
             datagram_flow_evict_total: AtomicU64::new(0),
             stream_conns_active: AtomicI64::new(0),
@@ -934,6 +1045,7 @@ impl Metrics {
             proxy_upstream_bytes_in_total: AtomicU64::new(0),
             proxy_upstream_bytes_out_total: AtomicU64::new(0),
             proxy_upstream_connect_errors_total: AtomicU64::new(0),
+            proxy_upstream_latency_sum_us: AtomicU64::new(0),
             proxy_upstream_latency: std::array::from_fn(|_| {
                 AtomicU64::new(0)
             }),
@@ -955,11 +1067,11 @@ impl Metrics {
             static_range_total: AtomicU64::new(0),
             per_kind: std::array::from_fn(|_| ClassCounters::default()),
             per_vhost: RwLock::new(HashMap::new()),
+            listeners: RwLock::new(HashMap::new()),
             fine: Mutex::new(FineHistory::new()),
             paths: Mutex::new(PathData {
                 slots: (0..FINE_SLOTS).map(|_| HashMap::new()).collect(),
                 current: HashMap::new(),
-                total: HashMap::new(),
                 head: 0,
             }),
             minute: Mutex::new(CoarseArchive::new(MINUTE_SLOTS)),
@@ -974,10 +1086,6 @@ impl Metrics {
         let p = if path.len() > 128 { &path[..128] } else { path };
         let mut ph =
             self.paths.lock().unwrap_or_else(|e| e.into_inner());
-        let under_cap = ph.total.len() < MAX_TRACKED_PATHS;
-        if under_cap || ph.total.contains_key(p) {
-            *ph.total.entry(p.to_owned()).or_insert(0) += 1;
-        }
         let cur_under = ph.current.len() < MAX_TRACKED_PATHS;
         if cur_under || ph.current.contains_key(p) {
             *ph.current.entry(p.to_owned()).or_insert(0) += 1;
@@ -985,7 +1093,7 @@ impl Metrics {
     }
 
     /// Record a completed request.  Does not touch requests_active.
-    pub fn record(&self, status: u16, latency_ms: u128) {
+    pub fn record(&self, status: u16, latency: Duration) {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         match status / 100 {
             2 => {
@@ -1002,8 +1110,12 @@ impl Metrics {
             }
             _ => {}
         }
-        self.latency[latency_bucket(latency_ms)]
+        let us = latency.as_micros();
+        self.latency[latency_bucket_us(us)]
             .fetch_add(1, Ordering::Relaxed);
+        self.latency_sum_us
+            .fetch_add(us.min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed);
     }
 
     /// Record a completed request against the per-handler-type and
@@ -1015,15 +1127,16 @@ impl Metrics {
         kind: HandlerKind,
         vhost: &str,
         status: u16,
+        latency: Duration,
     ) {
-        self.per_kind[kind.index()].record(status);
+        self.per_kind[kind.index()].record(status, latency);
 
         // Fast path: vhost already seen — read lock only.
         {
             let map =
                 self.per_vhost.read().unwrap_or_else(|p| p.into_inner());
             if let Some(c) = map.get(vhost) {
-                c.record(status);
+                c.record(status, latency);
                 return;
             }
         }
@@ -1037,14 +1150,46 @@ impl Metrics {
                 .or_insert_with(|| Arc::new(ClassCounters::default()))
                 .clone()
         };
-        entry.record(status);
+        entry.record(status, latency);
     }
 
     /// Record one upstream-response latency into the reverse-proxy
     /// histogram (same bucket boundaries as the request histogram).
-    pub fn record_proxy_upstream_latency(&self, latency_ms: u128) {
-        self.proxy_upstream_latency[latency_bucket(latency_ms)]
+    pub fn record_proxy_upstream_latency(&self, latency: Duration) {
+        let us = latency.as_micros();
+        self.proxy_upstream_latency[latency_bucket_us(us)]
             .fetch_add(1, Ordering::Relaxed);
+        self.proxy_upstream_latency_sum_us
+            .fetch_add(us.min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed);
+    }
+
+    /// Per-listener counters for `bind`, created on first call.
+    /// Listener tasks call this once at spawn and hold the Arc.
+    pub fn listener(&self, bind: &str) -> Arc<ListenerMetrics> {
+        {
+            let map = self
+                .listeners
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(l) = map.get(bind) {
+                return l.clone();
+            }
+        }
+        let mut map = self
+            .listeners
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        map.entry(bind.to_owned())
+            .or_insert_with(|| Arc::new(ListenerMetrics::default()))
+            .clone()
+    }
+
+    /// Snapshot every listener's counters (map order).
+    pub fn listener_snapshots(&self) -> Vec<(String, ListenerSnap)> {
+        let map =
+            self.listeners.read().unwrap_or_else(|p| p.into_inner());
+        map.iter().map(|(n, l)| (n.clone(), l.snapshot())).collect()
     }
 
     /// Snapshot the per-handler-type and per-vhost breakdowns for the
@@ -1139,6 +1284,7 @@ impl Metrics {
             latency: std::array::from_fn(|i| {
                 self.latency[i].load(Ordering::Relaxed)
             }),
+            latency_sum_us: self.latency_sum_us.load(Ordering::Relaxed),
             rate_current,
             rate_1min,
             rate_5min,
@@ -1215,6 +1361,7 @@ impl Metrics {
             },
             by_handler,
             by_vhost,
+            by_listener: self.listener_snapshots(),
         }
     }
 
@@ -1338,6 +1485,9 @@ impl Metrics {
             latency: std::array::from_fn(|i| {
                 self.proxy_upstream_latency[i].load(Ordering::Relaxed)
             }),
+            latency_sum_us: self
+                .proxy_upstream_latency_sum_us
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -2023,11 +2173,11 @@ mod tests {
     #[test]
     fn record_increments_correct_status_bucket() {
         let m = Metrics::new();
-        m.record(200, 1);
-        m.record(204, 1);
-        m.record(301, 1);
-        m.record(404, 1);
-        m.record(503, 1);
+        m.record(200, Duration::from_millis(1));
+        m.record(204, Duration::from_millis(1));
+        m.record(301, Duration::from_millis(1));
+        m.record(404, Duration::from_millis(1));
+        m.record(503, Duration::from_millis(1));
         assert_eq!(m.status_2xx.load(Ordering::Relaxed), 2);
         assert_eq!(m.status_3xx.load(Ordering::Relaxed), 1);
         assert_eq!(m.status_4xx.load(Ordering::Relaxed), 1);
@@ -2038,12 +2188,12 @@ mod tests {
     #[test]
     fn record_increments_correct_latency_bucket() {
         let m = Metrics::new();
-        m.record(200, 0); // <1ms  -> bucket 0
-        m.record(200, 5); // <10ms -> bucket 1
-        m.record(200, 30); // <50ms -> bucket 2
-        m.record(200, 100); // <200ms -> bucket 3
-        m.record(200, 500); // <1s -> bucket 4
-        m.record(200, 2000); // >=1s -> bucket 5
+        // One sample per bucket: just under each finite bound, plus
+        // one beyond the last bound.
+        for us in LATENCY_BOUNDS_US {
+            m.record(200, Duration::from_micros(us - 1));
+        }
+        m.record(200, Duration::from_secs(11));
         for (i, b) in m.latency.iter().enumerate() {
             assert_eq!(
                 b.load(Ordering::Relaxed),
@@ -2051,6 +2201,7 @@ mod tests {
                 "bucket {i} should have count 1"
             );
         }
+        assert!(m.latency_sum_us.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
@@ -2067,7 +2218,7 @@ mod tests {
     #[test]
     fn rate_is_zero_before_any_tick() {
         let m = Metrics::new();
-        m.record(200, 1);
+        m.record(200, Duration::from_millis(1));
         let snap = m.snapshot();
         // Ring buffer has no completed windows yet -- all rates are 0.
         assert_eq!(snap.rate_1min, 0.0);
@@ -2081,7 +2232,7 @@ mod tests {
     fn tick_advances_ring_buffer() {
         let m = Metrics::new();
         for _ in 0..5 {
-            m.record(200, 1);
+            m.record(200, Duration::from_millis(1));
         }
         // Simulate one tick by directly writing the fine archive.
         let total = m.requests_total.load(Ordering::Relaxed);
@@ -2117,7 +2268,8 @@ mod tests {
                 status_3xx: 0,
                 status_4xx: 0,
                 status_5xx: 0,
-                latency: [0; 6],
+                latency: [0; LATENCY_BUCKETS],
+                latency_sum_us: 0,
                 rate_current: 0.0,
                 rate_1min: 0.0,
                 rate_5min: 0.0,
@@ -2196,7 +2348,7 @@ mod tests {
     fn sparkline_req_rate_reflects_ticked_data() {
         let m = Metrics::new();
         for _ in 0..10 {
-            m.record(200, 1);
+            m.record(200, Duration::from_millis(1));
         }
         // Simulate one fine tick.
         let total = m.requests_total.load(Ordering::Relaxed);
@@ -2312,12 +2464,13 @@ mod tests {
         m.proxy_lb_health_checks_total.fetch_add(4, Ordering::Relaxed);
         m.proxy_upstream_connect_errors_total
             .fetch_add(1, Ordering::Relaxed);
-        m.record_proxy_upstream_latency(5); // bucket 1 (<10ms)
+        m.record_proxy_upstream_latency(Duration::from_millis(5));
         let s = m.snapshot();
         assert_eq!(s.lb.picks, 7);
         assert_eq!(s.lb.health_checks, 4);
         assert_eq!(s.upstream.connect_errors, 1);
-        assert_eq!(s.upstream.latency[1], 1);
+        // 5ms falls in the [5ms, 10ms) bucket (index 3).
+        assert_eq!(s.upstream.latency[3], 1);
     }
 
     #[test]
@@ -2353,9 +2506,9 @@ mod tests {
     #[test]
     fn record_class_aggregates_by_handler_and_vhost() {
         let m = Metrics::new();
-        m.record_class(HandlerKind::Proxy, "example.com", 200);
-        m.record_class(HandlerKind::Proxy, "example.com", 502);
-        m.record_class(HandlerKind::Static, "other.com", 404);
+        m.record_class(HandlerKind::Proxy, "example.com", 200, Duration::from_millis(1));
+        m.record_class(HandlerKind::Proxy, "example.com", 502, Duration::from_millis(1));
+        m.record_class(HandlerKind::Static, "other.com", 404, Duration::from_millis(1));
         let s = m.snapshot();
         // Per-handler: proxy has 2 (one 2xx, one 5xx), static has 1 4xx.
         let proxy = s
@@ -2376,5 +2529,97 @@ mod tests {
             .unwrap();
         assert_eq!(ex.total, 2);
         assert_eq!(ex.s4xx, 0);
+    }
+
+    // -- 13-bucket histogram / legacy mapping / listeners ----------
+
+    #[test]
+    fn latency_bucket_bounds_are_exclusive_upper() {
+        for (i, &b) in LATENCY_BOUNDS_US.iter().enumerate() {
+            assert_eq!(latency_bucket_us(u128::from(b) - 1), i);
+            assert_eq!(latency_bucket_us(u128::from(b)), i + 1);
+        }
+        assert_eq!(
+            latency_bucket_us(u128::MAX),
+            LATENCY_BUCKETS - 1
+        );
+    }
+
+    #[test]
+    fn legacy6_sums_to_the_same_total() {
+        let fine: [u64; LATENCY_BUCKETS] =
+            std::array::from_fn(|i| (i as u64 + 1) * 3);
+        let l6 = legacy6(&fine);
+        assert_eq!(
+            l6.iter().sum::<u64>(),
+            fine.iter().sum::<u64>()
+        );
+    }
+
+    #[test]
+    fn legacy6_matches_old_boundaries() {
+        // A sample just under each legacy boundary must land in the
+        // same legacy bucket the old 6-bucket histogram used.
+        let cases: [(u64, usize); 6] = [
+            (900, 0),        // 0.9ms  -> <1ms
+            (9_000, 1),      // 9ms    -> <10ms
+            (49_000, 2),     // 49ms   -> <50ms
+            (190_000, 3),    // 190ms  -> <200ms
+            (900_000, 4),    // 900ms  -> <1s
+            (5_000_000, 5),  // 5s     -> >=1s
+        ];
+        for (us, want) in cases {
+            let mut fine = [0u64; LATENCY_BUCKETS];
+            fine[latency_bucket_us(u128::from(us))] = 1;
+            let l6 = legacy6(&fine);
+            assert_eq!(l6[want], 1, "{us}us should map to l6[{want}]");
+        }
+    }
+
+    #[test]
+    fn record_class_fills_per_vhost_latency() {
+        let m = Metrics::new();
+        m.record_class(
+            HandlerKind::Static,
+            "a.com",
+            200,
+            Duration::from_millis(30),
+        );
+        let (_, by_vhost) = m.class_snapshots();
+        let (_, c) =
+            by_vhost.iter().find(|(n, _)| n == "a.com").unwrap();
+        assert_eq!(c.latency.iter().sum::<u64>(), 1);
+        assert_eq!(c.latency_sum_us, 30_000);
+    }
+
+    #[test]
+    fn handler_kind_labels_stay_in_lockstep() {
+        assert_eq!(HANDLER_KIND_ALL.len(), HANDLER_KINDS);
+        for (i, k) in HANDLER_KIND_ALL.iter().enumerate() {
+            assert_eq!(k.index(), i, "{} out of order", k.label());
+        }
+        // Labels are unique.
+        let mut labels: Vec<_> =
+            HANDLER_KIND_ALL.iter().map(|k| k.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), HANDLER_KINDS);
+    }
+
+    #[test]
+    fn listener_registry_returns_same_instance() {
+        let m = Metrics::new();
+        let a = m.listener("tcp://0.0.0.0:80");
+        let b = m.listener("tcp://0.0.0.0:80");
+        let c = m.listener("tcp://0.0.0.0:443");
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &c));
+        a.requests_total.fetch_add(2, Ordering::Relaxed);
+        let snaps = m.listener_snapshots();
+        let (_, snap) = snaps
+            .iter()
+            .find(|(n, _)| n == "tcp://0.0.0.0:80")
+            .unwrap();
+        assert_eq!(snap.requests_total, 2);
     }
 }

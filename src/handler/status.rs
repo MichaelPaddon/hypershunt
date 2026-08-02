@@ -399,7 +399,10 @@ mod tests {
             status_3xx: 80,
             status_4xx: 50,
             status_5xx: 4,
-            latency: [800, 300, 100, 20, 10, 4],
+            latency: [
+                400, 400, 150, 150, 50, 50, 10, 10, 5, 5, 2, 1, 1,
+            ],
+            latency_sum_us: 0,
             rate_current: 12.5,
             rate_1min: 10.2,
             rate_5min: 8.7,

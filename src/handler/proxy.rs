@@ -418,7 +418,7 @@ impl ProxyHandler {
         resp: &HttpResponse,
     ) {
         if let Some(m) = &self.metrics {
-            m.record_proxy_upstream_latency(start.elapsed().as_millis());
+            m.record_proxy_upstream_latency(start.elapsed());
             m.proxy_upstream_bytes_out_total
                 .fetch_add(req_bytes, std::sync::atomic::Ordering::Relaxed);
             m.proxy_upstream_bytes_in_total.fetch_add(

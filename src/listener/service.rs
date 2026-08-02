@@ -282,9 +282,10 @@ impl HypershuntService {
                         .header("Content-Type", "text/plain")
                         .body(bytes_body(Bytes::from(body)))
                         .expect("known-valid status and header");
-                    let ms = start.elapsed().as_millis();
+                    let elapsed = start.elapsed();
+                    let ms = elapsed.as_millis();
                     state.metrics.dec_active();
-                    state.metrics.record(resp.status().as_u16(), ms);
+                    state.metrics.record(resp.status().as_u16(), elapsed);
                     state.metrics.record_path(&path);
                     log_access(
                         &state, &method, &path, &resp, ms, peer, &host,
@@ -305,9 +306,10 @@ impl HypershuntService {
                 &state.health,
                 &crate::handler::health::DRAINING,
             ) {
-                let ms = start.elapsed().as_millis();
+                let elapsed = start.elapsed();
+                let ms = elapsed.as_millis();
                 state.metrics.dec_active();
-                state.metrics.record(resp.status().as_u16(), ms);
+                state.metrics.record(resp.status().as_u16(), elapsed);
                 state.metrics.record_path(&path);
                 log_access(
                     &state, &method, &path, &resp, ms, peer, &host, "-",
@@ -330,9 +332,10 @@ impl HypershuntService {
                     .header("Cache-Control", "public, max-age=3600")
                     .body(bytes_body(Bytes::from(body)))
                     .expect("known-valid status and headers");
-                let ms = start.elapsed().as_millis();
+                let elapsed = start.elapsed();
+                let ms = elapsed.as_millis();
                 state.metrics.dec_active();
-                state.metrics.record(resp.status().as_u16(), ms);
+                state.metrics.record(resp.status().as_u16(), elapsed);
                 state.metrics.record_path(&path);
                 log_access(
                     &state, &method, &path, &resp, ms, peer, &host, "-",
@@ -359,9 +362,10 @@ impl HypershuntService {
                         return Ok(response_503_retry(5));
                     }
                     let resp = handle_oidc_login(oidc, &query, is_tls);
-                    let ms = start.elapsed().as_millis();
+                    let elapsed = start.elapsed();
+                    let ms = elapsed.as_millis();
                     state.metrics.dec_active();
-                    state.metrics.record(resp.status().as_u16(), ms);
+                    state.metrics.record(resp.status().as_u16(), elapsed);
                     state.metrics.record_path(&path);
                     log_access(
                         &state, &method, &path, &resp, ms, peer, &host,
@@ -384,9 +388,10 @@ impl HypershuntService {
                         &state.error_pages,
                     )
                     .await;
-                    let ms = start.elapsed().as_millis();
+                    let elapsed = start.elapsed();
+                    let ms = elapsed.as_millis();
                     state.metrics.dec_active();
-                    state.metrics.record(resp.status().as_u16(), ms);
+                    state.metrics.record(resp.status().as_u16(), elapsed);
                     state.metrics.record_path(&path);
                     log_access(
                         &state, &method, &path, &resp, ms, peer, &host,
@@ -404,9 +409,10 @@ impl HypershuntService {
                             Some(&state.error_pages),
                         )
                         .await;
-                        let ms = start.elapsed().as_millis();
+                        let elapsed = start.elapsed();
+                        let ms = elapsed.as_millis();
                         state.metrics.dec_active();
-                        state.metrics.record(resp.status().as_u16(), ms);
+                        state.metrics.record(resp.status().as_u16(), elapsed);
                         state.metrics.record_path(&path);
                         log_access(
                             &state, &method, &path, &resp, ms, peer,
@@ -425,9 +431,10 @@ impl HypershuntService {
                         &state.error_pages,
                     )
                     .await;
-                    let ms = start.elapsed().as_millis();
+                    let elapsed = start.elapsed();
+                    let ms = elapsed.as_millis();
                     state.metrics.dec_active();
-                    state.metrics.record(resp.status().as_u16(), ms);
+                    state.metrics.record(resp.status().as_u16(), elapsed);
                     state.metrics.record_path(&path);
                     log_access(
                         &state, &method, &path, &resp, ms, peer, &host,
@@ -450,9 +457,10 @@ impl HypershuntService {
                         1,
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    let ms = start.elapsed().as_millis();
+                    let elapsed = start.elapsed();
+                    let ms = elapsed.as_millis();
                     state.metrics.dec_active();
-                    state.metrics.record(resp.status().as_u16(), ms);
+                    state.metrics.record(resp.status().as_u16(), elapsed);
                     state.metrics.record_path(&path);
                     log_access(
                         &state, &method, &path, &resp, ms, peer, &host,
@@ -1129,13 +1137,14 @@ impl HypershuntService {
             }
 
             let status = resp.status().as_u16();
-            let ms = start.elapsed().as_millis();
+            let elapsed = start.elapsed();
+            let ms = elapsed.as_millis();
             state.metrics.dec_active();
-            state.metrics.record(status, ms);
+            state.metrics.record(status, elapsed);
             state.metrics.record_path(&path);
             // Per-vhost / per-handler breakdown for routed requests.
             if let Some((vhost, kind)) = &matched_class {
-                state.metrics.record_class(*kind, vhost, status);
+                state.metrics.record_class(*kind, vhost, status, elapsed);
             }
             log_access(
                 &state, &method, &path, &resp, ms, peer, &host, &log_user,

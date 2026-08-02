@@ -607,7 +607,8 @@ pub(super) fn render_html(
     upstreams: &[UpstreamRow],
     matched_prefix: &str,
 ) -> HttpResponse {
-    let total_lat: u64 = s.latency.iter().sum();
+    let lat6 = crate::metrics::legacy6(&s.latency);
+    let total_lat: u64 = lat6.iter().sum();
     // Brand assets served from a sub-path relative to wherever the
     // status location is mounted (/, /status, /.hypershunt/status, …):
     // the wide lockup for the sidebar image, the square crop for the
@@ -936,7 +937,7 @@ pub(super) fn render_html(
         s3xx = fmt_num(s.status_3xx),
         s4xx = fmt_num(s.status_4xx),
         s5xx = fmt_num(s.status_5xx),
-        latency_bars = latency_bars_html(&s.latency, total_lat),
+        latency_bars = latency_bars_html(&lat6, total_lat),
         resource_sec = resource_sec,
         auth_sec = auth_sec,
         certs_sec = certs_sec,
@@ -1840,6 +1841,7 @@ mod tests {
             s3xx: 0,
             s4xx: 1,
             s5xx: 0,
+            ..Default::default()
         };
         let s = Snapshot {
             by_handler: vec![("static", cls)],

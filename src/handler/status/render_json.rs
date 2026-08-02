@@ -283,6 +283,9 @@ pub(super) fn render_json(
         },
     });
 
+    // Legacy 6-bucket latency shape; the fine 13-bucket histogram is
+    // published alongside under "latency_hist".
+    let lat6 = crate::metrics::legacy6(&s.latency);
     let body = serde_json::json!({
         "version":              sum.version,
         "pid":                  std::process::id(),
@@ -303,12 +306,12 @@ pub(super) fn render_json(
             "avg_15min":       s.rate_15min,
         },
         "latency_ms": {
-            "lt_1":    s.latency[0],
-            "lt_10":   s.latency[1],
-            "lt_50":   s.latency[2],
-            "lt_200":  s.latency[3],
-            "lt_1000": s.latency[4],
-            "ge_1000": s.latency[5],
+            "lt_1":    lat6[0],
+            "lt_10":   lat6[1],
+            "lt_50":   lat6[2],
+            "lt_200":  lat6[3],
+            "lt_1000": lat6[4],
+            "ge_1000": lat6[5],
         },
         "memory_kb":            s.memory_kb,
         "cpu_percent":          s.cpu_percent,
