@@ -60,9 +60,10 @@ templates makes hypershunt run the authenticator for matching
 requests even when the location has no access policy; referencing
 `{country}` triggers the GeoIP lookup the same way.
 
-Custom, request-derived variables are defined with the server-level
-[`variable`](#variable) directive and referenced with the same
-`{name}` syntax.
+Custom, request-derived variables are defined with the
+[`variable`](#variable) directive — at server, vhost, or location
+scope, inner definitions shadowing outer ones — and referenced with
+the same `{name}` syntax.
 
 ### Where templates render
 
@@ -1230,12 +1231,14 @@ vhost "internal.example.com" {
 
 ### variable
 
-**Child** of [`server`](#server).  Optional, repeatable.
+**Child** of [`server`](#server), [`vhost`](#vhost), or
+[`location`](#location).  Optional, repeatable.
 
 Defines a custom [variable](#variables), referenced anywhere
-templates render as `{<name>}`.  Names are global to the config,
-must match `[a-z][a-z0-9_]*`, and must not collide with a
-[built-in](#built-in-variables) or another definition.
+templates render as `{<name>}`.  Names must match
+`[a-z][a-z0-9_]*` and must not collide with a
+[built-in](#built-in-variables) or another definition in the
+same scope.
 
 Two forms.  The **constant** form gives the name a template value:
 
@@ -1285,6 +1288,33 @@ Notes:
 - A variable whose definition reads `{username}`/`{groups}` or
   `{country}` forces authentication / GeoIP exactly as a direct
   reference would, but only on routes that actually use it.
+
+**Scoping.**  A definition inside a `vhost` applies to every
+location under that vhost; one inside a `location` applies to that
+location only.  Redefining a name in an inner scope **shadows** the
+outer definition there — the innermost definition wins.  Redefining
+a name twice in the *same* scope is an error.
+
+Shadowing is **late-bound**: every reference on a route resolves
+against that route's innermost definitions, including references
+made *by other variable definitions*.  A server-level variable
+derived from `{tier}` re-renders through a location's override of
+`tier` on requests routed there:
+
+```kdl
+server {
+    variable "tier" "prod"
+    variable "backend" "http://{tier}.internal:8080"
+}
+vhost "staging.example.com" {
+    variable "tier" "staging"
+    // {backend} renders http://staging.internal:8080 here
+}
+```
+
+Cycles are rejected per effective scope, so an override cannot
+introduce one.  Scopes that define no variables share the outer
+scope's compiled table and add no per-request cost.
 
 ### cache (server)
 

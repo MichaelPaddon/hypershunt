@@ -164,6 +164,7 @@ impl Router {
                 &lb_registry,
                 &mut lb_pools,
                 &var_table,
+                &config.server.variables,
             )?);
             built.push(vhost);
             // Handle uniqueness is enforced by Config::validate; the
@@ -575,11 +576,34 @@ fn build_vhost(
     named_policies: &HashMap<String, Vec<PolicyRule>>,
     lb_registry: &SharedLbRegistry,
     lb_pools: &mut Vec<LbPoolEntry>,
-    var_table: &Arc<VarTable>,
+    server_table: &Arc<VarTable>,
+    server_vars: &[crate::config::VariableDef],
 ) -> anyhow::Result<VHost> {
-    let names = var_table.names();
+    // Effective table for this vhost: reuse the server table unless
+    // the vhost defines variables of its own (shadowing by name).
+    let vhost_table = if vcfg.variables.is_empty() {
+        server_table.clone()
+    } else {
+        Arc::new(VarTable::build_layered(&[
+            server_vars,
+            &vcfg.variables,
+        ])?)
+    };
     let mut locations = Vec::with_capacity(vcfg.locations.len());
     for loc in &vcfg.locations {
+        // Same again per location; most locations reuse the vhost
+        // table pointer and cost nothing.
+        let var_table = if loc.variables.is_empty() {
+            vhost_table.clone()
+        } else {
+            Arc::new(VarTable::build_layered(&[
+                server_vars,
+                &vcfg.variables,
+                &loc.variables,
+            ])?)
+        };
+        let var_table = &var_table;
+        let names = var_table.names();
         // Aggregate over every template this location can render, so
         // the listener knows up front whether to run the
         // authenticator, look up geoip, snapshot headers, or allocate

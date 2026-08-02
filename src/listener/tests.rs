@@ -2897,6 +2897,43 @@ index-file "index.html";
     }
 
     #[tokio::test]
+    async fn scoped_variables_shadow_per_vhost_and_location() {
+        // Same variable name, three scopes: the server default, a
+        // vhost override, and a location override under that vhost.
+        // The server-level derived `line` re-renders through each
+        // override (late binding).
+        let template = r#"
+            server {
+                variable "greeting" "hello"
+                variable "line" "{greeting} world"
+            }
+            listener "tcp://{addr}"
+            vhost "a.example.com" {
+                location "/" {
+                    respond status=200 body="{line}"
+                }
+            }
+            vhost "b.example.com" {
+                variable "greeting" "goodbye"
+                location "/" {
+                    respond status=200 body="{line}"
+                }
+                location "/fr/" {
+                    variable "greeting" "bonjour"
+                    respond status=200 body="{line}"
+                }
+            }
+        "#;
+        let srv = TestServer::start(template).await;
+        let (_, _, body) = srv.get("a.example.com", "/").await;
+        assert_eq!(body, "hello world");
+        let (_, _, body) = srv.get("b.example.com", "/").await;
+        assert_eq!(body, "goodbye world");
+        let (_, _, body) = srv.get("b.example.com", "/fr/").await;
+        assert_eq!(body, "bonjour world");
+    }
+
+    #[tokio::test]
     async fn variable_capture_in_redirect_target() {
         let template = r##"
             server {

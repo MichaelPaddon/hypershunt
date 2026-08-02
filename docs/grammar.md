@@ -480,6 +480,7 @@ listed in [`<l4-proxy-opt>`](#l4-proxy-opt).
 
 - `"alias"` [`<string>`](#string) ( `regex=`[`<boolean>`](#boolean) )?
 - `"alpn"` [`<string>`](#string)
+- [`<variable-def>`](#variable-def)
 - [`<location>`](#location)
 
 `alpn` is a repeating single-argument child (rule 4).
@@ -504,6 +505,7 @@ listed in [`<l4-proxy-opt>`](#l4-proxy-opt).
 - [`<rate-limit-block>`](#rate-limit-block)
 - [`<match-block>`](#match-block)
 - [`<rewrite-directive>`](#rewrite-directive)
+- [`<variable-def>`](#variable-def)
 
 ### `rate-limit-block`
 

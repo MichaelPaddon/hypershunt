@@ -12,7 +12,7 @@ use crate::headers::{BUILTIN_VARS, CaptureScope, RequestContext, Template};
 use anyhow::{anyhow, bail};
 use hyper::header::HeaderName;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 /// Index of a variable in the `VarTable`.
@@ -157,41 +157,64 @@ impl VarTable {
         }
     }
 
-    /// Compile and validate all `variable` definitions.  Errors carry
-    /// the definition's config line for the operator.
+    /// Compile and validate all `variable` definitions from one scope.
+    /// Errors carry the definition's config line for the operator.
     pub fn build(specs: &[VariableDef]) -> anyhow::Result<VarTable> {
+        Self::build_layered(&[specs])
+    }
+
+    /// Compile the effective table for a scope chain, outermost layer
+    /// first (server, then vhost, then location).  A name redefined in
+    /// an inner layer shadows the outer definition: it takes over the
+    /// same `VarId`, so references compiled anywhere in the chain
+    /// resolve to the innermost definition (late binding).  Redefining
+    /// a name twice in the *same* layer is an error.
+    pub fn build_layered(
+        layers: &[&[VariableDef]],
+    ) -> anyhow::Result<VarTable> {
         let mut names = VarNames::default();
-        for spec in specs {
-            if !valid_name(&spec.name) {
-                bail!(
-                    "line {}: invalid variable name '{}': must match \
-                     [a-z][a-z0-9_]*",
-                    spec.line,
-                    spec.name
-                );
+        // Innermost spec chosen so far for each VarId slot.
+        let mut chosen: Vec<&VariableDef> = Vec::new();
+        for layer in layers {
+            let mut seen_this_layer: HashSet<&str> = HashSet::new();
+            for spec in *layer {
+                if !valid_name(&spec.name) {
+                    bail!(
+                        "line {}: invalid variable name '{}': must \
+                         match [a-z][a-z0-9_]*",
+                        spec.line,
+                        spec.name
+                    );
+                }
+                if BUILTIN_VARS.contains(&spec.name.as_str())
+                    || RESERVED.contains(&spec.name.as_str())
+                {
+                    bail!(
+                        "line {}: variable '{}' collides with a \
+                         built-in or reserved variable name",
+                        spec.line,
+                        spec.name
+                    );
+                }
+                if !seen_this_layer.insert(&spec.name) {
+                    bail!(
+                        "line {}: duplicate variable '{}'",
+                        spec.line,
+                        spec.name
+                    );
+                }
+                match names.get(&spec.name) {
+                    Some(id) => chosen[id.0] = spec,
+                    None => {
+                        names.insert(&spec.name);
+                        chosen.push(spec);
+                    }
+                }
             }
-            if BUILTIN_VARS.contains(&spec.name.as_str())
-                || RESERVED.contains(&spec.name.as_str())
-            {
-                bail!(
-                    "line {}: variable '{}' collides with a built-in \
-                     or reserved variable name",
-                    spec.line,
-                    spec.name
-                );
-            }
-            if names.get(&spec.name).is_some() {
-                bail!(
-                    "line {}: duplicate variable '{}'",
-                    spec.line,
-                    spec.name
-                );
-            }
-            names.insert(&spec.name);
         }
 
-        let mut defs = Vec::with_capacity(specs.len());
-        for spec in specs {
+        let mut defs = Vec::with_capacity(chosen.len());
+        for spec in chosen {
             let body = compile_body(spec, &names)?;
             defs.push(VarDef {
                 name: spec.name.clone(),
@@ -929,5 +952,94 @@ mod tests {
         };
         let t = Template::compile("{lane}", table.names()).unwrap();
         assert_eq!(t.render(&ctx), "canary");
+    }
+
+    // -- layered (scoped) tables -------------------------------------
+
+    #[test]
+    fn layered_inner_definition_shadows_outer() {
+        let server =
+            [def("greeting", VariableBody::Constant("hello".into()))];
+        let location =
+            [def("greeting", VariableBody::Constant("goodbye".into()))];
+        let table =
+            VarTable::build_layered(&[&server, &location]).unwrap();
+        assert_eq!(eval_host(&table, "greeting", "x"), "goodbye");
+    }
+
+    #[test]
+    fn layered_late_binding_outer_ref_sees_inner_override() {
+        // A server-level derived variable re-renders through the
+        // inner layer's override of its input.
+        let server = [
+            def("greeting", VariableBody::Constant("hello".into())),
+            def("line", VariableBody::Constant("{greeting} world".into())),
+        ];
+        let inner =
+            [def("greeting", VariableBody::Constant("bonjour".into()))];
+        let table = VarTable::build_layered(&[&server, &inner]).unwrap();
+        assert_eq!(eval_host(&table, "line", "x"), "bonjour world");
+    }
+
+    #[test]
+    fn layered_shadow_keeps_one_slot_per_name() {
+        let server = [
+            def("a", VariableBody::Constant("1".into())),
+            def("b", VariableBody::Constant("2".into())),
+        ];
+        let inner = [def("a", VariableBody::Constant("3".into()))];
+        let table = VarTable::build_layered(&[&server, &inner]).unwrap();
+        // The shadow reuses `a`'s slot; only unique names count.
+        assert_eq!(table.new_slots().len(), 2);
+    }
+
+    #[test]
+    fn duplicate_within_one_layer_errors() {
+        let layer = [
+            def("a", VariableBody::Constant("1".into())),
+            def("a", VariableBody::Constant("2".into())),
+        ];
+        let err = VarTable::build_layered(&[&layer])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate variable 'a'"), "got: {err}");
+    }
+
+    #[test]
+    fn same_name_across_layers_is_not_a_duplicate() {
+        let outer = [def("a", VariableBody::Constant("1".into()))];
+        let inner = [def("a", VariableBody::Constant("2".into()))];
+        assert!(VarTable::build_layered(&[&outer, &inner]).is_ok());
+    }
+
+    #[test]
+    fn cycle_through_inner_override_errors() {
+        // Acyclic per layer, cyclic only in the effective table:
+        // server `a` -> `b`, inner `b` -> `a`.
+        let server = [
+            def("a", VariableBody::Constant("{b}".into())),
+            def("b", VariableBody::Constant("x".into())),
+        ];
+        let inner = [def("b", VariableBody::Constant("{a}".into()))];
+        let err = VarTable::build_layered(&[&server, &inner])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cycle"), "got: {err}");
+    }
+
+    #[test]
+    fn layered_needs_follow_the_innermost_definition() {
+        // Server derives from {country}; the inner layer overrides
+        // with a constant, so the effective table needs no geoip.
+        let server = [def(
+            "region",
+            match_body("{country}", vec![arm(None, "eu")]),
+        )];
+        let inner = [def("region", VariableBody::Constant("us".into()))];
+        let table = VarTable::build_layered(&[&server, &inner]).unwrap();
+        assert!(!table.any_needs_geoip());
+        assert!(
+            VarTable::build_layered(&[&server]).unwrap().any_needs_geoip()
+        );
     }
 }
