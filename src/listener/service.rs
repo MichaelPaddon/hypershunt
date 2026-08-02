@@ -125,6 +125,9 @@ pub struct HypershuntService {
     // Per-connection first-request signal; shared with the connection
     // loop so it can lift its time-to-first-request header timeout.
     pub(super) first_request: Arc<FirstRequest>,
+    // This listener's counters, resolved once at listener spawn so
+    // the per-request path never touches the registry lock.
+    pub(super) lmetrics: Arc<crate::metrics::ListenerMetrics>,
 }
 
 impl hyper::service::Service<Request<Incoming>> for HypershuntService {
@@ -1164,6 +1167,7 @@ impl HypershuntService {
         timeouts: Timeouts,
         max_body_bytes: Option<u64>,
         auto_alt_svc: Option<Arc<str>>,
+        lmetrics: Arc<crate::metrics::ListenerMetrics>,
     ) -> Self {
         HypershuntService {
             state,
@@ -1182,6 +1186,7 @@ impl HypershuntService {
             // stays Anonymous on this transport for v1.
             client_cert: None,
             first_request: Arc::new(FirstRequest::default()),
+            lmetrics,
         }
     }
 }

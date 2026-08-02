@@ -93,6 +93,7 @@ pub async fn run_plain(
         Arc::from(cfg.trusted_proxies.as_slice());
     let alt_svc: Option<Arc<str>> =
         cfg.auto_alt_svc.as_deref().map(Arc::from);
+    let lmetrics = state.load().metrics.listener(&name);
     tracing::info!(bind = %name, "listening (HTTP)");
     let mut connections: JoinSet<()> = JoinSet::new();
 
@@ -107,6 +108,7 @@ pub async fn run_plain(
                         // *new* connections.
                         let state       = state.load_full();
                         let bind        = name.clone();
+                        let lm          = lmetrics.clone();
                         let timeouts    = cfg.timeouts.clone();
                         let conn_shutdown = shutdown.clone();
                         let proxy_ver   = cfg.accept_proxy_protocol;
@@ -143,6 +145,7 @@ pub async fn run_plain(
                                 auto_alt_svc: alt_svc,
                                 client_cert: None,
                                 first_request: Arc::new(FirstRequest::default()),
+                                lmetrics: lm,
                             };
                             serve_connection(
                                 io, svc, conn_shutdown, peer_addr,
@@ -208,6 +211,7 @@ pub async fn run_tls(
         Arc::from(cfg.trusted_proxies.as_slice());
     let alt_svc: Option<Arc<str>> =
         cfg.auto_alt_svc.as_deref().map(Arc::from);
+    let lmetrics = state.load().metrics.listener(&name);
     tracing::info!(bind = %name, "listening (HTTPS)");
     let mut connections: JoinSet<()> = JoinSet::new();
 
@@ -218,6 +222,7 @@ pub async fn run_tls(
                     Ok((mut stream, peer_addr)) => {
                         let map = alpn_map.load_full();
                         let state = state.load_full();
+                        let lm = lmetrics.clone();
                         let bind = name.clone();
                         let svc_timeouts = cfg.timeouts.clone();
                         let conn_shutdown = shutdown.clone();
@@ -266,11 +271,15 @@ pub async fn run_tls(
                                 },
                             ).await {
                                 Ok(Ok(s)) => {
+                                    lm.tls_handshakes_total
+                                        .fetch_add(1, Ordering::Relaxed);
                                     state.metrics.tls_handshakes_total
                                         .fetch_add(1, Ordering::Relaxed);
                                     s
                                 }
                                 Ok(Err(e)) => {
+                                    lm.tls_handshake_failures_total
+                                        .fetch_add(1, Ordering::Relaxed);
                                     state.metrics
                                         .tls_handshake_failures_total
                                         .fetch_add(1, Ordering::Relaxed);
@@ -286,6 +295,8 @@ pub async fn run_tls(
                                     return;
                                 }
                                 Err(_) => {
+                                    lm.tls_handshake_timeouts_total
+                                        .fetch_add(1, Ordering::Relaxed);
                                     state.metrics
                                         .tls_handshake_timeouts_total
                                         .fetch_add(1, Ordering::Relaxed);
@@ -317,6 +328,7 @@ pub async fn run_tls(
                                 auto_alt_svc: alt_svc,
                                 client_cert,
                                 first_request: Arc::new(FirstRequest::default()),
+                                lmetrics: lm,
                             };
                             serve_connection(
                                 io, svc, conn_shutdown, peer_addr,
@@ -354,11 +366,15 @@ pub async fn run_tls(
 
 /// Decrements the live HTTP-connection gauge when a connection task
 /// ends, whatever path it takes out of `serve_connection`.
-struct HttpConnGuard(Arc<Metrics>);
+struct HttpConnGuard(
+    Arc<Metrics>,
+    Arc<crate::metrics::ListenerMetrics>,
+);
 
 impl Drop for HttpConnGuard {
     fn drop(&mut self) {
         self.0.http_conns_active.fetch_sub(1, Ordering::Relaxed);
+        self.1.conns_active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -385,7 +401,12 @@ async fn serve_connection<I>(
     // guard decrements on every exit path.
     svc.state.metrics.http_conns_total.fetch_add(1, Ordering::Relaxed);
     svc.state.metrics.http_conns_active.fetch_add(1, Ordering::Relaxed);
-    let _conn_guard = HttpConnGuard(svc.state.metrics.clone());
+    svc.lmetrics.conns_total.fetch_add(1, Ordering::Relaxed);
+    svc.lmetrics.conns_active.fetch_add(1, Ordering::Relaxed);
+    let _conn_guard = HttpConnGuard(
+        svc.state.metrics.clone(),
+        svc.lmetrics.clone(),
+    );
     debug!(%peer_addr, "accepted connection");
     let builder = make_builder(&svc.timeouts);
     // Bound the accept->first-request window so a peer can't hold a
