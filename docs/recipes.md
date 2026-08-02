@@ -395,3 +395,40 @@ vhost "app.example.com" {
 
 **See also:**
 [PROXY protocol on the receive side](guide.md#proxy-protocol-on-the-receive-side).
+
+## Prometheus scraping
+
+Expose the [`metrics`](reference.md#metrics) handler on a location
+and keep it off the public internet with a policy (or a dedicated
+internal listener):
+
+```kdl
+listener "tcp://0.0.0.0:443" { tls acme { domain "example.com" } }
+
+vhost "example.com" {
+    location "/metrics" {
+        policy { allow address "10.0.0.0/8"; deny code=403 }
+        metrics
+    }
+    location "/" { static root="/var/www/example" }
+}
+```
+
+Matching scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: hypershunt
+    metrics_path: /metrics
+    scheme: https
+    static_configs:
+      - targets: ["example.com:443"]
+```
+
+Useful first queries: request rate `rate(hypershunt_requests_total[5m])`,
+per-vhost p95 latency
+`histogram_quantile(0.95, rate(hypershunt_vhost_request_duration_seconds_bucket[5m]))`,
+upstream error ratio
+`rate(hypershunt_upstream_errors_total[5m]) / rate(hypershunt_upstream_requests_total[5m])`.
+
+**See also:** [Reference — metrics](reference.md#metrics).
