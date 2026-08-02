@@ -241,6 +241,7 @@ pub struct LbPoolEntry {
 pub type SharedLbRegistry = Arc<arc_swap::ArcSwap<Vec<LbPoolEntry>>>;
 
 /// Flattened, point-in-time view of one upstream for the renderers.
+#[derive(Default)]
 pub struct UpstreamRow {
     pub label: String,
     pub url: String,
@@ -248,6 +249,11 @@ pub struct UpstreamRow {
     pub in_flight: u32,
     pub healthy: bool,
     pub ejected: bool,
+    pub group: Option<String>,
+    pub consecutive_errors: u32,
+    pub ejected_remaining_ms: u64,
+    pub requests: u64,
+    pub errors: u64,
 }
 
 // -- Handler -------------------------------------------------------
@@ -292,6 +298,7 @@ impl StatusHandler {
         let mut rows = Vec::new();
         for entry in reg.load().iter() {
             for u in entry.pool.upstreams() {
+                let c = u.counters();
                 rows.push(UpstreamRow {
                     label: entry.label.clone(),
                     url: u.url.clone(),
@@ -299,6 +306,12 @@ impl StatusHandler {
                     in_flight: u.in_flight(),
                     healthy: u.is_healthy(),
                     ejected: u.is_ejected(now_ms),
+                    group: u.group.clone(),
+                    consecutive_errors: u.consecutive_errors(),
+                    ejected_remaining_ms: u
+                        .ejected_remaining_ms(now_ms),
+                    requests: c.requests_total,
+                    errors: c.errors_total,
                 });
             }
         }
@@ -542,6 +555,24 @@ mod tests {
         assert!(text.contains("\"rates\""));
         assert!(text.contains("\"latency_ms\""));
         assert!(text.contains("\"memory_kb\""));
+        // Legacy 6-bucket keys survive alongside the fine histogram,
+        // and both views agree on the total sample count.
+        let v: serde_json::Value =
+            serde_json::from_str(text).unwrap();
+        let l6 = &v["latency_ms"];
+        let legacy_sum: u64 = ["lt_1", "lt_10", "lt_50", "lt_200",
+                "lt_1000", "ge_1000"]
+            .iter()
+            .map(|k| l6[k].as_u64().unwrap())
+            .sum();
+        let fine_sum: u64 = v["latency_hist"]["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b.as_u64().unwrap())
+            .sum();
+        assert_eq!(legacy_sum, fine_sum);
+        assert!(v["by_listener"].is_array());
         assert!(text.contains("\"auth_failures_total\""));
         assert!(text.contains("\"sparkline\""));
         assert!(text.contains("\"top_paths\""));
@@ -1021,6 +1052,7 @@ mod tests {
             in_flight: 1,
             healthy: true,
             ejected: false,
+            ..Default::default()
         }];
         let paths: Vec<(String, u64)> = vec![];
         let resp = render_html(
@@ -1050,6 +1082,7 @@ mod tests {
             in_flight: 0,
             healthy: false,
             ejected: true,
+            ..Default::default()
         }];
         let paths: Vec<(String, u64)> = vec![];
         let resp = render_json(
