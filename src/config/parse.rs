@@ -817,6 +817,7 @@ fn parse_location(
                     | "scgi"
                     | "cgi"
                     | "status"
+                    | "metrics"
                     | "auth-request"
             )
         })

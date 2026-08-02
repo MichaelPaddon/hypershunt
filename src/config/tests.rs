@@ -3121,3 +3121,21 @@ fn vhost_unknown_node_suggests_variable() {
     .to_string();
     assert!(err.contains("did you mean 'variable'"), "{err}");
 }
+
+// -- metrics handler -------------------------------------------------
+
+#[test]
+fn metrics_handler_parses() {
+    let cfg = Config::parse(
+        r#"
+        server { }
+        listener "tcp://0.0.0.0:8080"
+        vhost "h" { location "/metrics" { metrics } }
+        "#,
+    )
+    .unwrap();
+    assert!(matches!(
+        cfg.vhosts[0].locations[0].handler,
+        HandlerConfig::Metrics
+    ));
+}

@@ -220,6 +220,7 @@ fn handler_type_name(h: &HandlerConfig) -> &'static str {
         HandlerConfig::Scgi { .. } => "scgi",
         HandlerConfig::Cgi { .. } => "cgi",
         HandlerConfig::Status => "status",
+        HandlerConfig::Metrics => "metrics",
         HandlerConfig::AuthRequest => "auth-request",
     }
 }

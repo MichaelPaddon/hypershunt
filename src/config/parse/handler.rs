@@ -44,6 +44,7 @@ pub(super) fn parse_handler(
             Ok(HandlerConfig::Cgi { root })
         }
         "status" => Ok(HandlerConfig::Status),
+        "metrics" => Ok(HandlerConfig::Metrics),
         "auth-request" => Ok(HandlerConfig::AuthRequest),
         other => bail!(
             "{name}:{line}: unknown handler '{other}' \

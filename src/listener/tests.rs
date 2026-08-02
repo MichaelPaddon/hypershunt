@@ -911,6 +911,82 @@ index-file "index.html";
         );
     }
 
+    /// The metrics handler serves Prometheus text exposition.
+    #[tokio::test]
+    async fn metrics_endpoint_serves_prometheus_text() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "example.com" {
+                location "/metrics" { metrics }
+                location "/" { respond status=200 body="ok" }
+            }
+            "#,
+        )
+        .await;
+
+        let (status, _, _) = srv.get("example.com", "/").await;
+        assert_eq!(status, 200);
+        let (status, headers, body) =
+            srv.get("example.com", "/metrics").await;
+        assert_eq!(status, 200);
+        let ct = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("text/plain"), "ct: {ct}");
+        assert!(ct.contains("version=0.0.4"), "ct: {ct}");
+        let text = std::str::from_utf8(&body).expect("utf8");
+        assert!(
+            text.contains("hypershunt_requests_total 1"),
+            "{text}"
+        );
+        assert!(text.contains(
+            "hypershunt_vhost_requests_total\
+{vhost=\"example.com\",code=\"2xx\"} 1"
+        ));
+        assert!(
+            text.contains("hypershunt_listener_requests_total"),
+        );
+        assert!(text.contains(
+            "hypershunt_request_duration_seconds_bucket"
+        ));
+    }
+
+    /// Non-GET/HEAD on the metrics endpoint returns 405.
+    #[tokio::test]
+    async fn metrics_endpoint_rejects_post() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "example.com" {
+                location "/metrics" { metrics }
+            }
+            "#,
+        )
+        .await;
+        let stream =
+            tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(io).await.unwrap();
+        tokio::spawn(conn);
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri("/metrics")
+            .header("host", "example.com")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 405);
+        assert_eq!(
+            resp.headers()
+                .get("allow")
+                .and_then(|v| v.to_str().ok()),
+            Some("GET, HEAD")
+        );
+    }
+
     /// When health is disabled, /healthz falls through to the router.
     #[tokio::test]
     async fn health_endpoint_disabled_falls_through_to_router() {

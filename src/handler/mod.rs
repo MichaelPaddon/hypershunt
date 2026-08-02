@@ -12,6 +12,7 @@ pub mod cgi;
 pub mod cgi_util;
 pub mod fcgi;
 pub mod health;
+pub mod metrics;
 pub mod proxy;
 pub mod scgi;
 pub mod static_files;
@@ -319,6 +320,11 @@ pub fn build_handler(
                 h = h.with_cert_state(cs.clone());
             }
             h = h.with_lb_registry(lb_registry.clone());
+            Ok((Arc::new(h) as Arc<dyn Handler>, None))
+        }
+        HandlerConfig::Metrics => {
+            let h = metrics::MetricsHandler::new(metrics.clone())
+                .with_lb_registry(lb_registry.clone());
             Ok((Arc::new(h) as Arc<dyn Handler>, None))
         }
         HandlerConfig::AuthRequest => Ok((

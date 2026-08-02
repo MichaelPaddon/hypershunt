@@ -722,6 +722,7 @@ fn handler_kind(h: &crate::config::HandlerConfig) -> HandlerKind {
         H::Scgi { .. } => HandlerKind::Scgi,
         H::Cgi { .. } => HandlerKind::Cgi,
         H::Status => HandlerKind::Status,
+        H::Metrics => HandlerKind::Metrics,
         H::AuthRequest => HandlerKind::AuthRequest,
     }
 }
