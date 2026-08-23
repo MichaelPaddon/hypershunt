@@ -303,6 +303,7 @@ impl HypershuntService {
                         &state, &method, &path, &resp, ms, peer, &host,
                         "-", protocol, referer.as_deref(),
                         user_agent.as_deref(),
+                        &[],
                     );
                     return Ok(resp);
                 }
@@ -334,6 +335,7 @@ impl HypershuntService {
                 log_access(
                     &state, &method, &path, &resp, ms, peer, &host, "-",
                     protocol, referer.as_deref(), user_agent.as_deref(),
+                    &[],
                 );
                 return Ok(resp);
             }
@@ -368,6 +370,7 @@ impl HypershuntService {
                 log_access(
                     &state, &method, &path, &resp, ms, peer, &host, "-",
                     protocol, referer.as_deref(), user_agent.as_deref(),
+                    &[],
                 );
                 return Ok(resp);
             }
@@ -407,6 +410,7 @@ impl HypershuntService {
                         &state, &method, &path, &resp, ms, peer, &host,
                         "-", protocol, referer.as_deref(),
                         user_agent.as_deref(),
+                        &[],
                     );
                     return Ok(resp);
                 }
@@ -441,6 +445,7 @@ impl HypershuntService {
                         &state, &method, &path, &resp, ms, peer, &host,
                         "-", protocol, referer.as_deref(),
                         user_agent.as_deref(),
+                        &[],
                     );
                     return Ok(resp);
                 }
@@ -470,6 +475,7 @@ impl HypershuntService {
                             &state, &method, &path, &resp, ms, peer,
                             &host, "-", protocol, referer.as_deref(),
                             user_agent.as_deref(),
+                            &[],
                         );
                         return Ok(resp);
                     }
@@ -500,6 +506,7 @@ impl HypershuntService {
                         &state, &method, &path, &resp, ms, peer, &host,
                         "-", protocol, referer.as_deref(),
                         user_agent.as_deref(),
+                        &[],
                     );
                     return Ok(resp);
                 }
@@ -534,6 +541,7 @@ impl HypershuntService {
                         &state, &method, &path, &resp, ms, peer, &host,
                         "-", protocol, referer.as_deref(),
                         user_agent.as_deref(),
+                        &[],
                     );
                     return Ok(resp);
                 }
@@ -704,6 +712,12 @@ impl HypershuntService {
             // attributed even for policy/rate-limit early returns.  Stays
             // `None` for unrouted requests (404), which have no vhost.
             let mut matched_class: Option<(Arc<str>, HandlerKind)> = None;
+            // Operator-declared access-log fields, rendered inside the
+            // serve future where the variable slots live and read at
+            // the log site below.  Captured the same way as
+            // `matched_class` so the handler-timeout branch, which
+            // never reaches a location, doesn't have to invent values.
+            let mut log_extra: Vec<(Arc<str>, String)> = Vec::new();
             let serve_fut = async {
                 match state.router.route(&mut req, &bind) {
                     Some(route) => {
@@ -990,6 +1004,19 @@ impl HypershuntService {
                             vars: var_scope,
                         };
 
+                        // Render the access-log fields here, before the
+                        // body-limit and rate-limit gates, so a 413 or
+                        // 429 is logged with the same classification a
+                        // served request would carry.
+                        if let Some(fields) = &route.log_fields {
+                            log_extra = fields
+                                .iter()
+                                .map(|(n, t)| {
+                                    (n.clone(), t.render(&req_ctx))
+                                })
+                                .collect();
+                        }
+
                         // Per-location max-request-body override:
                         // the listener-wide cap already ran at request
                         // entry (line ~379); this fires only when the
@@ -1219,6 +1246,7 @@ impl HypershuntService {
             log_access(
                 &state, &method, &path, &resp, ms, peer, &host, &log_user,
                 protocol, referer.as_deref(), user_agent.as_deref(),
+                &log_extra,
             );
             Ok(resp)
         }
@@ -1586,6 +1614,7 @@ fn log_access(
     protocol: &str,
     referer: Option<&str>,
     user_agent: Option<&str>,
+    extra: &[(std::sync::Arc<str>, String)],
 ) {
     let bytes_sent = resp
         .headers()
@@ -1605,6 +1634,7 @@ fn log_access(
         ms,
         referer,
         user_agent,
+        extra,
     });
 }
 

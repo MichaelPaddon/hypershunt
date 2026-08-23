@@ -189,6 +189,8 @@ suite_auth_file_reload_on_mtime
 suite_access_log_common
 suite_access_log_combined
 suite_access_log_json
+suite_access_log_fields
+suite_access_log_fields_common
 suite_reload_routing_hot_swap
 suite_reload_vhost_scoping
 suite_reload_mid_flight_download

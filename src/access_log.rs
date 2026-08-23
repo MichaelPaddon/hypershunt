@@ -10,9 +10,10 @@
 // to the operator's existing log pipeline.
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, BufWriter, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Output format for access-log lines.  `Tracing` keeps the historic
@@ -45,6 +46,12 @@ pub struct AccessLogRecord<'a> {
     pub ms: u128,
     pub referer: Option<&'a str>,
     pub user_agent: Option<&'a str>,
+    /// Operator-declared fields rendered for this request, keyed by
+    /// field name.  Empty on the pre-routing paths (ACME, health,
+    /// JWKS), which have no location and therefore no templates; the
+    /// formatters pad from the logger's configured names so the
+    /// fixed-column formats keep a stable shape.
+    pub extra: &'a [(Arc<str>, String)],
 }
 
 /// JSON shape; flat object keyed by familiar nginx/apache field names.
@@ -66,6 +73,11 @@ struct JsonRow<'a> {
     referer: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_agent: Option<&'a str>,
+    /// Operator-declared fields, flattened into the object alongside
+    /// the built-ins.  Parse-time validation rejects names that would
+    /// collide with a built-in key.
+    #[serde(flatten)]
+    extra: BTreeMap<&'a str, &'a str>,
 }
 
 /// Owns the output sink and dispatches each record through the
@@ -73,6 +85,10 @@ struct JsonRow<'a> {
 pub struct AccessLogger {
     format: AccessLogFormat,
     sink: Sink,
+    /// Configured extra field names, in declaration order.  Held here
+    /// rather than read off each record so a record that carries no
+    /// values (an unrouted request) still produces the same columns.
+    field_names: Vec<Arc<str>>,
 }
 
 enum Sink {
@@ -93,6 +109,7 @@ impl AccessLogger {
     pub fn new(
         format: AccessLogFormat,
         path: Option<&str>,
+        field_names: Vec<Arc<str>>,
     ) -> io::Result<Self> {
         let sink = match (format, path) {
             (AccessLogFormat::Tracing, _) => Sink::Tracing,
@@ -105,7 +122,11 @@ impl AccessLogger {
             }
             (_, None) => Sink::Stdout(Mutex::new(())),
         };
-        Ok(Self { format, sink })
+        Ok(Self {
+            format,
+            sink,
+            field_names,
+        })
     }
 
     /// Default-constructed logger: tracing format, no file sink.
@@ -115,6 +136,7 @@ impl AccessLogger {
         Self {
             format: AccessLogFormat::Tracing,
             sink: Sink::Tracing,
+            field_names: Vec::new(),
         }
     }
 
@@ -127,12 +149,17 @@ impl AccessLogger {
     /// access logging is best-effort and we'd rather lose a line than
     /// fail a request.
     pub fn emit(&self, r: &AccessLogRecord<'_>) {
+        let names = &self.field_names;
         match self.format {
             AccessLogFormat::Tracing => self.emit_tracing(r),
-            AccessLogFormat::Json => self.write_line(&format_json(r)),
-            AccessLogFormat::Common => self.write_line(&format_common(r)),
+            AccessLogFormat::Json => {
+                self.write_line(&format_json(r, names))
+            }
+            AccessLogFormat::Common => {
+                self.write_line(&format_common(r, names))
+            }
             AccessLogFormat::Combined => {
-                self.write_line(&format_combined(r))
+                self.write_line(&format_combined(r, names))
             }
         }
     }
@@ -140,6 +167,22 @@ impl AccessLogger {
     fn emit_tracing(&self, r: &AccessLogRecord<'_>) {
         // Cast to u64 for tracing's field type; u128 millisecond counts
         // would overflow only after ~584 million years.
+        if self.field_names.is_empty() {
+            tracing::info!(
+                peer = r.peer,
+                user = r.user,
+                host = r.host,
+                method = r.method,
+                path = r.path,
+                status = r.status,
+                ms = r.ms as u64,
+                "request"
+            );
+            return;
+        }
+        // `tracing`'s macro field names must be static, so operator
+        // fields cannot each become their own event field.  Fold them
+        // into one logfmt-style `fields` value instead.
         tracing::info!(
             peer = r.peer,
             user = r.user,
@@ -148,6 +191,7 @@ impl AccessLogger {
             path = r.path,
             status = r.status,
             ms = r.ms as u64,
+            fields = %join_extra(r, &self.field_names),
             "request"
         );
     }
@@ -196,7 +240,12 @@ pub fn build_access_log(
         AccessLogFormatConfig::Common => AccessLogFormat::Common,
         AccessLogFormatConfig::Combined => AccessLogFormat::Combined,
     };
-    let logger = AccessLogger::new(format, cfg.path.as_deref())
+    let field_names: Vec<Arc<str>> = cfg
+        .fields
+        .iter()
+        .map(|(n, _)| Arc::from(n.as_str()))
+        .collect();
+    let logger = AccessLogger::new(format, cfg.path.as_deref(), field_names)
         .with_context(|| {
             format!(
                 "opening access-log path {:?}",
@@ -206,7 +255,46 @@ pub fn build_access_log(
     Ok(std::sync::Arc::new(logger))
 }
 
-fn format_json(r: &AccessLogRecord<'_>) -> String {
+/// Value of one configured field for this record, or "" when the
+/// request never reached a location (the pre-routing paths carry no
+/// rendered values at all).
+fn extra_value<'a>(
+    r: &'a AccessLogRecord<'_>,
+    name: &str,
+) -> &'a str {
+    r.extra
+        .iter()
+        .find(|(n, _)| &**n == name)
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("")
+}
+
+/// `name=value` pairs for the tracing format, space-separated, with a
+/// value quoted only when it contains whitespace or a quote so the
+/// common case stays readable.
+fn join_extra(r: &AccessLogRecord<'_>, names: &[Arc<str>]) -> String {
+    let mut out = String::new();
+    for name in names {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(name);
+        out.push('=');
+        let v = extra_value(r, name);
+        if v.is_empty()
+            || v.contains(|c: char| c.is_whitespace() || c == '"')
+        {
+            out.push('"');
+            out.push_str(&escape_quotes(v));
+            out.push('"');
+        } else {
+            out.push_str(v);
+        }
+    }
+    out
+}
+
+fn format_json(r: &AccessLogRecord<'_>, names: &[Arc<str>]) -> String {
     let row = JsonRow {
         time: rfc3339_utc(SystemTime::now()),
         peer: r.peer,
@@ -220,12 +308,19 @@ fn format_json(r: &AccessLogRecord<'_>) -> String {
         ms: r.ms as u64,
         referer: r.referer,
         user_agent: r.user_agent,
+        // Every configured field appears on every line, so consumers
+        // see one stable schema rather than a key that vanishes on
+        // unrouted requests.
+        extra: names
+            .iter()
+            .map(|n| (&**n, extra_value(r, n)))
+            .collect::<BTreeMap<_, _>>(),
     };
     // serde_json::to_string never fails for owned/borrowed primitives.
     serde_json::to_string(&row).unwrap_or_else(|_| String::new())
 }
 
-fn format_common(r: &AccessLogRecord<'_>) -> String {
+fn format_common(r: &AccessLogRecord<'_>, names: &[Arc<str>]) -> String {
     // NCSA Common Log Format: %h %l %u %t "%r" %s %b
     // %l (ident) is always "-": RFC 1413 is dead.
     let bytes = match r.bytes_sent {
@@ -233,7 +328,7 @@ fn format_common(r: &AccessLogRecord<'_>) -> String {
         None => "-".to_string(),
     };
     let user = if r.user.is_empty() { "-" } else { r.user };
-    format!(
+    let mut line = format!(
         "{} - {} {} \"{} {} {}\" {} {}",
         r.peer,
         user,
@@ -243,19 +338,44 @@ fn format_common(r: &AccessLogRecord<'_>) -> String {
         r.protocol,
         r.status,
         bytes,
-    )
+    );
+    append_extra(&mut line, r, names);
+    line
 }
 
-fn format_combined(r: &AccessLogRecord<'_>) -> String {
-    // Common + "%{Referer}i" "%{User-agent}i".
+fn format_combined(
+    r: &AccessLogRecord<'_>,
+    names: &[Arc<str>],
+) -> String {
+    // Common + "%{Referer}i" "%{User-agent}i".  Extra fields land after
+    // the referer/agent pair, so they stay last in both formats.
     let referer = r.referer.unwrap_or("-");
     let agent = r.user_agent.unwrap_or("-");
-    format!(
+    let mut line = format!(
         "{} \"{}\" \"{}\"",
-        format_common(r),
+        format_common(r, &[]),
         escape_quotes(referer),
         escape_quotes(agent),
-    )
+    );
+    append_extra(&mut line, r, names);
+    line
+}
+
+/// Append the configured fields to a fixed-column line as quoted
+/// tokens in declaration order.  Always emits one token per configured
+/// field so the column count never varies between requests.
+fn append_extra(
+    line: &mut String,
+    r: &AccessLogRecord<'_>,
+    names: &[Arc<str>],
+) {
+    for name in names {
+        let v = extra_value(r, name);
+        let v = if v.is_empty() { "-" } else { v };
+        line.push_str(" \"");
+        line.push_str(&escape_quotes(v));
+        line.push('"');
+    }
 }
 
 /// Backslash-escape any literal `"` or `\` so a malicious or unusual
@@ -353,6 +473,7 @@ mod tests {
             ms: 7,
             referer: Some("https://ref.example/"),
             user_agent: Some("curl/8.0"),
+            extra: &[],
         }
     }
 
@@ -381,7 +502,7 @@ mod tests {
     #[test]
     fn common_format_shape() {
         let r = epoch_record();
-        let line = format_common(&r);
+        let line = format_common(&r, &[]);
         // Spot-check the field order; the bracketed timestamp varies
         // by wall clock so we anchor on the surrounding tokens.
         assert!(line.starts_with("10.0.0.1:54321 - alice ["));
@@ -391,7 +512,7 @@ mod tests {
     #[test]
     fn combined_appends_referer_and_agent() {
         let r = epoch_record();
-        let line = format_combined(&r);
+        let line = format_combined(&r, &[]);
         assert!(line.ends_with("\"https://ref.example/\" \"curl/8.0\""));
     }
 
@@ -400,14 +521,103 @@ mod tests {
         let mut r = epoch_record();
         r.referer = None;
         r.user_agent = None;
-        let line = format_combined(&r);
+        let line = format_combined(&r, &[]);
         assert!(line.ends_with("\"-\" \"-\""));
+    }
+
+    fn names(v: &[&str]) -> Vec<Arc<str>> {
+        v.iter().map(|s| Arc::from(*s)).collect()
+    }
+
+    #[test]
+    fn json_flattens_extra_fields() {
+        let mut r = epoch_record();
+        let extra = [
+            (Arc::from("tenant"), String::from("acme")),
+            (Arc::from("lane"), String::from("fast")),
+        ];
+        r.extra = &extra;
+        let line = format_json(&r, &names(&["tenant", "lane"]));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["tenant"], "acme");
+        assert_eq!(v["lane"], "fast");
+        // Built-ins are untouched by the flatten.
+        assert_eq!(v["status"], 200);
+    }
+
+    #[test]
+    fn json_emits_configured_fields_even_without_values() {
+        // An unrouted request carries no rendered values; the schema
+        // must still be stable for downstream consumers.
+        let r = epoch_record();
+        let line = format_json(&r, &names(&["tenant"]));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["tenant"], "");
+    }
+
+    #[test]
+    fn common_appends_extra_fields_in_declaration_order() {
+        let mut r = epoch_record();
+        let extra = [
+            (Arc::from("tenant"), String::from("acme")),
+            (Arc::from("lane"), String::from("fast")),
+        ];
+        r.extra = &extra;
+        let line = format_common(&r, &names(&["tenant", "lane"]));
+        assert!(
+            line.ends_with(" \"acme\" \"fast\""),
+            "got {line:?}"
+        );
+    }
+
+    #[test]
+    fn common_pads_missing_extra_with_dash() {
+        // Column count must not vary between routed and unrouted
+        // requests or an NCSA parser loses its footing.
+        let r = epoch_record();
+        let line = format_common(&r, &names(&["tenant", "lane"]));
+        assert!(line.ends_with(" \"-\" \"-\""), "got {line:?}");
+    }
+
+    #[test]
+    fn combined_puts_extra_after_referer_and_agent() {
+        let mut r = epoch_record();
+        let extra = [(Arc::from("tenant"), String::from("acme"))];
+        r.extra = &extra;
+        let line = format_combined(&r, &names(&["tenant"]));
+        assert!(
+            line.ends_with(
+                "\"https://ref.example/\" \"curl/8.0\" \"acme\""
+            ),
+            "got {line:?}"
+        );
+    }
+
+    #[test]
+    fn extra_values_are_quote_escaped() {
+        let mut r = epoch_record();
+        let extra = [(Arc::from("tenant"), String::from("a\"b"))];
+        r.extra = &extra;
+        let line = format_common(&r, &names(&["tenant"]));
+        assert!(line.ends_with(" \"a\\\"b\""), "got {line:?}");
+    }
+
+    #[test]
+    fn join_extra_quotes_only_when_needed() {
+        let mut r = epoch_record();
+        let extra = [
+            (Arc::from("tenant"), String::from("acme")),
+            (Arc::from("note"), String::from("two words")),
+        ];
+        r.extra = &extra;
+        let joined = join_extra(&r, &names(&["tenant", "note", "gone"]));
+        assert_eq!(joined, "tenant=acme note=\"two words\" gone=\"\"");
     }
 
     #[test]
     fn json_round_trips() {
         let r = epoch_record();
-        let line = format_json(&r);
+        let line = format_json(&r, &[]);
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["peer"], "10.0.0.1:54321");
         assert_eq!(v["user"], "alice");
@@ -429,7 +639,7 @@ mod tests {
         let mut r = epoch_record();
         r.referer = None;
         r.user_agent = None;
-        let line = format_json(&r);
+        let line = format_json(&r, &[]);
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert!(v.get("referer").is_none());
         assert!(v.get("user_agent").is_none());
@@ -439,7 +649,7 @@ mod tests {
     fn json_null_bytes_sent_when_unknown() {
         let mut r = epoch_record();
         r.bytes_sent = None;
-        let line = format_json(&r);
+        let line = format_json(&r, &[]);
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert!(v["bytes_sent"].is_null());
     }
@@ -449,7 +659,7 @@ mod tests {
         let mut r = epoch_record();
         r.user = "";
         r.bytes_sent = None;
-        let line = format_common(&r);
+        let line = format_common(&r, &[]);
         // " - - [" matches the no-user, no-ident token pattern.
         assert!(line.contains(" - - ["));
         assert!(line.ends_with(" 200 -"));
@@ -469,6 +679,7 @@ mod tests {
         let logger = AccessLogger::new(
             AccessLogFormat::Common,
             Some(path.to_str().unwrap()),
+            Vec::new(),
         )
         .unwrap();
         logger.emit(&epoch_record());

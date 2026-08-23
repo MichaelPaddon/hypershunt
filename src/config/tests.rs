@@ -1866,6 +1866,129 @@ fn access_log_block_parses_json_format() {
 }
 
 #[test]
+fn access_log_fields_parse_in_declaration_order() {
+    let cfg = Config::parse(
+        r#"
+        server {
+            variable "tenant" "{header:x-tenant}"
+            access-log "json" {
+                field "tenant" "{tenant}"
+                field "lane" "{header:x-lane|none}"
+            }
+}
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    let al = cfg.server.access_log.as_ref().expect("present");
+    assert_eq!(
+        al.fields,
+        vec![
+            ("tenant".to_string(), "{tenant}".to_string()),
+            ("lane".to_string(), "{header:x-lane|none}".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn access_log_without_fields_has_none() {
+    let cfg = Config::parse(
+        r#"
+        server { access-log "json" }
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    let al = cfg.server.access_log.as_ref().expect("present");
+    assert!(al.fields.is_empty());
+}
+
+#[test]
+fn access_log_rejects_duplicate_field_name() {
+    let err = Config::parse(
+        r#"
+        server {
+            access-log "json" {
+                field "tenant" "{host}"
+                field "tenant" "{path}"
+            }
+}
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("duplicate access-log field"), "{err}");
+}
+
+#[test]
+fn access_log_rejects_reserved_field_name() {
+    let err = Config::parse(
+        r#"
+        server {
+            access-log "json" { field "status" "{host}" }
+}
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("already emitted by the built-in"), "{err}");
+}
+
+#[test]
+fn access_log_rejects_bad_field_name() {
+    let err = Config::parse(
+        r#"
+        server {
+            access-log "json" { field "a b" "{host}" }
+}
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("invalid access-log field name"), "{err}");
+}
+
+#[test]
+fn access_log_rejects_unknown_child() {
+    let err = Config::parse(
+        r#"
+        server {
+            access-log "json" { fields "tenant" "{host}" }
+}
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("unknown node 'fields'"), "{err}");
+}
+
+#[test]
+fn access_log_rejects_field_with_wrong_arity() {
+    let err = Config::parse(
+        r#"
+        server {
+            access-log "json" { field "tenant" }
+}
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("exactly two arguments"), "{err}");
+}
+
+#[test]
 fn access_log_block_defaults_path_to_none() {
     use crate::config::AccessLogFormatConfig;
     let cfg = Config::parse(

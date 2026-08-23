@@ -136,3 +136,140 @@ EOF
         fi
     done
 }
+
+suite_access_log_fields() {
+    echo "=== access-log field renders template variables ==="
+
+    local logfile="$TMPDIR/access_fields.log"
+    : > "$logfile"
+
+    # `tenant` is derived from a request header, so two requests with
+    # different headers must produce two different log values -- the
+    # whole point of the feature.
+    cat >"$TMPDIR/access_fields.kdl" <<EOF
+server {
+    variable "tenant" {
+        match "{header:x-tenant}" {
+            "^acme\$"  "acme"
+            "^globex\$" "globex"
+            _          "unknown"
+        }
+    }
+    access-log "json" path="$logfile" {
+        field "tenant" "{tenant}"
+        field "lane" "{header:x-lane|none}"
+    }
+}
+listener "tcp://127.0.0.1:8293"
+vhost localhost {
+    location "/" {
+        static root="/tmp/www" {
+index-file index.html;
+}
+    }
+}
+EOF
+    start_server "$TMPDIR/access_fields.kdl" 8293 \
+        || { fail "access_log/fields/start" "hypershunt failed"; return; }
+
+    curl -s -o /dev/null --max-time 5 -H "Host: localhost" \
+        -H "X-Tenant: acme" -H "X-Lane: fast" \
+        "http://127.0.0.1:8293/" || true
+    curl -s -o /dev/null --max-time 5 -H "Host: localhost" \
+        -H "X-Tenant: globex" "http://127.0.0.1:8293/" || true
+    # Unrouted built-in endpoint: must still log, with empty fields.
+    curl -s -o /dev/null --max-time 5 -H "Host: localhost" \
+        "http://127.0.0.1:8293/healthz" || true
+
+    stop_server
+
+    local acme_line globex_line health_line
+    acme_line=$(grep '"tenant":"acme"' "$logfile" | tail -n 1)
+    globex_line=$(grep '"tenant":"globex"' "$logfile" | tail -n 1)
+    health_line=$(grep '"path":"/healthz"' "$logfile" | tail -n 1)
+
+    if [[ "$acme_line" == *'"lane":"fast"'* ]]; then
+        pass "access_log/fields/renders_per_request"
+    else
+        fail "access_log/fields/renders_per_request" \
+            "expected tenant=acme lane=fast; got: $acme_line"
+    fi
+
+    if [[ -n "$globex_line" ]]; then
+        pass "access_log/fields/varies_per_request"
+    else
+        fail "access_log/fields/varies_per_request" \
+            "no globex line in:\n$(cat "$logfile")"
+    fi
+
+    # Fallback arm: no X-Lane header on the second request.
+    if [[ "$globex_line" == *'"lane":"none"'* ]]; then
+        pass "access_log/fields/fallback_applies"
+    else
+        fail "access_log/fields/fallback_applies" \
+            "expected lane=none; got: $globex_line"
+    fi
+
+    # The pre-routing path has no location and therefore no templates,
+    # but the keys must still be present so the schema is stable.
+    if [[ "$health_line" == *'"tenant":""'* \
+            && "$health_line" == *'"lane":""'* ]]; then
+        pass "access_log/fields/unrouted_keeps_schema"
+    else
+        fail "access_log/fields/unrouted_keeps_schema" \
+            "expected empty tenant/lane; got: $health_line"
+    fi
+}
+
+suite_access_log_fields_common() {
+    echo "=== access-log fields append stable columns to common ==="
+
+    local logfile="$TMPDIR/access_fields_common.log"
+    : > "$logfile"
+
+    cat >"$TMPDIR/access_fields_common.kdl" <<EOF
+server {
+    access-log "common" path="$logfile" {
+        field "vhost" "{host}"
+        field "lane" "{header:x-lane}"
+    }
+}
+listener "tcp://127.0.0.1:8294"
+vhost localhost {
+    location "/" {
+        static root="/tmp/www" {
+index-file index.html;
+}
+    }
+}
+EOF
+    start_server "$TMPDIR/access_fields_common.kdl" 8294 \
+        || { fail "access_log/fields_common/start" "hypershunt failed"; \
+             return; }
+
+    curl -s -o /dev/null --max-time 5 -H "Host: localhost" \
+        -H "X-Lane: slow" "http://127.0.0.1:8294/" || true
+    curl -s -o /dev/null --max-time 5 -H "Host: localhost" \
+        "http://127.0.0.1:8294/healthz" || true
+
+    stop_server
+
+    local routed unrouted
+    routed=$(grep '"GET / HTTP/1.1"' "$logfile" | tail -n 1)
+    unrouted=$(grep '"GET /healthz HTTP/1.1"' "$logfile" | tail -n 1)
+
+    if [[ "$routed" == *' "localhost" "slow"' ]]; then
+        pass "access_log/fields_common/appends_values"
+    else
+        fail "access_log/fields_common/appends_values" \
+            "expected trailing \"localhost\" \"slow\"; got: $routed"
+    fi
+
+    # Same column count on a line that never reached a location.
+    if [[ "$unrouted" == *' "-" "-"' ]]; then
+        pass "access_log/fields_common/pads_unrouted"
+    else
+        fail "access_log/fields_common/pads_unrouted" \
+            "expected trailing \"-\" \"-\"; got: $unrouted"
+    fi
+}

@@ -72,8 +72,9 @@ Templated today: [`request-headers` / `response-headers`
 to=`](#to-redirect), [`respond body=`](#body-respond),
 [`cache key=`](#cache-location), [`policy redirect
 to=`](#policy-location), [`try-files`](#try-files),
-[`fallback-redirect`](#fallback-redirect), and [`proxy
-group-by`](#group-by).
+[`fallback-redirect`](#fallback-redirect), [`proxy
+group-by`](#group-by), and [`access-log field`](#field-access-log)
+values.
 
 Two look-alikes are **not** request templates: [`rewrite`](#rewrite)
 `to=` uses regex `$1`/`$name` capture replacement, and the LDAP
@@ -1386,9 +1387,61 @@ SIGHUP, so log rotation can rename-and-signal in the usual style.
 server { access-log "combined" path="/var/log/hypershunt/access.log" }
 ```
 
+A child block of [`field`](#field-access-log) nodes adds
+request-derived values to every line.
+
+```kdl
+server {
+    variable "tenant" "{header:x-tenant}"
+    access-log "json" path="/var/log/hypershunt/access.log" {
+        field "tenant" "{tenant}"
+        field "lane" "{header:x-lane|none}"
+    }
+}
+```
+
 ##### path (access-log)
 
 **Property** on [`access-log`](#access-log).
+
+##### field (access-log)
+
+**Child** of [`access-log`](#access-log).  Repeatable.
+
+Adds one operator-named field to every access-log line.  The first
+argument is the field name; the second is a template (see
+[Variables](#variables)) rendered per request.
+
+Templates are compiled against the scope of the matched
+[`location`](#location), so a `variable` shadowed at vhost or
+location level renders that scope's value even though `access-log`
+itself is declared once at server level.  A field referencing
+`{username}`, `{groups}` or `{country}` makes hypershunt resolve the
+identity or run the GeoIP lookup for matching requests, exactly as
+the same reference does anywhere else.
+
+Field names take ASCII letters, digits, `_` and `-`.  A name that
+duplicates another field, or that collides with a field the built-in
+formats already emit (`time`, `peer`, `user`, `host`, `method`,
+`path`, `protocol`, `status`, `bytes_sent`, `ms`, `referer`,
+`user_agent`), is rejected at startup.
+
+How the values appear depends on the format:
+
+| Format | Rendering |
+|---|---|
+| `json` | Extra keys in the object, one per declared field. |
+| `common`, `combined` | Quoted tokens appended in declaration order, after the standard fields.  `"-"` marks a value that rendered empty. |
+| `tracing` | One extra event field, `fields`, holding `name=value` pairs.  `tracing` requires static field names, so the declared names cannot each become their own event field. |
+
+Every declared field appears on every line, including requests that
+never reach a location (built-in endpoints such as `/healthz` and
+`/.well-known/jwks.json`, and unmatched hosts).  Those lines render
+the fields empty rather than omitting them, so the column count and
+JSON shape stay constant for downstream parsers.
+
+Each declared field is one more value rendered per request; declare
+the ones you intend to query, not everything that might be useful.
 
 ---
 
