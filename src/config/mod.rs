@@ -217,7 +217,32 @@ pub struct AccessLogConfig {
     /// text/JSON formats; ignored for `Tracing` (always goes through
     /// the global tracing subscriber).
     pub path: Option<String>,
+    /// Extra operator-declared fields, as `(name, raw template)` pairs
+    /// in declaration order.  The templates are compiled per location
+    /// by the router, against that location's variable table, so
+    /// vhost- and location-scoped `variable` definitions resolve the
+    /// same way they do everywhere else.
+    pub fields: Vec<(String, String)>,
 }
+
+/// Record keys the built-in formatters already emit.  An operator
+/// field may not shadow one: JSON would end up with a duplicate key
+/// and the fixed-column formats would silently gain a column with a
+/// familiar name but different meaning.
+pub const ACCESS_LOG_RESERVED_FIELDS: &[&str] = &[
+    "time",
+    "peer",
+    "user",
+    "host",
+    "method",
+    "path",
+    "protocol",
+    "status",
+    "bytes_sent",
+    "ms",
+    "referer",
+    "user_agent",
+];
 
 /// Mirror of `crate::access_log::AccessLogFormat`.  Kept separate so
 /// the config crate doesn't depend on the runtime module.

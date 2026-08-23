@@ -2338,6 +2338,38 @@ server { access-log "combined" path="/var/log/hypershunt/access.log" }
 - `"json"` — one JSON object per line (ndjson).  Easy to feed
   into Loki, Elasticsearch, or jq.
 
+### Extra fields
+
+Anything you can express as a [template](reference.md#variables) can
+become its own log field.  This is the payoff for classifying
+requests with [`variable`](reference.md#variable): the classification
+lands in the log instead of only steering behaviour.
+
+```kdl
+server {
+    variable "tenant" {
+        match "{host}" {
+            "^(.+)\.customers\.example$"  "{1}"
+            _                             "internal"
+        }
+    }
+    access-log "json" path="/var/log/hypershunt/access.log" {
+        field "tenant" "{tenant}"
+        field "lane" "{header:x-lane|none}"
+    }
+}
+```
+
+Each [`field`](reference.md#field-access-log) is rendered per request
+and appears in every line -- as a JSON key, as a trailing quoted
+column in `common`/`combined`, or folded into a `fields` value under
+`tracing`.  Requests answered before routing (`/healthz` and friends)
+log the fields empty rather than dropping them, so the shape never
+varies.
+
+Fields resolve in the scope of the matched location, so a variable
+shadowed per vhost or per location logs that scope's value.
+
 ### Log rotation
 
 For file-backed formats, hypershunt reopens the log file on SIGHUP --

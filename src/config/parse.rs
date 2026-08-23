@@ -378,7 +378,71 @@ fn parse_access_log(
         ),
     };
     let path = prop_str(node, "path");
-    Ok(AccessLogConfig { format, path })
+    let fields = parse_access_log_fields(node, src, name)?;
+    Ok(AccessLogConfig {
+        format,
+        path,
+        fields,
+    })
+}
+
+// Parse the optional `field "<name>" "<template>"` children of
+// `access-log`.  Names are validated here rather than at render time
+// so a typo fails startup instead of producing a log column nobody
+// notices is empty.
+fn parse_access_log_fields(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let children = node.children().map(|d| d.nodes()).unwrap_or_default();
+    let mut fields: Vec<(String, String)> = Vec::new();
+    for child in children {
+        let cl = node_line(src, child);
+        let cn = child.name().value();
+        if cn != "field" {
+            bail!(
+                "{name}:{cl}: unknown node '{cn}' in access-log{}",
+                did_you_mean(cn, &["field"])
+            );
+        }
+        let args = arg_strs(child);
+        let [field_name, template] = args.as_slice() else {
+            bail!(
+                "{name}:{cl}: access-log field takes exactly two \
+                 arguments: a name and a template, e.g. \
+                 `field \"tenant\" \"{{tenant}}\"`"
+            );
+        };
+        if field_name.is_empty()
+            || !field_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            bail!(
+                "{name}:{cl}: invalid access-log field name \
+                 {field_name:?}; use ASCII letters, digits, '_' \
+                 or '-'"
+            );
+        }
+        if crate::config::ACCESS_LOG_RESERVED_FIELDS
+            .contains(&field_name.as_str())
+        {
+            bail!(
+                "{name}:{cl}: access-log field name {field_name:?} \
+                 is already emitted by the built-in formats; pick \
+                 another name"
+            );
+        }
+        if fields.iter().any(|(n, _)| n == field_name) {
+            bail!(
+                "{name}:{cl}: duplicate access-log field \
+                 {field_name:?}"
+            );
+        }
+        fields.push((field_name.clone(), template.clone()));
+    }
+    Ok(fields)
 }
 
 // Parse an octal file-mode string such as "0640" or "0o640".

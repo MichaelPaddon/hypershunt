@@ -1496,6 +1496,103 @@
         assert!(vars.needs.uses_vars);
     }
 
+    // -- access-log fields --------------------------------------------
+
+    fn route_log_fields(
+        router: &Router,
+        host: &str,
+        path: &str,
+        bind: &str,
+    ) -> Option<LogFields> {
+        let vhost = router.resolve_vhost(Some(host), bind)?;
+        vhost
+            .locations
+            .iter()
+            .filter(|loc| path.starts_with(loc.path.as_str()))
+            .max_by_key(|loc| loc.path.len())
+            .and_then(|loc| loc.log_fields.clone())
+    }
+
+    #[test]
+    fn access_log_field_absorbs_variable_needs() {
+        // The field is declared server-wide but must still make this
+        // location resolve a principal, or it would log an empty user
+        // classification with no hint as to why.
+        let config = make_config(
+            r#"
+            server {
+                access-log "json" {
+                    field "who" "{username}"
+                }
+            }
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/" { static root="." }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        let vars = route_vars(&router, "a.com", "/", "tcp://0.0.0.0:80")
+            .expect("route must carry var machinery");
+        assert!(vars.needs.principal);
+    }
+
+    #[test]
+    fn access_log_field_compiles_against_location_scope() {
+        // `tier` is shadowed at the location; the field must render the
+        // location's value, not the server's.
+        let config = make_config(
+            r#"
+            server {
+                variable "tier" "prod"
+                access-log "json" {
+                    field "tier" "{tier}"
+                }
+            }
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/edge/" {
+                    variable "tier" "edge"
+                    static root="."
+                }
+                location "/" { static root="." }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        let render = |path: &str| {
+            let fields =
+                route_log_fields(&router, "a.com", path, "tcp://0.0.0.0:80")
+                    .expect("field configured");
+            let vars =
+                route_vars(&router, "a.com", path, "tcp://0.0.0.0:80")
+                    .expect("var machinery");
+            let slots = vars.table.new_slots();
+            let ctx = crate::headers::RequestContext {
+                vars: crate::vars::VarScope::new(&vars.table, &slots),
+                ..crate::headers::RequestContext::empty()
+            };
+            fields[0].1.render(&ctx)
+        };
+        assert_eq!(render("/edge/"), "edge");
+        assert_eq!(render("/"), "prod");
+    }
+
+    #[test]
+    fn no_access_log_fields_means_no_per_route_cost() {
+        let config = make_config(
+            r#"
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" { location "/" { static root="." } }
+            "#,
+        );
+        let router = make_router(&config);
+        assert!(
+            route_log_fields(&router, "a.com", "/", "tcp://0.0.0.0:80")
+                .is_none()
+        );
+    }
+
     // -- scoped variables (vhost / location layers) ------------------
 
     #[test]

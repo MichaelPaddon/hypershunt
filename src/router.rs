@@ -22,6 +22,11 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Compiled access-log fields for one location: field name paired with
+/// its template, in declaration order.  Shared by `Arc` so routing a
+/// request clones a pointer rather than the templates.
+pub type LogFields = Arc<Vec<(Arc<str>, Template)>>;
+
 pub struct Route {
     pub handler: Arc<dyn Handler>,
     pub matched_prefix: String,
@@ -48,6 +53,10 @@ pub struct Route {
     /// route can render; `None` when they are all static (the common
     /// case, zero per-request overhead).
     pub vars: Option<Arc<RouteVars>>,
+    /// Operator-declared access-log fields, compiled against this
+    /// location's variable table.  `None` when the server declares
+    /// none, which is the common case.
+    pub log_fields: Option<LogFields>,
 }
 
 // Runtime representation of a virtual host, with handlers pre-built.
@@ -86,6 +95,8 @@ struct Location {
     cache_policy: Option<Arc<crate::cache::CachePolicy>>,
     // See Route::vars.
     vars: Option<Arc<RouteVars>>,
+    // See Route::log_fields.
+    log_fields: Option<LogFields>,
 }
 
 /// Runtime rewrite: compiled regex plus its replacement template.
@@ -137,6 +148,16 @@ impl Router {
         let var_table =
             Arc::new(VarTable::build(&config.server.variables)?);
 
+        // Operator-declared access-log fields, compiled once per
+        // location below so each resolves against that location's
+        // variable scope.
+        let access_log_fields: &[(String, String)] = config
+            .server
+            .access_log
+            .as_ref()
+            .map(|c| c.fields.as_slice())
+            .unwrap_or(&[]);
+
         // Inline all named policies first so location blocks can reference
         // them via apply.
         let named_policies = resolve_named_policies(&config.server.policies)?;
@@ -165,6 +186,7 @@ impl Router {
                 &mut lb_pools,
                 &var_table,
                 &config.server.variables,
+                access_log_fields,
             )?);
             built.push(vhost);
             // Handle uniqueness is enforced by Config::validate; the
@@ -273,6 +295,7 @@ impl Router {
                 max_request_body: loc.max_request_body,
                 cache_policy: loc.cache_policy.clone(),
                 vars: loc.vars.clone(),
+                log_fields: loc.log_fields.clone(),
             });
         }
         tracing::warn!(
@@ -578,6 +601,7 @@ fn build_vhost(
     lb_pools: &mut Vec<LbPoolEntry>,
     server_table: &Arc<VarTable>,
     server_vars: &[crate::config::VariableDef],
+    log_fields: &[(String, String)],
 ) -> anyhow::Result<VHost> {
     // Effective table for this vhost: reuse the server table unless
     // the vhost defines variables of its own (shadowing by name).
@@ -681,6 +705,23 @@ fn build_vhost(
                 Ok::<_, anyhow::Error>(Arc::new(p))
             })
             .transpose()?;
+        // Access-log fields are server-wide but compile per location
+        // so they see this location's scope, and so their `absorb`
+        // calls fold into the same needs analysis that decides whether
+        // the listener runs the authenticator or the GeoIP lookup.
+        let log_fields = if log_fields.is_empty() {
+            None
+        } else {
+            let compiled = log_fields
+                .iter()
+                .map(|(fname, raw)| {
+                    let t = Template::compile(raw, names)?;
+                    needs.absorb(&t, var_table);
+                    Ok::<_, anyhow::Error>((Arc::from(fname.as_str()), t))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Some(Arc::new(compiled))
+        };
         let vars = needs.any().then(|| {
             Arc::new(RouteVars {
                 table: var_table.clone(),
@@ -696,6 +737,7 @@ fn build_vhost(
             header_rules,
             rate_limits,
             max_request_body: loc.max_request_body,
+            log_fields,
             matcher,
             rewrite,
             cache_policy,

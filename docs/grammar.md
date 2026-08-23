@@ -242,8 +242,19 @@ last); the single argument is the value template.
 
 ### `access-log-block`
 
-`"access-log"` [`<access-log-format>`](#access-log-format) (
-`path=`[`<string>`](#string) )?
+- `"access-log"` [`<access-log-format>`](#access-log-format) (
+  `path=`[`<string>`](#string) )?
+- `"access-log"` [`<access-log-format>`](#access-log-format) (
+  `path=`[`<string>`](#string) )? `{`
+  [`<access-log-field>`](#access-log-field)* `}`
+
+### `access-log-field`
+
+`"field"` [`<string>`](#string) [`<string>`](#string)
+
+The first argument is the field name (ASCII letters, digits, `_` or
+`-`, and not one of the built-in field names); the second is the
+value template.
 
 ### `access-log-format`
 
