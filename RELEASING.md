@@ -67,19 +67,26 @@ container images.
 1. Edit `Cargo.toml` — set the new `version`.
 2. Update the date in `docs/hypershunt.1` (`.TH ... "YYYY-MM-DD" ...`).
 3. Update the version in the `README.md` status line (`> **Status:**
-   ... (currently X.Y.Z)`).
-4. Regenerate the man page and manual:
+   stable — X.Y.Z.`).
+4. Regenerate the man page and manual, which also refreshes the
+   `hypershunt` entry in `Cargo.lock`:
 
    ```sh
    cargo build
    ```
 
-5. Commit the bump (include all four files):
+5. Commit the bump (all four files):
 
    ```sh
-   git add Cargo.toml docs/hypershunt.1 docs/manual.md README.md
+   git add Cargo.toml Cargo.lock docs/hypershunt.1 README.md
    git commit -m "release: bump version to X.Y.Z"
    ```
+
+   `docs/manual.md` is not in that list: pandoc drops the `.TH`
+   footer, so the mirror carries no version string and a bump alone
+   never changes it.  `Cargo.lock` is: it pins the crate's own
+   version, and leaving it stale makes the next `cargo build` dirty
+   the tree.
 
 6. Tag and push:
 

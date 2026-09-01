@@ -54,15 +54,18 @@ fn resolve_ids(
     user: &str,
     group: Option<&str>,
 ) -> anyhow::Result<(Uid, Gid)> {
-    // Look up the target user in the system user database.
+    // Both arms name the offending entry: an NSS backend that is
+    // unreachable (or that reports a miss as an errno, as SSSD does)
+    // fails the lookup outright rather than returning a clean miss,
+    // and the operator needs the name either way to spot the typo.
     let pw = User::from_name(user)
-        .context("looking up user")?
+        .with_context(|| format!("looking up user '{user}'"))?
         .ok_or_else(|| anyhow::anyhow!("user '{user}' not found"))?;
 
     // Resolve target GID: explicit group name or user's primary GID.
     let gid: Gid = if let Some(name) = group {
         Group::from_name(name)
-            .context("looking up group")?
+            .with_context(|| format!("looking up group '{name}'"))?
             .ok_or_else(|| anyhow::anyhow!("group '{name}' not found"))?
             .gid
     } else {
@@ -171,12 +174,18 @@ mod tests {
         assert_eq!(gid, group.gid);
     }
 
+    // These assert on the *name* rather than on "not found": whether
+    // an absent entry surfaces as a clean miss or as a failed lookup
+    // depends on the host's nsswitch backends (SSSD reports a miss as
+    // an errno), and both are rejections.  The name is what the
+    // operator needs, so that is the contract worth pinning.
+
     #[test]
     fn resolve_ids_rejects_unknown_user() {
         let err = resolve_ids("no-such-user-zz", None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not found"), "got: {err}");
+        assert!(err.contains("no-such-user-zz"), "got: {err}");
     }
 
     #[test]
@@ -185,6 +194,6 @@ mod tests {
         let err = resolve_ids(&me.name, Some("no-such-group-zz"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not found"), "got: {err}");
+        assert!(err.contains("no-such-group-zz"), "got: {err}");
     }
 }
