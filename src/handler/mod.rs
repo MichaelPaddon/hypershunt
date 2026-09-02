@@ -209,6 +209,7 @@ pub fn build_handler(
             pool_max_idle,
             upstream_tls,
             connect_timeout_secs,
+            grpc,
         } => {
             let skip_verify =
                 upstream_tls.as_ref().map(|t| t.skip_verify).unwrap_or(false);
@@ -234,6 +235,7 @@ pub fn build_handler(
                 *pool_max_idle,
                 skip_verify,
                 *connect_timeout_secs,
+                grpc.clone(),
                 metrics.clone(),
             )?;
             // Active health-check task: spawn one per pool when

@@ -38,6 +38,23 @@ QUIC is a UDP-based transport with built-in TLS 1.3; HTTP/3 is HTTP
 carried over QUIC.  hypershunt serves HTTP/3 on `udp://` listeners; see
 [HTTP/3](guide.md#http3).
 
+## h2c
+
+HTTP/2 over cleartext TCP.  Because there is no TLS handshake there is
+no [ALPN](#alpn) to negotiate with, so both ends must simply know the
+connection is HTTP/2 ("prior knowledge").  hypershunt speaks h2c to an
+`http://` upstream when the proxy sets
+[`scheme="h2c"`](reference.md#scheme) or a
+[`grpc`](reference.md#grpc) block.
+
+## gRPC
+
+An RPC protocol carried over HTTP/2, in which the call's outcome is
+delivered as a `grpc-status` **trailer** rather than an HTTP status
+code.  It has no HTTP/1.1 wire format, so proxying it requires HTTP/2
+end to end plus trailer passthrough; see
+[gRPC](guide.md#grpc).
+
 ## mTLS
 
 *Mutual TLS* — TLS where the **client** also presents a certificate, so

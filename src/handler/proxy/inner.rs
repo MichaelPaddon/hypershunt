@@ -20,7 +20,7 @@ use http_body_util::BodyExt;
 use hyper_rustls::ConfigBuilderExt;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -166,6 +166,7 @@ impl InnerProxyClient {
         pool_max_idle: Option<u32>,
         skip_verify: bool,
         connect_timeout_secs: Option<u64>,
+        grpc: Option<&crate::config::GrpcConfig>,
     ) -> anyhow::Result<Self> {
         let connect_timeout =
             connect_timeout_secs.map(std::time::Duration::from_secs);
@@ -175,8 +176,43 @@ impl InnerProxyClient {
         let pool_idle =
             pool_idle_timeout_secs.map(std::time::Duration::from_secs);
         let mut http_builder = Client::builder(TokioExecutor::new());
+        // A timer is required for the HTTP/2 keepalive PINGs below;
+        // without one hyper-util silently never fires them.
+        http_builder.timer(TokioTimer::new());
         if let Some(d) = pool_idle {
             http_builder.pool_idle_timeout(d);
+        }
+        // gRPC has no HTTP/1.1 wire format, and `scheme="h2c"` is an
+        // explicit request for prior-knowledge h2.  Both pin the
+        // client to HTTP/2: over TLS that just fixes what ALPN would
+        // have negotiated, and over cleartext it is the only way to
+        // reach an h2c backend, since a plaintext connection has no
+        // ALPN to negotiate with.
+        let force_h2 = grpc.is_some()
+            || scheme == crate::config::ProxyUpstreamScheme::H2c;
+        if force_h2 {
+            http_builder.http2_only(true);
+        }
+        // HTTP/2 keepalive PINGs.  A long-lived streaming RPC can sit
+        // silent for minutes, which is long enough for a NAT or an
+        // idle-timing middlebox to drop the connection without either
+        // end noticing until the next write fails.  Off unless the
+        // operator asks: pinging a backend that never asked for it is
+        // worse than the status quo.
+        if let Some(g) = grpc {
+            if let Some(secs) = g.keepalive_interval_secs {
+                http_builder.http2_keep_alive_interval(
+                    std::time::Duration::from_secs(secs),
+                );
+            }
+            if let Some(secs) = g.keepalive_timeout_secs {
+                http_builder.http2_keep_alive_timeout(
+                    std::time::Duration::from_secs(secs),
+                );
+            }
+            if g.keepalive_while_idle {
+                http_builder.http2_keep_alive_while_idle(true);
+            }
         }
         if let Some(n) = pool_max_idle {
             http_builder.pool_max_idle_per_host(n as usize);

@@ -730,8 +730,9 @@ connection, forwards the request, and streams the response back.
 
 [`upstream`](reference.md#upstream) accepts `http://`, `https://`,
 or `unix-stream:/path`.  HTTP/2 over plaintext (`h2c`) is
-available via [`scheme="h2c"`](reference.md#scheme); HTTP/3 over
-QUIC via `scheme="h3"` (https only).
+available via [`scheme="h2c"`](reference.md#scheme), or implied
+by a [`grpc`](#grpc) block; HTTP/3 over QUIC via `scheme="h3"`
+(https only).
 
 ```kdl
 proxy { upstream "https://api.example.com" }
@@ -770,7 +771,10 @@ location "/api/" {
 
 Hypershunt automatically strips hop-by-hop headers (`Connection`,
 `Keep-Alive`, `Transfer-Encoding`, etc.) — the upstream sees a
-clean HTTP/1.1+ message.
+clean HTTP/1.1+ message.  One value survives the hop: `TE:
+trailers`, which HTTP/2 explicitly permits and which trailer-using
+protocols (gRPC among them) need.  Response trailers are likewise
+passed straight through.
 
 ### Path handling
 
@@ -787,6 +791,47 @@ location "/api/v1/" {
     proxy strip-prefix=#true { upstream "http://api:9000" }
 }
 ```
+
+### gRPC
+
+Add a [`grpc`](reference.md#grpc) child to mark the pool as a gRPC
+backend:
+
+```kdl
+location "/pkg.Service/" {
+    proxy {
+        upstream "http://grpc1.internal:9000"
+        upstream "http://grpc2.internal:9000"
+        grpc keepalive-interval=30 keepalive-timeout=10
+    }
+}
+```
+
+The node is the opt-in, and it exists because the protocol cannot
+be guessed early enough: gRPC has no HTTP/1.1 wire format, and a
+plaintext connection has no ALPN to negotiate with, so without it
+an `http://` upstream is reached over HTTP/1.1 and every RPC
+fails.  With it, hypershunt speaks prior-knowledge h2c to
+`http://` upstreams and ALPN-pinned h2 to `https://` ones.
+
+Everything else about the location works unchanged: load
+balancing, health checks, `strip-prefix`, access policy, rate
+limits.  Three combinations are rejected at startup rather than
+failing mysteriously at runtime:
+
+- [`retry max`](reference.md#max-retry) > 0 -- retry buffers the
+  whole request body so it can be replayed, and a client-streaming
+  RPC never finishes sending one.
+- [`proxy-protocol=`](reference.md#proxy-protocol) -- that upstream
+  path speaks HTTP/1.1 only.
+- [`scheme="h3"`](reference.md#scheme) -- gRPC over HTTP/3 is not
+  supported.
+
+Long-lived streaming RPCs can sit silent long enough for a NAT or
+an idle-timing middlebox to drop the connection with neither end
+noticing.  `keepalive-interval` sends HTTP/2 PINGs to hold it open
+and to detect a dead peer; `keepalive-timeout` bounds the wait for
+the acknowledgement.  Both are off unless you set them.
 
 **See also:** [Load balancing](#load-balancing), [Health
 checks](#health-checks), [Retries](#retries),
