@@ -16,8 +16,9 @@ use crate::auth::{Authenticator, Principal};
 use crate::compress;
 use crate::config::Timeouts;
 use crate::error::{
-    BoxBody, ReqBody, bytes_body, response_404, response_413, response_429,
-    response_503_retry, response_redirect, response_status, response_www_auth,
+    BoxBody, ReqBody, bytes_body, response_400, response_404, response_413,
+    response_429, response_503_retry, response_redirect, response_status,
+    response_www_auth,
 };
 use crate::geoip;
 use crate::metrics::HandlerKind;
@@ -175,6 +176,23 @@ impl HypershuntService {
         self,
         mut req: Request<ReqBody>,
     ) -> Result<Response<BoxBody>, anyhow::Error> {
+        if normalize_host(&mut req).is_err() {
+            // Logged rather than access-logged: the request never
+            // reaches routing, so there is no vhost or location to
+            // attribute it to -- the same shape as the oversized-body
+            // rejection below.
+            tracing::warn!(
+                peer = %self.peer_addr,
+                authority = ?req.uri().authority().map(|a| a.as_str()),
+                host = ?req
+                    .headers()
+                    .get(hyper::header::HOST)
+                    .and_then(|v| v.to_str().ok()),
+                "rejecting malformed request: Host disagrees with \
+                 :authority"
+            );
+            return Ok(response_400());
+        }
         let state = self.state.clone();
         let lmetrics = self.lmetrics.clone();
         let bind = self.bind.clone();
@@ -566,7 +584,7 @@ impl HypershuntService {
                         );
                         None
                     }
-                    // Valid signature but past exp — count separately from
+                    // Valid signature but past exp: count separately from
                     // bad-signature failures so operators can distinguish
                     // normal session expiry from token tampering.
                     Some(crate::jwt::JwtResult::Expired) => {
@@ -1378,7 +1396,7 @@ async fn serve_with_cache(
         }
         Lookup::Miss => {
             if rcc.only_if_cached {
-                // RFC 9111 §5.2.1.7: nothing cached, so do not contact
+                // RFC 9111 s.5.2.1.7: nothing cached, so do not contact
                 // the origin -- answer 504.
                 metrics.cache_misses.fetch_add(1, Relaxed);
                 let mut r = Response::new(bytes_body(Bytes::from_static(
@@ -1638,6 +1656,64 @@ fn log_access(
     });
 }
 
+/// An HTTP/2 or HTTP/3 request whose `Host` header disagrees with
+/// its `:authority`.  The two name different targets, so there is no
+/// safe way to pick one: whichever this proxy chose, a downstream hop
+/// could choose the other.
+pub(super) struct HostMismatch;
+
+/// Reconcile the host the client asked for into the `Host` header.
+///
+/// HTTP/1.1 carries it in `Host`, but HTTP/2 and HTTP/3 carry it in
+/// the `:authority` pseudo-header, which hyper surfaces on the URI
+/// instead.  Everything downstream reads the header -- vhost
+/// resolution in `router.rs`, the `{host}` template variable, the
+/// access log -- so without the copy an h2 or h3 request looks like
+/// it named no host at all and falls back to the listener's default
+/// vhost.
+///
+/// The authority keeps any port, which `router.rs` strips before
+/// matching, exactly as it does for an h1 `Host` header.
+///
+/// When an h2/h3 request carries both, they must agree: RFC 9113
+/// s.8.3.1 and RFC 9114 s.4.3.1 require a server to treat a mismatch
+/// as malformed.  Comparison is ASCII case-insensitive, since host
+/// names are.
+///
+/// HTTP/1.1 is deliberately exempt.  A request in absolute form
+/// legitimately carries both, and RFC 9112 s.3.2.2 has the server
+/// ignore `Host` there rather than reject the request -- so the
+/// existing header is left to win, and h1 behaviour is unchanged.
+fn normalize_host<B>(req: &mut Request<B>) -> Result<(), HostMismatch> {
+    let Some(authority) = req.uri().authority().cloned() else {
+        return Ok(());
+    };
+    match req.headers().get(hyper::header::HOST) {
+        Some(host) => {
+            let strict = matches!(
+                req.version(),
+                hyper::Version::HTTP_2 | hyper::Version::HTTP_3
+            );
+            if strict
+                && !host
+                    .as_bytes()
+                    .eq_ignore_ascii_case(authority.as_str().as_bytes())
+            {
+                return Err(HostMismatch);
+            }
+            Ok(())
+        }
+        None => {
+            if let Ok(v) =
+                hyper::header::HeaderValue::from_str(authority.as_str())
+            {
+                req.headers_mut().insert(hyper::header::HOST, v);
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Stringify a hyper HTTP version into the `HTTP/x.y` token used in
 /// NCSA-style access logs.  hyper's `Debug` impl already emits that
 /// shape but we resolve it explicitly so callers don't depend on a
@@ -1683,10 +1759,13 @@ fn record_compression(
 
 #[cfg(test)]
 mod tests {
-    use super::FirstRequest;
-    use super::presented_credentials;
+    use super::normalize_host;
+    use super::{FirstRequest, presented_credentials};
+    use bytes::Bytes;
     use hyper::HeaderMap;
     use hyper::header::{AUTHORIZATION, COOKIE, HeaderValue};
+    use hyper::Request;
+    use std::net::SocketAddr;
 
     #[tokio::test]
     async fn first_request_signal_before_wait_returns_immediately() {
@@ -1873,6 +1952,166 @@ mod tests {
     // early-return branches are exercised against a real HTTP round
     // trip rather than mocked in isolation.
     use crate::test::TestServer;
+
+    // -- vhost selection across protocols --------------------------
+
+    /// Send a request over HTTP/2 with the given `:authority` and
+    /// return the response body.  Deliberately sends no `Host`
+    /// header: that is what an HTTP/2 client does, and it is what
+    /// made this fail before the authority backfill existed.
+    async fn h2_body(addr: SocketAddr, authority: &str, path: &str) -> Bytes {
+        use http_body_util::{BodyExt as _, Empty};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        let uri = format!("http://{authority}{path}");
+        let req = Request::builder()
+            .uri(uri)
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+        let resp = sender.send_request(req).await.expect("request");
+        resp.into_body().collect().await.unwrap().to_bytes()
+    }
+
+    const TWO_VHOSTS: &str = r#"
+        listener "tcp://{addr}"
+        vhost "a.example" { location "/" { respond status=200 body="a" } }
+        vhost "b.example" { location "/" { respond status=200 body="b" } }
+        "#;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vhost_selected_from_h2_authority() {
+        // Regression: HTTP/2 has no `Host` header, so every request
+        // used to fall through to the listener's default vhost --
+        // `a.example` here -- whatever the client asked for.
+        let srv = TestServer::start(TWO_VHOSTS).await;
+        assert_eq!(
+            h2_body(srv.addr, "b.example", "/").await,
+            Bytes::from_static(b"b")
+        );
+        // The default vhost still answers when it is the one named,
+        // so the fix is selection, not a blanket redirect.
+        assert_eq!(
+            h2_body(srv.addr, "a.example", "/").await,
+            Bytes::from_static(b"a")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vhost_selection_matches_across_h1_and_h2() {
+        // The two protocols must agree: this is the property that was
+        // violated, and asserting it as a pair keeps them honest.
+        let srv = TestServer::start(TWO_VHOSTS).await;
+        let (_s, _h, h1) =
+            crate::test::http_get(srv.addr, "b.example", "/").await;
+        let h2 = h2_body(srv.addr, "b.example", "/").await;
+        assert_eq!(h1, Bytes::from_static(b"b"));
+        assert_eq!(h2, h1, "h2 and h1 must resolve the same vhost");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h2_authority_with_port_selects_vhost() {
+        // `:authority` carries the port; the router strips it the same
+        // way it strips one from an h1 `Host` header.
+        let srv = TestServer::start(TWO_VHOSTS).await;
+        let authority = format!("b.example:{}", srv.addr.port());
+        assert_eq!(
+            h2_body(srv.addr, &authority, "/").await,
+            Bytes::from_static(b"b")
+        );
+    }
+
+    /// Send an HTTP/2 request carrying both an `:authority` and a
+    /// `Host` header, and return the response status.
+    async fn h2_status_with_host(
+        addr: SocketAddr,
+        authority: &str,
+        host: &str,
+    ) -> hyper::StatusCode {
+        use http_body_util::Empty;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        let req = Request::builder()
+            .uri(format!("http://{authority}/"))
+            .header("host", host)
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+        sender.send_request(req).await.expect("request").status()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h2_host_disagreeing_with_authority_is_rejected() {
+        // RFC 9113 s.8.3.1: the two name different targets, and any
+        // choice between them is one a downstream hop could make
+        // differently.  Routing on either would be a request-smuggling
+        // primitive, so the request is refused instead.
+        let srv = TestServer::start(TWO_VHOSTS).await;
+        assert_eq!(
+            h2_status_with_host(srv.addr, "a.example", "b.example").await,
+            hyper::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h2_host_agreeing_with_authority_is_served() {
+        // Carrying both is legal when they match, including when they
+        // differ only in case: host names are case-insensitive.
+        let srv = TestServer::start(TWO_VHOSTS).await;
+        assert_eq!(
+            h2_status_with_host(srv.addr, "b.example", "b.example").await,
+            hyper::StatusCode::OK
+        );
+        assert_eq!(
+            h2_status_with_host(srv.addr, "b.example", "B.Example").await,
+            hyper::StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn h1_absolute_form_keeps_its_host_header() {
+        // HTTP/1.1 is exempt: a request in absolute form legitimately
+        // carries both, and RFC 9112 s.3.2.2 has the server ignore
+        // `Host` rather than reject.  Rejecting here would break
+        // requests that work today.
+        let mut req = Request::builder()
+            .version(hyper::Version::HTTP_11)
+            .uri("http://a.example/some/path")
+            .header("host", "b.example")
+            .body(())
+            .expect("valid request");
+        assert!(normalize_host(&mut req).is_ok());
+        let host = req.headers().get(hyper::header::HOST).unwrap();
+        assert_eq!(host, "b.example");
+    }
+
+    #[test]
+    fn normalize_host_is_a_noop_without_an_authority() {
+        // An h1 origin-form request: no authority on the URI and no
+        // Host header.  Nothing to copy, and nothing invented.
+        let mut req = Request::builder()
+            .uri("/some/path")
+            .body(())
+            .expect("valid request");
+        assert!(normalize_host(&mut req).is_ok());
+        assert!(req.headers().get(hyper::header::HOST).is_none());
+    }
 
     #[tokio::test]
     async fn policy_unconditional_deny_returns_configured_code() {

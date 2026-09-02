@@ -472,13 +472,10 @@ async fn handle_h3_request(
         seen: 0,
     }
     .boxed_unsync();
+    // The `:authority` -> `Host` backfill this transport needs now
+    // lives in `HypershuntService::dispatch`, which every transport
+    // funnels through, so HTTP/2 gets it too.
     let mut req: Request<ReqBody> = Request::from_parts(parts, body);
-    if !req.headers().contains_key(hyper::header::HOST)
-        && let Some(authority) = req.uri().authority().cloned()
-        && let Ok(hv) = hyper::header::HeaderValue::from_str(authority.as_str())
-    {
-        req.headers_mut().insert(hyper::header::HOST, hv);
-    }
     if let PeerAddr::Tcp(addr) = peer {
         req.extensions_mut().insert(addr);
     }

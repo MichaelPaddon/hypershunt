@@ -48,7 +48,7 @@ Syntax inside a template:
 | `{path}`                | Request URI path.                              |
 | `{query}`               | Query string without the `?`; empty if absent. |
 | `{path_and_query}`      | Path plus original query (`/a?x=1`).           |
-| `{host}`                | Request `Host` header, port stripped.          |
+| `{host}`                | Host requested by the client, port stripped. |
 | `{scheme}`              | `http` or `https`.                             |
 | `{country}`             | ISO 3166-1 code from [`geoip`](#geoip); empty when unconfigured or unmatched. |
 | `{client_cert_subject}` | Verified mTLS client-cert subject DN; empty if none. |
@@ -2174,9 +2174,19 @@ listener "tcp://0.0.0.0:5432" {
 
 ## vhost
 
-Virtual hosts route requests by `Host` header.  The positional
-argument is the host-match pattern; setting `regex=#true` turns it
-into an anchored regex.  Vhosts are defined once at the top level;
+Virtual hosts route requests by the host the client asked for: the
+`Host` header on HTTP/1.1, or the `:authority` pseudo-header on
+HTTP/2 and HTTP/3.  Any port is stripped before matching.
+
+An HTTP/2 or HTTP/3 request that carries *both* an `:authority` and
+a `Host` header, with different values, is rejected with `400`:
+they name different targets, and RFC 9113 requires a server to
+treat the mismatch as malformed rather than pick one.  Matching
+values (compared case-insensitively) are fine.
+
+The positional argument is the host-match pattern; setting
+`regex=#true` turns it into an anchored regex.  Vhosts are defined
+once at the top level;
 each [`listener`](#listener) then serves either every vhost (the
 default) or an explicit subset via its
 [`vhost`](#vhost-listener-child) child.
