@@ -156,6 +156,7 @@ impl TestServer {
             reject_unknown_host: false,
             health: None,
             timeouts: Timeouts::default(),
+            http2: Default::default(),
             max_connections: None,
             max_request_body: None,
             auto_alt_svc,

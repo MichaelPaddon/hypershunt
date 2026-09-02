@@ -1041,6 +1041,34 @@ listener "tcp://[::]:80" {
 
 **See also:** [Reference — timeouts](reference.md#timeouts).
 
+### HTTP/2 connection tuning
+
+`timeouts` speaks HTTP/1.1 concepts.  The HTTP/2 connection has
+its own controls, under [`http2`](reference.md#http2):
+
+```kdl
+listener "tcp://[::]:443" {
+    http2 keepalive-interval=30 keepalive-timeout=10 \
+          max-concurrent-streams=250
+}
+```
+
+- [`keepalive-interval`](reference.md#keepalive-interval-http2)
+  and
+  [`keepalive-timeout`](reference.md#keepalive-timeout-http2):
+  send HTTP/2 PINGs and bound the wait for the reply.  A
+  long-lived stream -- a gRPC server stream, an SSE feed -- can
+  sit silent long enough for a NAT or an idle-timing middlebox to
+  drop the connection with neither end noticing until the next
+  write fails.
+- [`max-concurrent-streams`](reference.md#max-concurrent-streams):
+  cap the streams one client may open on a single connection, so
+  one peer cannot demand unbounded concurrent work.
+
+All are off by default.  The matching outbound knobs, for the
+connection hypershunt opens to a backend, live on the proxy's
+[`grpc`](reference.md#grpc) block.
+
 ## Compression
 
 hypershunt negotiates response compression automatically.  Supported

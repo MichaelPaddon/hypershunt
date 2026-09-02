@@ -592,6 +592,97 @@ fn proxy_retry_requires_on_status_when_enabled() {
 }
 
 #[test]
+fn listener_http2_block_parses() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://[::]:80" {
+            http2 keepalive-interval=30 keepalive-timeout=10 \
+                  max-concurrent-streams=250
+        }
+        vhost h { location "/" { static root="/tmp" } }
+        "#,
+    )
+    .unwrap();
+    let h2 = &cfg.listeners[0].http2;
+    assert_eq!(h2.keepalive_interval_secs, Some(30));
+    assert_eq!(h2.keepalive_timeout_secs, Some(10));
+    assert_eq!(h2.max_concurrent_streams, Some(250));
+}
+
+#[test]
+fn listener_without_http2_block_has_no_tuning() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://[::]:80"
+        vhost h { location "/" { static root="/tmp" } }
+        "#,
+    )
+    .unwrap();
+    // Every knob unset means hyper's own defaults stay in place.
+    assert_eq!(cfg.listeners[0].http2, Default::default());
+}
+
+#[test]
+fn listener_http2_rejects_keepalive_timeout_without_interval() {
+    let err = http2_listener_err("http2 keepalive-timeout=10");
+    assert!(
+        err.contains("keepalive-timeout")
+            && err.contains("keepalive-interval"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn listener_http2_rejects_zero_values() {
+    for kdl in [
+        "http2 keepalive-interval=0",
+        "http2 max-concurrent-streams=0",
+    ] {
+        let err = http2_listener_err(kdl);
+        assert!(
+            err.contains("greater than zero"),
+            "for {kdl:?}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn listener_http2_rejected_on_l4_proxy_listener() {
+    // An L4 proxy listener forwards bytes and never speaks HTTP, so
+    // the block would be silently inert -- the same reasoning that
+    // already rejects `timeouts` there.
+    let err = Config::parse(
+        r#"
+        listener "tcp://[::]:80" {
+            proxy "tcp://127.0.0.1:9000"
+            http2 keepalive-interval=30
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("http2") && err.contains("HTTP listeners"),
+        "got: {err}"
+    );
+}
+
+/// Parse a listener whose `http2` block is expected to be rejected,
+/// and return the error text.
+fn http2_listener_err(http2_kdl: &str) -> String {
+    Config::parse(&format!(
+        r#"
+        listener "tcp://[::]:80" {{
+            {http2_kdl}
+        }}
+        vhost h {{ location "/" {{ static root="/tmp" }} }}
+        "#
+    ))
+    .unwrap_err()
+    .to_string()
+}
+
+#[test]
 fn proxy_grpc_block_parses() {
     let cfg = Config::parse(
         r#"

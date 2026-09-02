@@ -390,6 +390,7 @@ Prefixed children for repeating values of the wrapped backend:
   [`<l4-proxy-opt>`](#l4-proxy-opt)* `}` )?
 - [`<policy-block>`](#policy-block)
 - [`<timeouts-block>`](#timeouts-block)
+- [`<http2-block>`](#http2-block)
 
 `trusted-proxies` and `alpn` are repeating single-argument
 children (rule 4).  A `vhost` child is a *reference* (one or more
@@ -470,6 +471,15 @@ Properties vary by provider kind.
 `"timeouts"` ( `request-header=`[`<integer>`](#integer) )?
 ( `handler=`[`<integer>`](#integer) )?
 ( `keepalive=`[`<integer>`](#integer) )?
+
+### `http2-block`
+
+`"http2"` ( `keepalive-interval=`[`<integer>`](#integer) )?
+( `keepalive-timeout=`[`<integer>`](#integer) )?
+( `max-concurrent-streams=`[`<integer>`](#integer) )?
+
+`keepalive-timeout` requires `keepalive-interval`.  All three
+values must be greater than zero when present.
 
 The `proxy` node also carries the scalar attributes
 `proxy-protocol=`( `"v1"` | `"v2"` ) and
