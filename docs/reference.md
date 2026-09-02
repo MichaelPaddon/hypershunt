@@ -2178,11 +2178,32 @@ Virtual hosts route requests by the host the client asked for: the
 `Host` header on HTTP/1.1, or the `:authority` pseudo-header on
 HTTP/2 and HTTP/3.  Any port is stripped before matching.
 
-An HTTP/2 or HTTP/3 request that carries *both* an `:authority` and
-a `Host` header, with different values, is rejected with `400`:
-they name different targets, and RFC 9113 requires a server to
-treat the mismatch as malformed rather than pick one.  Matching
-values (compared case-insensitively) are fine.
+A request must name exactly one usable host, or it is refused with
+`400`:
+
+- more than one `Host` header line, on any protocol;
+- a `Host` value that is not a valid host name or address, with an
+  optional numeric port and no `user@` part;
+- on HTTP/2 and HTTP/3, a `Host` header that disagrees with the
+  `:authority` (compared case-insensitively; matching values are
+  fine).  RFC 9113 requires a server to treat that mismatch as
+  malformed rather than pick one;
+- on HTTP/1.1, no `Host` header and no authority on the
+  request-target.  HTTP/1.0 predates the header and is exempt, as
+  are the built-in [`health`](#health) endpoints, which are
+  documented to answer without one.
+
+The reason these are refused rather than resolved is that any
+resolution is a *choice*, and the next hop -- a CDN, a cache, a
+backend -- may choose differently.  Two hops disagreeing about which
+site a request was for is the basis of request smuggling and cache
+poisoning.
+
+On HTTP/1.1 a request in **absolute form**
+(`GET http://host/path HTTP/1.1`) is the one case where both are
+expected: sending `Host` as well is required so the host survives a
+1.0 hop.  There the request-target wins and the header is ignored,
+per RFC 9112, rather than the request being refused.
 
 The positional argument is the host-match pattern; setting
 `regex=#true` turns it into an anchored regex.  Vhosts are defined

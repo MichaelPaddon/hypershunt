@@ -218,10 +218,23 @@ handler](reference.md#static) for every knob.
 A [`vhost`](reference.md#vhost) claims one or more host names.  The
 name comes from the request's `Host:` header on HTTP/1.1, or from
 its `:authority` pseudo-header on HTTP/2 and HTTP/3, so the same
-vhost config applies on every protocol.  An HTTP/2 or HTTP/3
-request carrying both, with different values, is refused with
-`400`: they name different targets, and RFC 9113 requires a server
-to treat that as malformed rather than choose one.  Matching order per
+vhost config applies on every protocol.
+
+A request has to name exactly one usable host or it is refused with
+`400`: two `Host` lines, a malformed `Host` value, an HTTP/2 or
+HTTP/3 `Host` that disagrees with the `:authority`, or an HTTP/1.1
+request with no host at all.  Resolving any of those would be a
+*choice*, and the next hop -- a CDN, a cache, your backend -- may
+choose differently; two hops disagreeing about which site a request
+was for is how request smuggling and cache poisoning start.
+
+Two deliberate exceptions.  An HTTP/1.1 request in absolute form
+(`GET http://host/path HTTP/1.1`) is *required* to send `Host` too,
+so the host survives a 1.0 hop: there the request-target wins and
+the header is ignored, rather than the request being refused.  And
+the built-in [health endpoints](reference.md#health) still answer
+without a `Host` header, as documented, so a liveness probe that
+omits one keeps working.  Matching order per
 request, **within the listener's vhost set**: every exact literal
 name (O(1) hash lookup), then every regex pattern in list order,
 then the listener's default (its first vhost).  By default every

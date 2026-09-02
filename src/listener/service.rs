@@ -176,22 +176,20 @@ impl HypershuntService {
         self,
         mut req: Request<ReqBody>,
     ) -> Result<Response<BoxBody>, anyhow::Error> {
-        if normalize_host(&mut req).is_err() {
-            // Logged rather than access-logged: the request never
-            // reaches routing, so there is no vhost or location to
-            // attribute it to -- the same shape as the oversized-body
-            // rejection below.
-            tracing::warn!(
-                peer = %self.peer_addr,
-                authority = ?req.uri().authority().map(|a| a.as_str()),
-                host = ?req
-                    .headers()
-                    .get(hyper::header::HOST)
-                    .and_then(|v| v.to_str().ok()),
-                "rejecting malformed request: Host disagrees with \
-                 :authority"
-            );
-            return Ok(response_400());
+        // A request naming no host is refused, but not yet: the
+        // built-in endpoints below (health, ACME, JWKS) are
+        // documented to answer without a `Host` header, and a
+        // liveness probe that omits one must keep working.  The
+        // other three faults are refused here and now -- they are
+        // the ones a second hop could resolve differently, so no
+        // part of this process should act on such a request.
+        let mut missing_host = false;
+        match normalize_host(&mut req) {
+            Ok(()) => {}
+            Err(HostError::Missing) => missing_host = true,
+            Err(e) => {
+                return Ok(reject_bad_host(self.peer_addr, &req, &e));
+            }
         }
         let state = self.state.clone();
         let lmetrics = self.lmetrics.clone();
@@ -563,6 +561,18 @@ impl HypershuntService {
                     );
                     return Ok(resp);
                 }
+            }
+
+            // Every built-in endpoint has now had its chance, so a
+            // request that never named a host can be refused (RFC
+            // 9110 s.7.2).  Anything past here is routed to operator
+            // configuration, which is selected by host.
+            if missing_host {
+                return Ok(reject_bad_host(
+                    peer,
+                    &req,
+                    &HostError::Missing,
+                ));
             }
 
             // JWT pre-validation: extract and verify the session cookie
@@ -1656,61 +1666,185 @@ fn log_access(
     });
 }
 
-/// An HTTP/2 or HTTP/3 request whose `Host` header disagrees with
-/// its `:authority`.  The two name different targets, so there is no
-/// safe way to pick one: whichever this proxy chose, a downstream hop
-/// could choose the other.
-pub(super) struct HostMismatch;
+/// Why a request's target host was rejected.  Each maps to `400`;
+/// the variants exist so the log line can say which rule was broken.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HostError {
+    /// An HTTP/1.1 request with neither a `Host` header nor an
+    /// authority on its target.  RFC 9110 s.7.2.
+    Missing,
+    /// More than one `Host` header line.  Which one a hop routes on
+    /// is then a choice, and two hops can choose differently, so
+    /// RFC 9110 s.7.2 requires the request be refused instead.
+    Duplicate,
+    /// A `Host` value that is not a valid host (optionally with a
+    /// port).  Also covers userinfo, which a `Host` must not carry.
+    Invalid,
+    /// An HTTP/2 or HTTP/3 request whose `Host` disagrees with its
+    /// `:authority`.  RFC 9113 s.8.3.1, RFC 9114 s.4.3.1.
+    Mismatch,
+}
 
-/// Reconcile the host the client asked for into the `Host` header.
+impl HostError {
+    /// Short reason for the rejection log line.
+    fn reason(&self) -> &'static str {
+        match self {
+            HostError::Missing => "no Host header and no authority",
+            HostError::Duplicate => "more than one Host header",
+            HostError::Invalid => "malformed Host value",
+            HostError::Mismatch => "Host disagrees with :authority",
+        }
+    }
+}
+
+/// True when `value` is a valid `Host` field value: a host, with an
+/// optional port, and no userinfo.
 ///
-/// HTTP/1.1 carries it in `Host`, but HTTP/2 and HTTP/3 carry it in
+/// The authority parser accepts a `user@host` form that is legal in a
+/// URI but not in a `Host` header, so that is excluded separately.
+fn is_valid_host_value(value: &str) -> bool {
+    if value.contains('@') {
+        return false;
+    }
+    let Ok(authority) = value.parse::<hyper::http::uri::Authority>() else {
+        return false;
+    };
+    // The authority parser tolerates a non-numeric port (`port_u16`
+    // simply returns None for it), so anything trailing the host has
+    // to be checked separately.
+    if authority.as_str().len() > authority.host().len()
+        && authority.port_u16().is_none()
+    {
+        return false;
+    }
+    true
+}
+
+/// Reconcile the host the client asked for into the `Host` header,
+/// rejecting requests that do not name exactly one usable host.
+///
+/// HTTP/1.1 carries the host in `Host`; HTTP/2 and HTTP/3 carry it in
 /// the `:authority` pseudo-header, which hyper surfaces on the URI
 /// instead.  Everything downstream reads the header -- vhost
 /// resolution in `router.rs`, the `{host}` template variable, the
-/// access log -- so without the copy an h2 or h3 request looks like
-/// it named no host at all and falls back to the listener's default
-/// vhost.
+/// access log -- so the authority is copied into it.  Without that
+/// copy an h2 or h3 request looks like it named no host at all and
+/// falls back to the listener's default vhost.
 ///
 /// The authority keeps any port, which `router.rs` strips before
 /// matching, exactly as it does for an h1 `Host` header.
 ///
-/// When an h2/h3 request carries both, they must agree: RFC 9113
-/// s.8.3.1 and RFC 9114 s.4.3.1 require a server to treat a mismatch
-/// as malformed.  Comparison is ASCII case-insensitive, since host
-/// names are.
+/// Where the two disagree, the protocol decides who wins, because the
+/// specifications differ deliberately:
 ///
-/// HTTP/1.1 is deliberately exempt.  A request in absolute form
-/// legitimately carries both, and RFC 9112 s.3.2.2 has the server
-/// ignore `Host` there rather than reject the request -- so the
-/// existing header is left to win, and h1 behaviour is unchanged.
-fn normalize_host<B>(req: &mut Request<B>) -> Result<(), HostMismatch> {
-    let Some(authority) = req.uri().authority().cloned() else {
-        return Ok(());
+/// * **HTTP/2 and HTTP/3** reject the request.  There is no reason to
+///   send both, so a mismatch signals confusion rather than a proxy
+///   chain (RFC 9113 s.8.3.1, RFC 9114 s.4.3.1).
+/// * **HTTP/1.1 in absolute form** takes the authority and ignores
+///   the header.  Sending both is *required* there, so that the host
+///   survives a 1.0 hop that predates `Host`, and they are expected
+///   to differ; RFC 9112 s.3.2.2 names the request-target the winner
+///   rather than treating it as an error.
+fn normalize_host<B>(req: &mut Request<B>) -> Result<(), HostError> {
+    // At most one Host line, whatever the protocol: with two, the
+    // choice of which to route on is exactly the disagreement that
+    // lets one hop admit a request as one site and another serve it
+    // as a different one.
+    let mut lines = req.headers().get_all(hyper::header::HOST).iter();
+    let host = lines.next().cloned();
+    if lines.next().is_some() {
+        return Err(HostError::Duplicate);
+    }
+
+    // An empty value names no host; treat it as absent rather than
+    // malformed, so the authority below can still supply one.
+    let host = match host {
+        Some(v) => {
+            let text = v.to_str().map_err(|_| HostError::Invalid)?;
+            if text.is_empty() {
+                None
+            } else if is_valid_host_value(text) {
+                Some(v)
+            } else {
+                return Err(HostError::Invalid);
+            }
+        }
+        None => None,
     };
-    match req.headers().get(hyper::header::HOST) {
-        Some(host) => {
-            let strict = matches!(
-                req.version(),
-                hyper::Version::HTTP_2 | hyper::Version::HTTP_3
-            );
-            if strict
-                && !host
+
+    let authority = req.uri().authority().cloned();
+    let version = req.version();
+    let is_h2_or_h3 = matches!(
+        version,
+        hyper::Version::HTTP_2 | hyper::Version::HTTP_3
+    );
+
+    match (authority, host) {
+        (Some(authority), Some(host)) => {
+            if is_h2_or_h3 {
+                if host
                     .as_bytes()
                     .eq_ignore_ascii_case(authority.as_str().as_bytes())
-            {
-                return Err(HostMismatch);
+                {
+                    Ok(())
+                } else {
+                    Err(HostError::Mismatch)
+                }
+            } else {
+                // HTTP/1.x absolute form: the request-target wins.
+                set_host(req, authority.as_str());
+                Ok(())
             }
+        }
+        (Some(authority), None) => {
+            set_host(req, authority.as_str());
             Ok(())
         }
-        None => {
-            if let Ok(v) =
-                hyper::header::HeaderValue::from_str(authority.as_str())
+        (None, Some(_)) => Ok(()),
+        (None, None) => {
+            // HTTP/1.0 predates `Host` and may legitimately omit it;
+            // every later version must name a host somewhere.
+            if version == hyper::Version::HTTP_10
+                || version == hyper::Version::HTTP_09
             {
-                req.headers_mut().insert(hyper::header::HOST, v);
+                Ok(())
+            } else {
+                Err(HostError::Missing)
             }
-            Ok(())
         }
+    }
+}
+
+/// Log a rejected request's host problem and build its `400`.
+///
+/// Logged here rather than through the access log because the
+/// request never reaches routing, so there is no vhost or location
+/// to attribute it to -- the same shape as the oversized-body
+/// rejection.
+fn reject_bad_host<B>(
+    peer: PeerAddr,
+    req: &Request<B>,
+    err: &HostError,
+) -> Response<BoxBody> {
+    tracing::warn!(
+        %peer,
+        version = %http_version_str(req.version()),
+        authority = ?req.uri().authority().map(|a| a.as_str()),
+        host = ?req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|v| v.to_str().ok()),
+        "rejecting malformed request: {}",
+        err.reason()
+    );
+    response_400()
+}
+
+/// Overwrite the `Host` header with `value`, which the caller has
+/// already validated as an authority.
+fn set_host<B>(req: &mut Request<B>, value: &str) {
+    if let Ok(v) = hyper::header::HeaderValue::from_str(value) {
+        req.headers_mut().insert(hyper::header::HOST, v);
     }
 }
 
@@ -1759,7 +1893,7 @@ fn record_compression(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_host;
+    use super::{HostError, normalize_host};
     use super::{FirstRequest, presented_credentials};
     use bytes::Bytes;
     use hyper::HeaderMap;
@@ -2084,33 +2218,218 @@ mod tests {
         );
     }
 
+    /// Build a request for the pure-function host tests.
+    fn req_with(
+        version: hyper::Version,
+        uri: &str,
+        hosts: &[&str],
+    ) -> Request<()> {
+        let mut b = Request::builder().version(version).uri(uri);
+        for h in hosts {
+            b = b.header("host", *h);
+        }
+        b.body(()).expect("valid request")
+    }
+
     #[test]
-    fn h1_absolute_form_keeps_its_host_header() {
-        // HTTP/1.1 is exempt: a request in absolute form legitimately
-        // carries both, and RFC 9112 s.3.2.2 has the server ignore
-        // `Host` rather than reject.  Rejecting here would break
-        // requests that work today.
-        let mut req = Request::builder()
-            .version(hyper::Version::HTTP_11)
-            .uri("http://a.example/some/path")
-            .header("host", "b.example")
-            .body(())
-            .expect("valid request");
+    fn h1_absolute_form_takes_the_request_target() {
+        // RFC 9112 s.3.2.2: an origin server ignores `Host` when the
+        // target is in absolute form.  Sending both is *required* on
+        // HTTP/1.1 so the host survives a 1.0 hop, so they are
+        // expected to differ and the target is the designated winner
+        // -- unlike HTTP/2, where a mismatch is refused outright.
+        let mut req = req_with(
+            hyper::Version::HTTP_11,
+            "http://a.example/some/path",
+            &["b.example"],
+        );
+        assert!(normalize_host(&mut req).is_ok());
+        let host = req.headers().get(hyper::header::HOST).unwrap();
+        assert_eq!(host, "a.example");
+    }
+
+    #[test]
+    fn h1_origin_form_keeps_its_host_header() {
+        // The ordinary case: no authority on the target, so the
+        // header is the only source and is left untouched.
+        let mut req =
+            req_with(hyper::Version::HTTP_11, "/some/path", &["b.example"]);
         assert!(normalize_host(&mut req).is_ok());
         let host = req.headers().get(hyper::header::HOST).unwrap();
         assert_eq!(host, "b.example");
     }
 
     #[test]
-    fn normalize_host_is_a_noop_without_an_authority() {
-        // An h1 origin-form request: no authority on the URI and no
-        // Host header.  Nothing to copy, and nothing invented.
-        let mut req = Request::builder()
-            .uri("/some/path")
-            .body(())
-            .expect("valid request");
+    fn duplicate_host_headers_are_rejected() {
+        // RFC 9110 s.7.2.  Routing on either one is a choice another
+        // hop could make differently, which is what makes this a
+        // smuggling primitive rather than a mere ambiguity.
+        for version in [
+            hyper::Version::HTTP_11,
+            hyper::Version::HTTP_2,
+        ] {
+            let mut req =
+                req_with(version, "/p", &["a.example", "b.example"]);
+            assert_eq!(
+                normalize_host(&mut req),
+                Err(HostError::Duplicate),
+                "for {version:?}"
+            );
+        }
+        // Two lines carrying the *same* value are still two lines.
+        let mut req = req_with(
+            hyper::Version::HTTP_11,
+            "/p",
+            &["a.example", "a.example"],
+        );
+        assert_eq!(normalize_host(&mut req), Err(HostError::Duplicate));
+    }
+
+    #[test]
+    fn malformed_host_values_are_rejected() {
+        for bad in [
+            "bad host",       // space is not valid in a host
+            "user@a.example", // userinfo does not belong in Host
+            "a.example:notaport",
+            "[::1",           // unclosed IPv6 literal
+        ] {
+            let mut req = req_with(hyper::Version::HTTP_11, "/p", &[bad]);
+            assert_eq!(
+                normalize_host(&mut req),
+                Err(HostError::Invalid),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_host_values_are_accepted() {
+        for good in [
+            "a.example",
+            "a.example:8080",
+            "127.0.0.1:80",
+            "[::1]:8080",
+            "xn--bcher-kva.example", // punycode IDN
+        ] {
+            let mut req = req_with(hyper::Version::HTTP_11, "/p", &[good]);
+            assert!(
+                normalize_host(&mut req).is_ok(),
+                "should accept {good:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_host_is_rejected_on_http_11_only() {
+        // HTTP/1.0 predates the header and may legitimately omit it;
+        // HTTP/1.1 must name a host somewhere.
+        let mut h11 = req_with(hyper::Version::HTTP_11, "/p", &[]);
+        assert_eq!(normalize_host(&mut h11), Err(HostError::Missing));
+
+        let mut h10 = req_with(hyper::Version::HTTP_10, "/p", &[]);
+        assert!(normalize_host(&mut h10).is_ok());
+        assert!(h10.headers().get(hyper::header::HOST).is_none());
+    }
+
+    #[test]
+    fn empty_host_falls_back_to_the_authority() {
+        // An empty value names no host, so it is treated as absent
+        // rather than malformed and the target still supplies one.
+        let mut req = req_with(
+            hyper::Version::HTTP_11,
+            "http://a.example/p",
+            &[""],
+        );
+        assert!(normalize_host(&mut req).is_ok());
+        let host = req.headers().get(hyper::header::HOST).unwrap();
+        assert_eq!(host, "a.example");
+    }
+
+    #[test]
+    fn empty_host_with_no_authority_is_missing_on_http_11() {
+        let mut req = req_with(hyper::Version::HTTP_11, "/p", &[""]);
+        assert_eq!(normalize_host(&mut req), Err(HostError::Missing));
+    }
+
+    #[test]
+    fn normalize_host_is_a_noop_without_an_authority_on_http_10() {
+        // No authority on the URI and no Host header: nothing to
+        // copy, and nothing invented.
+        let mut req = req_with(hyper::Version::HTTP_10, "/some/path", &[]);
         assert!(normalize_host(&mut req).is_ok());
         assert!(req.headers().get(hyper::header::HOST).is_none());
+    }
+
+    /// Send a raw HTTP/1.1 request and return its status line.
+    /// Raw because the shared helpers always send a `Host` header,
+    /// and the point of these tests is to omit or duplicate it.
+    async fn raw_status_line(addr: SocketAddr, request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut sock =
+            tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = sock.read(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_string()
+    }
+
+    const ONE_LOCATION: &str = r#"
+        listener "tcp://{addr}"
+        vhost "localhost" {
+            location "/api/" { respond status=200 body="api" }
+        }
+        "#;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_http11_request_without_host_is_rejected() {
+        // RFC 9110 s.7.2.  Before this, such a request silently
+        // reached whichever vhost happened to be the default.
+        let srv = TestServer::start(ONE_LOCATION).await;
+        let line = raw_status_line(
+            srv.addr,
+            "GET /api/x HTTP/1.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(line.contains("400"), "got: {line}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_endpoint_still_answers_without_host() {
+        // The built-in endpoints are documented to work without a
+        // `Host` header, so the missing-host check deliberately runs
+        // after they have had their chance.  A liveness probe that
+        // omits the header must not start failing.
+        let srv = TestServer::start(ONE_LOCATION).await;
+        let line = raw_status_line(
+            srv.addr,
+            "GET /healthz HTTP/1.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(line.contains("200"), "got: {line}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_endpoint_is_not_exempt_from_the_other_rules() {
+        // Only *missing* host is deferred.  A duplicated or malformed
+        // header is a disagreement another hop could resolve
+        // differently, so it is refused everywhere, built-in
+        // endpoints included.
+        let srv = TestServer::start(ONE_LOCATION).await;
+        for req in [
+            "GET /healthz HTTP/1.1\r\nHost: a.example\r\n\
+             Host: b.example\r\nConnection: close\r\n\r\n",
+            "GET /healthz HTTP/1.1\r\nHost: bad host\r\n\
+             Connection: close\r\n\r\n",
+        ] {
+            let line = raw_status_line(srv.addr, req).await;
+            assert!(line.contains("400"), "got: {line} for {req:?}");
+        }
     }
 
     #[tokio::test]
