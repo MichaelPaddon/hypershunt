@@ -175,6 +175,7 @@ impl HypershuntService {
         self,
         mut req: Request<ReqBody>,
     ) -> Result<Response<BoxBody>, anyhow::Error> {
+        backfill_host_from_authority(&mut req);
         let state = self.state.clone();
         let lmetrics = self.lmetrics.clone();
         let bind = self.bind.clone();
@@ -566,7 +567,7 @@ impl HypershuntService {
                         );
                         None
                     }
-                    // Valid signature but past exp — count separately from
+                    // Valid signature but past exp: count separately from
                     // bad-signature failures so operators can distinguish
                     // normal session expiry from token tampering.
                     Some(crate::jwt::JwtResult::Expired) => {
@@ -1378,7 +1379,7 @@ async fn serve_with_cache(
         }
         Lookup::Miss => {
             if rcc.only_if_cached {
-                // RFC 9111 §5.2.1.7: nothing cached, so do not contact
+                // RFC 9111 s.5.2.1.7: nothing cached, so do not contact
                 // the origin -- answer 504.
                 metrics.cache_misses.fetch_add(1, Relaxed);
                 let mut r = Response::new(bytes_body(Bytes::from_static(
@@ -1638,6 +1639,34 @@ fn log_access(
     });
 }
 
+/// Make the request's target host visible as a `Host` header.
+///
+/// HTTP/1.1 carries it in `Host`, but HTTP/2 and HTTP/3 carry it in
+/// the `:authority` pseudo-header, which hyper surfaces on the URI
+/// instead.  Everything downstream reads the header -- vhost
+/// resolution in `router.rs`, the `{host}` template variable, the
+/// access log -- so without this an h2 or h3 request looks like it
+/// named no host at all and falls back to the listener's default
+/// vhost.
+///
+/// An explicit `Host` header wins when the client sent one, so
+/// HTTP/1.1 behaviour is untouched.  The authority keeps any port,
+/// which `router.rs` strips before matching, exactly as it does for
+/// an h1 `Host` header.
+fn backfill_host_from_authority<B>(req: &mut Request<B>) {
+    if req.headers().contains_key(hyper::header::HOST) {
+        return;
+    }
+    let Some(authority) = req.uri().authority().cloned() else {
+        return;
+    };
+    if let Ok(v) =
+        hyper::header::HeaderValue::from_str(authority.as_str())
+    {
+        req.headers_mut().insert(hyper::header::HOST, v);
+    }
+}
+
 /// Stringify a hyper HTTP version into the `HTTP/x.y` token used in
 /// NCSA-style access logs.  hyper's `Debug` impl already emits that
 /// shape but we resolve it explicitly so callers don't depend on a
@@ -1683,10 +1712,13 @@ fn record_compression(
 
 #[cfg(test)]
 mod tests {
-    use super::FirstRequest;
-    use super::presented_credentials;
+    use super::backfill_host_from_authority;
+    use super::{FirstRequest, presented_credentials};
+    use bytes::Bytes;
     use hyper::HeaderMap;
     use hyper::header::{AUTHORIZATION, COOKIE, HeaderValue};
+    use hyper::Request;
+    use std::net::SocketAddr;
 
     #[tokio::test]
     async fn first_request_signal_before_wait_returns_immediately() {
@@ -1873,6 +1905,123 @@ mod tests {
     // early-return branches are exercised against a real HTTP round
     // trip rather than mocked in isolation.
     use crate::test::TestServer;
+
+    // -- vhost selection across protocols --------------------------
+
+    /// Send a request over HTTP/2 with the given `:authority` and
+    /// return the response body.  Deliberately sends no `Host`
+    /// header: that is what an HTTP/2 client does, and it is what
+    /// made this fail before the authority backfill existed.
+    async fn h2_body(addr: SocketAddr, authority: &str, path: &str) -> Bytes {
+        use http_body_util::{BodyExt as _, Empty};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        let uri = format!("http://{authority}{path}");
+        let req = Request::builder()
+            .uri(uri)
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+        let resp = sender.send_request(req).await.expect("request");
+        resp.into_body().collect().await.unwrap().to_bytes()
+    }
+
+    const TWO_VHOSTS: &str = r#"
+        listener "tcp://{addr}"
+        vhost "a.example" { location "/" { respond status=200 body="a" } }
+        vhost "b.example" { location "/" { respond status=200 body="b" } }
+        "#;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vhost_selected_from_h2_authority() {
+        // Regression: HTTP/2 has no `Host` header, so every request
+        // used to fall through to the listener's default vhost --
+        // `a.example` here -- whatever the client asked for.
+        let srv = TestServer::start(TWO_VHOSTS).await;
+        assert_eq!(
+            h2_body(srv.addr, "b.example", "/").await,
+            Bytes::from_static(b"b")
+        );
+        // The default vhost still answers when it is the one named,
+        // so the fix is selection, not a blanket redirect.
+        assert_eq!(
+            h2_body(srv.addr, "a.example", "/").await,
+            Bytes::from_static(b"a")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vhost_selection_matches_across_h1_and_h2() {
+        // The two protocols must agree: this is the property that was
+        // violated, and asserting it as a pair keeps them honest.
+        let srv = TestServer::start(TWO_VHOSTS).await;
+        let (_s, _h, h1) =
+            crate::test::http_get(srv.addr, "b.example", "/").await;
+        let h2 = h2_body(srv.addr, "b.example", "/").await;
+        assert_eq!(h1, Bytes::from_static(b"b"));
+        assert_eq!(h2, h1, "h2 and h1 must resolve the same vhost");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h2_authority_with_port_selects_vhost() {
+        // `:authority` carries the port; the router strips it the same
+        // way it strips one from an h1 `Host` header.
+        let srv = TestServer::start(TWO_VHOSTS).await;
+        let authority = format!("b.example:{}", srv.addr.port());
+        assert_eq!(
+            h2_body(srv.addr, &authority, "/").await,
+            Bytes::from_static(b"b")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h2_explicit_host_header_wins_over_authority() {
+        // A client may send both.  The existing header is preserved,
+        // so this fix cannot change how any request that already
+        // carried a `Host` header was routed.
+        use http_body_util::{BodyExt as _, Empty};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let srv = TestServer::start(TWO_VHOSTS).await;
+        let stream =
+            tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        let req = Request::builder()
+            .uri("http://a.example/")
+            .header("host", "b.example")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+        let resp = sender.send_request(req).await.expect("request");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"b"));
+    }
+
+    #[test]
+    fn backfill_is_a_noop_without_an_authority() {
+        // An h1 origin-form request: no authority on the URI and no
+        // Host header.  Nothing to backfill, and nothing invented.
+        let mut req = Request::builder()
+            .uri("/some/path")
+            .body(())
+            .expect("valid request");
+        backfill_host_from_authority(&mut req);
+        assert!(req.headers().get(hyper::header::HOST).is_none());
+    }
 
     #[tokio::test]
     async fn policy_unconditional_deny_returns_configured_code() {
