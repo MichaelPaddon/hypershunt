@@ -32,6 +32,8 @@ source "$TESTS_DIR/suite_auth.sh"
 source "$TESTS_DIR/suite_status.sh"
 # shellcheck source=suite_proxy.sh
 source "$TESTS_DIR/suite_proxy.sh"
+# shellcheck source=suite_grpc.sh
+source "$TESTS_DIR/suite_grpc.sh"
 # shellcheck source=suite_cgi.sh
 source "$TESTS_DIR/suite_cgi.sh"
 # shellcheck source=suite_gateways.sh
@@ -132,6 +134,7 @@ suite_static_mime_types
 suite_redirect_variables
 suite_proxy_x_forwarded_for
 suite_proxy_strip_prefix
+suite_grpc
 suite_jwt
 suite_subrequest_auth
 suite_auth_request

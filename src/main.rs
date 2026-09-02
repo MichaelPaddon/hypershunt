@@ -18,6 +18,7 @@ mod config;
 mod dns_provider;
 mod error;
 mod geoip;
+mod grpc;
 mod handler;
 mod headers;
 #[cfg(unix)]

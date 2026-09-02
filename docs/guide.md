@@ -833,6 +833,40 @@ noticing.  `keepalive-interval` sends HTTP/2 PINGs to hold it open
 and to detect a dead peer; `keepalive-timeout` bounds the wait for
 the acknowledgement.  Both are off unless you set them.
 
+#### Failures a client can act on
+
+A gRPC call reports its outcome in a `grpc-status` trailer, not in
+the HTTP status line.  So when hypershunt answers on its own
+behalf -- the backend is unreachable, the policy denied the
+request, the rate limit fired -- a plain HTTP error tells the
+caller nothing useful: the call surfaces as `UNKNOWN`.
+
+For any request whose content-type begins with
+`application/grpc`, hypershunt returns a
+[gRPC status](reference.md#grpc-status-mapping) instead: `200`
+with `grpc-status` and `grpc-message` set.  A dead backend
+becomes `14 UNAVAILABLE`, a denial `7 PERMISSION_DENIED`, an
+unmatched route `12 UNIMPLEMENTED`.
+
+```
+$ curl -s -D- -o/dev/null --http2-prior-knowledge \
+      -H 'content-type: application/grpc' \
+      http://localhost/pkg.Service/Method
+HTTP/2 200
+content-type: application/grpc
+grpc-status: 14
+grpc-message: Bad Gateway (HTTP 502)
+```
+
+This keys off the request, not off the `grpc` block, so a gRPC
+caller gets a usable status even at a location you did not mark
+as a gRPC backend.  Responses the backend produced are never
+rewritten.
+
+Your access log and metrics still record the original status, so
+a `502` from a dead backend remains a `502` to whoever is
+operating the proxy.
+
 **See also:** [Load balancing](#load-balancing), [Health
 checks](#health-checks), [Retries](#retries),
 [Connection pooling and timeouts](#connection-pooling-and-timeouts).

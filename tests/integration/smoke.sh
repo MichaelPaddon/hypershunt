@@ -24,6 +24,7 @@ engine="${CONTAINER_ENGINE:-podman}"
 cargo build --release
 cargo build --release --example h3get
 cargo build --release --example h2c_connect_echo
+cargo build --release --example grpc_echo
 
 "$engine" build -f tests/integration/Containerfile -t hypershunt-test .
 exec "$engine" run --rm hypershunt-test

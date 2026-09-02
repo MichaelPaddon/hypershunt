@@ -23,8 +23,12 @@ COPY target/release/examples/h3get /usr/bin/h3get
 # bridge.  Built with `cargo build --release --example
 # h2c_connect_echo`.
 COPY target/release/examples/h2c_connect_echo /usr/bin/h2c_connect_echo
+# Test-only gRPC-shaped h2c backend: answers `application/grpc` with a
+# `grpc-status` trailer.  Used by suite_grpc.sh.  Built with
+# `cargo build --release --example grpc_echo`.
+COPY target/release/examples/grpc_echo /usr/bin/grpc_echo
 COPY tests/integration/ /opt/tests/
 RUN chmod +x /opt/tests/run.sh /usr/bin/hypershunt /usr/bin/h3get \
-    /usr/bin/h2c_connect_echo
+    /usr/bin/h2c_connect_echo /usr/bin/grpc_echo
 
 CMD ["/opt/tests/run.sh"]

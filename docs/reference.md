@@ -3014,7 +3014,49 @@ a cleartext connection.
 `TE: trailers` is forwarded to the upstream and the upstream's
 response trailers (where a gRPC call's `grpc-status` lives) are
 returned to the client.  Those two are not gated on this node --
-hypershunt preserves them for every proxied request.
+hypershunt preserves them for every proxied request.  Neither is
+the status mapping below, which keys off the request's
+content-type.
+
+##### gRPC status mapping
+
+When hypershunt answers a request of its own accord -- the
+backend is unreachable, the policy denied it, the rate limit
+fired -- it produces a plain HTTP error, which a gRPC client can
+only read as a broken transport (`UNKNOWN`, with no detail).
+
+For any request whose `Content-Type` begins with
+`application/grpc`, hypershunt instead returns a gRPC
+"Trailers-Only" reply: HTTP `200` with `grpc-status` and
+`grpc-message` in the headers.  To a gRPC client the call has
+completed and its outcome is the status.  Configured
+response-headers survive the rewrite, so CORS headers a
+gRPC-Web caller needs are still present.
+
+This is keyed on the request, not on the [`grpc`](#grpc) node, so
+a gRPC caller gets a usable status even at a location that is not
+marked as a gRPC backend.  A response the backend produced is
+never rewritten: if it already carries `grpc-status` or an
+`application/grpc` content-type, it passes through untouched, as
+does any `2xx`.
+
+| HTTP | `grpc-status` | Produced by |
+|---|---|---|
+| 400 | 13 INTERNAL | malformed request |
+| 401 | 16 UNAUTHENTICATED | auth challenge |
+| 403 | 7 PERMISSION_DENIED | [`policy`](#policy-location) deny |
+| 404 | 12 UNIMPLEMENTED | no location matched |
+| 408 | 4 DEADLINE_EXCEEDED | [`handler`](#handler) timeout |
+| 413 | 8 RESOURCE_EXHAUSTED | [`max-request-body`](#max-request-body) |
+| 429 | 14 UNAVAILABLE | [`rate-limit`](#rate-limit) |
+| 3xx | 16 UNAUTHENTICATED | login redirect a client cannot follow |
+| 500 | 13 INTERNAL | internal error |
+| 502, 503, 504 | 14 UNAVAILABLE | no healthy upstream, backend error |
+| anything else | 2 UNKNOWN | |
+
+The access log and the metrics keep recording the original HTTP
+status, so a `502` from a dead backend stays visible as a `502`
+to whoever is operating the proxy.
 
 Rejected at parse time in combination with:
 

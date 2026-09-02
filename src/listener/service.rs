@@ -250,6 +250,12 @@ impl HypershuntService {
                 .and_then(|v| v.to_str().ok())
                 .map(ToOwned::to_owned);
 
+            // Is this a gRPC call?  Read before the handler consumes
+            // the request, so a failure hypershunt generates itself
+            // can be reported as a gRPC status rather than as an HTML
+            // error the client can only read as a broken transport.
+            let is_grpc = crate::grpc::is_grpc_request(req.headers());
+
             // Capture Referer + User-Agent for combined/JSON access-log
             // formats before the request is consumed by the handler.
             let referer = req
@@ -284,7 +290,10 @@ impl HypershuntService {
                     max,
                     "request body too large"
                 );
-                return Ok(response_413());
+                return Ok(crate::grpc::map_response(
+                    response_413(),
+                    is_grpc,
+                ));
             }
 
             state.metrics.inc_active();
@@ -1276,7 +1285,21 @@ impl HypershuntService {
                 protocol, referer.as_deref(), user_agent.as_deref(),
                 &log_extra,
             );
-            Ok(resp)
+
+            // Report a failure hypershunt generated itself as a gRPC
+            // status.  Every routed response funnels through here, so
+            // this one call covers the proxy's 502s, the handler
+            // timeout, policy denials, the rate limit, the per-location
+            // body cap, and an unmatched route.  Built-in endpoints
+            // that return earlier (ACME, health, JWKS, the OIDC login
+            // flow) are deliberately not covered: a gRPC client never
+            // addresses them.
+            //
+            // Deliberately after the metrics and the access log, so
+            // both keep recording the real HTTP failure -- an operator
+            // debugging a dead backend needs to see the 502, not the
+            // 200 the client is handed.
+            Ok(crate::grpc::map_response(resp, is_grpc))
         }
     }
 
@@ -2509,6 +2532,176 @@ mod tests {
             .get_h("h", "/", &[("authorization", "Basic Zm9vOmJhcg==")])
             .await;
         assert_eq!(status, hyper::StatusCode::UNAUTHORIZED);
+    }
+
+    // -- gRPC status mapping ---------------------------------------
+    //
+    // These drive the same policy / rate-limit / routing paths as the
+    // tests above, but with a gRPC content-type, so what is pinned is
+    // the end-to-end behaviour a gRPC client observes rather than the
+    // mapping table (unit-tested in `crate::grpc`).
+
+    const GRPC_CT: (&str, &str) = ("content-type", "application/grpc");
+
+    #[tokio::test]
+    async fn grpc_policy_deny_maps_to_permission_denied() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "h" {
+                location "/" {
+                    policy { deny code=403 }
+                    static root="/tmp"
+                }
+            }
+            "#,
+        )
+        .await;
+        let (status, headers, _b) =
+            srv.get_h("h", "/pkg.Svc/M", &[GRPC_CT]).await;
+        // 200 with a status trailer is a *completed* call as far as
+        // the client is concerned; the outcome is in grpc-status.
+        assert_eq!(status, hyper::StatusCode::OK);
+        assert_eq!(headers.get("grpc-status").unwrap(), "7");
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "application/grpc"
+        );
+        assert_eq!(
+            headers.get("grpc-message").unwrap(),
+            "Forbidden (HTTP 403)"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_unmatched_route_maps_to_unimplemented() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "h" {
+                location "/api/" { static root="/tmp" }
+            }
+            "#,
+        )
+        .await;
+        let (status, headers, _b) =
+            srv.get_h("h", "/pkg.Svc/M", &[GRPC_CT]).await;
+        assert_eq!(status, hyper::StatusCode::OK);
+        assert_eq!(headers.get("grpc-status").unwrap(), "12");
+    }
+
+    #[tokio::test]
+    async fn grpc_rate_limit_maps_to_unavailable() {
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "h" {
+                location "/" {
+                    rate-limit rate=1 per="minute" burst=1 {
+                        key "client-ip"
+                    }
+                    static root="/tmp"
+                }
+            }
+            "#,
+        )
+        .await;
+        let _ = srv.get_h("h", "/pkg.Svc/M", &[GRPC_CT]).await;
+        let (status, headers, _b) =
+            srv.get_h("h", "/pkg.Svc/M", &[GRPC_CT]).await;
+        assert_eq!(status, hyper::StatusCode::OK);
+        assert_eq!(headers.get("grpc-status").unwrap(), "14");
+        // Retry-After was set on the 429 and survives the rewrite,
+        // because the response is edited rather than rebuilt.
+        assert!(headers.get("retry-after").is_some());
+    }
+
+    #[tokio::test]
+    async fn grpc_dead_upstream_maps_to_unavailable_keeping_headers() {
+        // The headline case: the backend is unreachable, so the proxy
+        // answers 502 on its own behalf.  Also pins the reason the
+        // rewrite edits the response rather than rebuilding it -- a
+        // gRPC-Web caller in a browser cannot read the status it is
+        // sent unless the configured CORS header survives.
+        let _ = rustls::crypto::aws_lc_rs::default_provider()
+            .install_default();
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "h" {
+                location "/" {
+                    response-headers {
+                        set "Access-Control-Allow-Origin" "*"
+                    }
+                    proxy {
+                        // Port 1 is reliably refused, not filtered.
+                        upstream "http://127.0.0.1:1"
+                        grpc
+                    }
+                }
+            }
+            "#,
+        )
+        .await;
+        let (status, headers, body) =
+            srv.get_h("h", "/pkg.Svc/M", &[GRPC_CT]).await;
+        assert_eq!(status, hyper::StatusCode::OK);
+        assert_eq!(headers.get("grpc-status").unwrap(), "14");
+        assert_eq!(
+            headers.get("access-control-allow-origin").unwrap(),
+            "*"
+        );
+        // The HTML error body is replaced, not merely relabelled.
+        // The rewrite drops the stale Content-Length; hyper re-frames
+        // the now-empty body and emits `0` of its own accord.
+        assert!(body.is_empty(), "expected an empty body, got {body:?}");
+        assert_eq!(headers.get("content-length").unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn non_grpc_request_is_left_alone() {
+        // The same denial without a gRPC content-type must behave
+        // exactly as it did before this mapping existed.
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "h" {
+                location "/" {
+                    policy { deny code=403 }
+                    static root="/tmp"
+                }
+            }
+            "#,
+        )
+        .await;
+        let (status, headers, _b) = srv.get("h", "/pkg.Svc/M").await;
+        assert_eq!(status, hyper::StatusCode::FORBIDDEN);
+        assert!(headers.get("grpc-status").is_none());
+    }
+
+    #[tokio::test]
+    async fn grpc_body_cap_maps_to_resource_exhausted() {
+        // The listener-wide cap returns before routing, so it needs
+        // the mapping applied at its own exit rather than at the
+        // shared one.
+        let srv = TestServer::start(
+            r#"
+            listener "tcp://{addr}" max-request-body=10
+            vhost "h" {
+                location "/" { static root="/tmp" }
+            }
+            "#,
+        )
+        .await;
+        let (status, headers, _b) = srv
+            .get_h(
+                "h",
+                "/pkg.Svc/M",
+                &[GRPC_CT, ("content-length", "1000")],
+            )
+            .await;
+        assert_eq!(status, hyper::StatusCode::OK);
+        assert_eq!(headers.get("grpc-status").unwrap(), "8");
     }
 
     #[tokio::test]
