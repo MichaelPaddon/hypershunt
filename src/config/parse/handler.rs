@@ -336,6 +336,32 @@ fn parse_proxy(
     let active_health = parse_active_health(node, src, name)?;
     let passive_health = parse_passive_health(node);
     let retry = parse_retry(node, src, name)?;
+    let grpc = parse_grpc(node, src, name)?;
+    if grpc.is_some() {
+        // Each of these three rejections guards a path that cannot
+        // carry a gRPC stream, and failing at parse time is far
+        // kinder than a runtime hang or a mangled frame.
+        if retry.max > 0 {
+            bail!(
+                "{name}:{line}: proxy 'grpc' cannot be combined with \
+                 'retry max' > 0: retry buffers the whole request \
+                 body, which never completes for a streaming RPC"
+            );
+        }
+        if proxy_protocol.is_some() {
+            bail!(
+                "{name}:{line}: proxy 'grpc' cannot be combined with \
+                 proxy-protocol=: that upstream path speaks HTTP/1.1 \
+                 only"
+            );
+        }
+        if scheme == crate::config::ProxyUpstreamScheme::H3 {
+            bail!(
+                "{name}:{line}: proxy 'grpc' cannot be combined with \
+                 scheme=\"h3\": gRPC over HTTP/3 is not supported"
+            );
+        }
+    }
     Ok(HandlerConfig::Proxy {
         upstreams,
         lb_policy,
@@ -351,7 +377,65 @@ fn parse_proxy(
         pool_max_idle,
         upstream_tls,
         connect_timeout_secs,
+        grpc,
     })
+}
+
+/// Parse the optional `grpc` child of a `proxy` handler.
+///
+/// The node's boolean argument is optional, so the common case is
+/// just `grpc`.  `grpc #false` is the same as omitting the node,
+/// which lets a generated or templated config turn gRPC off without
+/// deleting the line and its keepalive settings.
+fn parse_grpc(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<Option<crate::config::GrpcConfig>> {
+    let Some(g) = node.children().and_then(|d| {
+        d.nodes().iter().find(|n| n.name().value() == "grpc")
+    }) else {
+        return Ok(None);
+    };
+    let line = node_line(src, g);
+    if let Some(entry) = g.get(0) {
+        match entry.as_bool() {
+            Some(false) => return Ok(None),
+            Some(true) => {}
+            None => bail!(
+                "{name}:{line}: proxy 'grpc' takes an optional \
+                 boolean argument (#true or #false)"
+            ),
+        }
+    }
+    let keepalive_interval_secs =
+        prop_i64(g, "keepalive-interval").map(|n| n as u64);
+    let keepalive_timeout_secs =
+        prop_i64(g, "keepalive-timeout").map(|n| n as u64);
+    // A timeout with no interval would never fire: no PING is ever
+    // sent, so nothing can time out waiting for its ACK.  Reject it
+    // rather than silently ignore the value the operator set.
+    if keepalive_timeout_secs.is_some()
+        && keepalive_interval_secs.is_none()
+    {
+        bail!(
+            "{name}:{line}: proxy 'grpc keepalive-timeout' requires \
+             keepalive-interval= (without it no PING is ever sent)"
+        );
+    }
+    if keepalive_interval_secs == Some(0) {
+        bail!(
+            "{name}:{line}: proxy 'grpc keepalive-interval' must be \
+             greater than zero; omit the property to disable \
+             keepalive"
+        );
+    }
+    Ok(Some(crate::config::GrpcConfig {
+        keepalive_interval_secs,
+        keepalive_timeout_secs,
+        keepalive_while_idle: prop_bool(g, "keepalive-while-idle")
+            .unwrap_or(false),
+    }))
 }
 
 fn parse_active_health(

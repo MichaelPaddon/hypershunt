@@ -592,6 +592,170 @@ fn proxy_retry_requires_on_status_when_enabled() {
 }
 
 #[test]
+fn proxy_grpc_block_parses() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://[::]:80"
+        vhost h {
+            location "/" {
+                proxy {
+
+                    upstream "http://a:8080"
+                    grpc keepalive-interval=30 keepalive-timeout=10 \
+                         keepalive-while-idle=#true
+}
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    match &cfg.vhosts[0].locations[0].handler {
+        HandlerConfig::Proxy { grpc, .. } => {
+            let g = grpc.as_ref().expect("grpc block");
+            assert_eq!(g.keepalive_interval_secs, Some(30));
+            assert_eq!(g.keepalive_timeout_secs, Some(10));
+            assert!(g.keepalive_while_idle);
+        }
+        _ => panic!("expected Proxy handler"),
+    }
+}
+
+#[test]
+fn proxy_grpc_bare_and_boolean_forms_parse() {
+    // A bare `grpc` node and an explicit `grpc #true` mean the same
+    // thing; `grpc #false` is equivalent to omitting the node, so a
+    // generated config can disable it without deleting the line.
+    for (kdl, want) in [
+        ("grpc", true),
+        ("grpc #true", true),
+        ("grpc #false", false),
+        ("", false),
+    ] {
+        let cfg = Config::parse(&format!(
+            r#"
+            listener "tcp://[::]:80"
+            vhost h {{
+                location "/" {{
+                    proxy {{
+
+                        upstream "http://a:8080"
+                        {kdl}
+}}
+                }}
+            }}
+            "#
+        ))
+        .unwrap();
+        match &cfg.vhosts[0].locations[0].handler {
+            HandlerConfig::Proxy { grpc, .. } => assert_eq!(
+                grpc.is_some(),
+                want,
+                "for {kdl:?}"
+            ),
+            _ => panic!("expected Proxy handler"),
+        }
+    }
+}
+
+#[test]
+fn proxy_grpc_rejects_retry() {
+    // Retry buffers the whole request body, which never completes
+    // for a client-streaming RPC.
+    let err = grpc_proxy_err("grpc
+                    retry max=2 {
+on-status 502
+}");
+    assert!(
+        err.contains("grpc") && err.contains("retry"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn proxy_grpc_rejects_proxy_protocol() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://[::]:80"
+        vhost h {
+            location "/" {
+                proxy proxy-protocol="v2" {
+
+                    upstream "http://a:8080"
+                    grpc
+}
+            }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("grpc") && err.contains("proxy-protocol"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn proxy_grpc_rejects_h3_scheme() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://[::]:80"
+        vhost h {
+            location "/" {
+                proxy scheme="h3" {
+
+                    upstream "https://a:8443"
+                    grpc
+}
+            }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("grpc") && err.contains("h3"), "got: {err}");
+}
+
+#[test]
+fn proxy_grpc_rejects_keepalive_timeout_without_interval() {
+    // Without an interval no PING is ever sent, so the timeout could
+    // never fire -- silently ignoring it would hide the mistake.
+    let err = grpc_proxy_err("grpc keepalive-timeout=10");
+    assert!(
+        err.contains("keepalive-timeout")
+            && err.contains("keepalive-interval"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn proxy_grpc_rejects_zero_keepalive_interval() {
+    let err = grpc_proxy_err("grpc keepalive-interval=0");
+    assert!(err.contains("keepalive-interval"), "got: {err}");
+}
+
+/// Parse a proxy location whose `grpc` configuration is expected to be
+/// rejected, and return the error text.
+fn grpc_proxy_err(grpc_kdl: &str) -> String {
+    Config::parse(&format!(
+        r#"
+        listener "tcp://[::]:80"
+        vhost h {{
+            location "/" {{
+                proxy {{
+
+                    upstream "http://a:8080"
+                    {grpc_kdl}
+}}
+            }}
+        }}
+        "#
+    ))
+    .unwrap_err()
+    .to_string()
+}
+
+#[test]
 fn location_rate_limit_block_parses() {
     let cfg = Config::parse(
         r#"

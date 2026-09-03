@@ -92,16 +92,31 @@ pub(super) enum ProxyClient {
 
 // Hop-by-hop headers that must not be forwarded (RFC 7230 s.6.1).
 // These are connection-specific and meaningless to the next hop.
+// `trailers` is deliberately absent: it is a *value* of TE, not a
+// header name, and listing it here only ever removed a header no
+// client sends.
 static HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
     "te",
-    "trailers",
     "transfer-encoding",
     "upgrade",
 ];
+
+/// True when a `TE` header value contains the `trailers` token.
+/// Token comparison is case-insensitive and ignores any q-value
+/// parameter, so `TE: trailers, deflate;q=0.5` matches.
+fn te_accepts_trailers(value: &str) -> bool {
+    value.split(',').any(|tok| {
+        tok.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("trailers")
+    })
+}
 
 /// Reverse-proxy handler.  Owns a Vec of per-upstream clients
 /// ([`InnerProxyClient`]) plus an [`UpstreamPool`] that picks one per
@@ -140,6 +155,7 @@ impl ProxyHandler {
         pool_max_idle: Option<u32>,
         skip_verify: bool,
         connect_timeout_secs: Option<u64>,
+        grpc: Option<&crate::config::GrpcConfig>,
     ) -> anyhow::Result<Self> {
         let inner = InnerProxyClient::new(
             upstream_str,
@@ -150,6 +166,7 @@ impl ProxyHandler {
             pool_max_idle,
             skip_verify,
             connect_timeout_secs,
+            grpc,
         )?;
         let upstreams = vec![Arc::new(crate::lb::Upstream::new(
             upstream_str.to_string(),
@@ -193,6 +210,7 @@ impl ProxyHandler {
         pool_max_idle: Option<u32>,
         skip_verify: bool,
         connect_timeout_secs: Option<u64>,
+        grpc: Option<crate::config::GrpcConfig>,
         metrics: Arc<crate::metrics::Metrics>,
     ) -> anyhow::Result<Self> {
         if upstreams_cfg.is_empty() {
@@ -209,6 +227,7 @@ impl ProxyHandler {
                 pool_max_idle,
                 skip_verify,
                 connect_timeout_secs,
+                grpc.as_ref(),
             )?);
         }
         let upstream_handles = crate::lb::build_upstreams(upstreams_cfg);
@@ -628,11 +647,26 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
         })
         .unwrap_or_default();
 
+    // `TE: trailers` is the one hop-by-hop value that must survive the
+    // hop: RFC 7540 s.8.1.2.2 permits exactly that token over HTTP/2,
+    // and a gRPC backend needs it to know the client will read the
+    // trailers its status rides in.  Note what is preserved is the
+    // token, not the header: any other TE value (`deflate`, `gzip`)
+    // is still dropped, because it describes this connection only.
+    let keep_te = headers
+        .get("te")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(te_accepts_trailers);
+
     for name in HOP_BY_HOP {
         headers.remove(*name);
     }
     for name in connection_listed {
         headers.remove(name);
+    }
+
+    if keep_te {
+        headers.insert("te", HeaderValue::from_static("trailers"));
     }
 }
 
@@ -758,13 +792,13 @@ mod tests {
 
     #[test]
     fn new_accepts_http_upstream() {
-        assert!(ProxyHandler::new("http://backend:8080", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None).is_ok());
+        assert!(ProxyHandler::new("http://backend:8080", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None).is_ok());
     }
 
     #[test]
     fn new_accepts_https_upstream() {
         assert!(
-            ProxyHandler::new("https://backend:8443", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None).is_ok(),
+            ProxyHandler::new("https://backend:8443", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None).is_ok(),
             "https upstream should be accepted"
         );
     }
@@ -772,7 +806,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn new_accepts_unix_upstream() {
-        let h = ProxyHandler::new("unix:/run/app.sock", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None);
+        let h = ProxyHandler::new("unix:/run/app.sock", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None);
         assert!(h.is_ok(), "unix: upstream should be accepted on unix");
         // The internal URI collapses to localhost so that Host header
         // is a sensible value for the backend.
@@ -783,18 +817,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn new_unix_upstream_uses_http_localhost_uri() {
-        let h = ProxyHandler::new("unix:/run/app.sock", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None).unwrap();
+        let h = ProxyHandler::new("unix:/run/app.sock", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None).unwrap();
         assert_eq!(h.upstream().scheme_str(), Some("http"));
     }
 
     #[test]
     fn new_rejects_invalid_scheme() {
-        assert!(ProxyHandler::new("ftp://backend", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None).is_err());
+        assert!(ProxyHandler::new("ftp://backend", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None).is_err());
     }
 
     #[test]
     fn new_rejects_missing_host() {
-        assert!(ProxyHandler::new("http:///path", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None).is_err());
+        assert!(ProxyHandler::new("http:///path", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None).is_err());
     }
 
     // -- build_backend_uri -----------------------------------------
@@ -888,6 +922,51 @@ mod tests {
     }
 
     #[test]
+    fn strip_hop_by_hop_preserves_te_trailers() {
+        // gRPC backends need `TE: trailers` to survive the hop; the
+        // other TE values describe this connection only and must not.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "te",
+            HeaderValue::from_static("trailers, deflate;q=0.5"),
+        );
+        strip_hop_by_hop(&mut headers);
+        assert_eq!(headers.get("te").unwrap(), "trailers");
+    }
+
+    #[test]
+    fn strip_hop_by_hop_drops_te_without_trailers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("te", HeaderValue::from_static("gzip"));
+        strip_hop_by_hop(&mut headers);
+        assert!(headers.get("te").is_none());
+    }
+
+    #[test]
+    fn strip_hop_by_hop_preserves_te_named_in_connection() {
+        // `Connection: te` would otherwise remove the header a second
+        // time, after the HOP_BY_HOP sweep already did.
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", HeaderValue::from_static("te"));
+        headers.insert("te", HeaderValue::from_static("trailers"));
+        strip_hop_by_hop(&mut headers);
+        assert_eq!(headers.get("te").unwrap(), "trailers");
+        assert!(headers.get("connection").is_none());
+    }
+
+    #[test]
+    fn te_accepts_trailers_is_case_and_space_insensitive() {
+        assert!(te_accepts_trailers("trailers"));
+        assert!(te_accepts_trailers("Trailers"));
+        assert!(te_accepts_trailers("gzip, TRAILERS "));
+        assert!(te_accepts_trailers("trailers;q=1.0"));
+        assert!(!te_accepts_trailers("gzip"));
+        assert!(!te_accepts_trailers(""));
+        // A prefix must not match: `trailersx` is a different token.
+        assert!(!te_accepts_trailers("trailersx"));
+    }
+
+    #[test]
     fn strip_hop_by_hop_removes_connection_listed_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -943,7 +1022,7 @@ mod tests {
         let h = ProxyHandler::new(
             "unix:/run/app.sock",
             false,
-            Some(ProxyProtocolVersion::V2), crate::config::ProxyUpstreamScheme::Auto, None, None, false, None);
+            Some(ProxyProtocolVersion::V2), crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None);
         assert!(h.is_ok(), "unix + proxy-protocol should be accepted");
     }
 
@@ -981,6 +1060,7 @@ mod tests {
             None,
         None,
         false,
+        None,
         None,
         )
         .unwrap();
@@ -1071,6 +1151,7 @@ mod tests {
             None,
         None,
         false,
+        None,
         None,
         )
         .unwrap();
@@ -1164,6 +1245,7 @@ mod tests {
         None,
         false,
         None,
+        None,
         )
         .unwrap();
         let req = hyper::Request::builder()
@@ -1182,6 +1264,233 @@ mod tests {
         // resetting to `Version::default()` we let hyper-util decide
         // based on the upstream's ALPN.
         assert_eq!(backend.version(), hyper::Version::default());
+    }
+
+    // -- gRPC transport tests ---------------------------------------
+
+    /// What a [`spawn_recording_backend`] request looked like on the
+    /// wire: the HTTP version it arrived over and its `TE` header.
+    type SeenRequest = Arc<
+        std::sync::Mutex<Option<(hyper::Version, Option<String>)>>,
+    >;
+
+    /// Spawn a backend that accepts HTTP/1.1 *and* prior-knowledge
+    /// HTTP/2, records what it saw into `seen`, and answers with a
+    /// body plus a `grpc-status` trailer.  Accepting both protocols is
+    /// the point: it lets a test observe which one the proxy chose
+    /// rather than forcing the answer.
+    async fn spawn_recording_backend(seen: SeenRequest) -> SocketAddr {
+        use bytes::Bytes;
+        use futures_util::stream;
+        use http_body_util::{BodyExt as _, StreamBody};
+        use hyper::body::{Frame, Incoming};
+        use hyper::service::service_fn;
+        use hyper::{HeaderMap, Request, Response};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto;
+        use std::convert::Infallible;
+        use tokio::net::TcpListener;
+
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = backend.accept().await {
+                let seen = seen.clone();
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let seen = seen.clone();
+                    async move {
+                        let te = req
+                            .headers()
+                            .get("te")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        *seen.lock().expect("test mutex") =
+                            Some((req.version(), te));
+                        let mut trailers = HeaderMap::new();
+                        trailers
+                            .insert("grpc-status", "0".parse().unwrap());
+                        let body = StreamBody::new(stream::iter(vec![
+                            Ok::<_, std::io::Error>(Frame::data(
+                                Bytes::from_static(b"pong"),
+                            )),
+                            Ok(Frame::trailers(trailers)),
+                        ]));
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .header(
+                                    "content-type",
+                                    "application/grpc",
+                                )
+                                .body(body.boxed_unsync())
+                                .expect("valid response"),
+                        )
+                    }
+                });
+                tokio::spawn(async move {
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(sock), svc)
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+
+    /// End-to-end HTTP/2: an h2 client through hypershunt to a
+    /// plaintext h2c backend.  Before `grpc` existed the outbound leg
+    /// was always HTTP/1.1 (ALPN cannot negotiate on cleartext), so a
+    /// gRPC backend was unreachable.  Asserts all three halves of the
+    /// contract at once: the backend sees HTTP/2, it sees the
+    /// `TE: trailers` the client sent, and the trailers it answers
+    /// with arrive back at the client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grpc_proxies_h2c_end_to_end_with_trailers() {
+        use bytes::Bytes;
+        use http_body_util::{BodyExt as _, Empty};
+        use hyper::Request;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use std::sync::Mutex;
+
+        // The proxy's HttpsConnector builds a rustls ClientConfig even
+        // for plaintext upstreams, which needs a process-wide provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider()
+            .install_default();
+
+        // What the backend saw, for the assertions below.
+        let seen: SeenRequest = Arc::new(Mutex::new(None));
+
+        let backend_addr = spawn_recording_backend(seen.clone()).await;
+
+        let template = format!(
+            r#"
+            listener "tcp://{{addr}}" {{ }}
+            vhost "example.com" {{
+                location "/" {{
+                    proxy {{
+                        upstream "http://{backend_addr}"
+                        grpc
+                    }}
+                }}
+            }}
+            "#,
+        );
+        let srv = crate::test::TestServer::start(&template).await;
+
+        // h2 prior-knowledge client into hypershunt's plain listener,
+        // so both legs of the proxy run over HTTP/2.
+        let stream =
+            tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2 handshake with hypershunt");
+        tokio::spawn(conn);
+
+        let req = Request::builder()
+            .uri("/pkg.Svc/Method")
+            .header("host", "example.com")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+        let resp = sender.send_request(req).await.expect("proxied request");
+        assert_eq!(resp.status(), 200);
+
+        let collected =
+            resp.into_body().collect().await.expect("collect body");
+        let trailers = collected.trailers().cloned();
+        assert_eq!(collected.to_bytes(), Bytes::from_static(b"pong"));
+        assert_eq!(
+            trailers
+                .as_ref()
+                .and_then(|t| t.get("grpc-status"))
+                .map(|v| v.as_bytes()),
+            Some(&b"0"[..]),
+            "backend trailers must reach the client"
+        );
+
+        let (version, te) =
+            seen.lock().expect("test mutex").clone().expect("backend saw a request");
+        assert_eq!(version, hyper::Version::HTTP_2);
+        assert_eq!(te.as_deref(), Some("trailers"));
+    }
+
+    /// The companion to the test above: with no `grpc` block the same
+    /// plaintext upstream is still reached over HTTP/1.1, because ALPN
+    /// cannot negotiate on a cleartext connection.  This is what makes
+    /// the opt-in necessary rather than cosmetic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn plaintext_upstream_without_grpc_stays_http1() {
+        use std::sync::Mutex;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider()
+            .install_default();
+        let seen: SeenRequest = Arc::new(Mutex::new(None));
+        let backend_addr = spawn_recording_backend(seen.clone()).await;
+
+        let template = format!(
+            r#"
+            listener "tcp://{{addr}}" {{ }}
+            vhost "example.com" {{
+                location "/" {{
+                    proxy {{
+                        upstream "http://{backend_addr}"
+                    }}
+                }}
+            }}
+            "#,
+        );
+        let srv = crate::test::TestServer::start(&template).await;
+        let (status, _, _) =
+            crate::test::http_get(srv.addr, "example.com", "/x").await;
+        assert_eq!(status, 200);
+
+        let (version, _) = seen
+            .lock()
+            .expect("test mutex")
+            .clone()
+            .expect("backend saw a request");
+        assert_eq!(version, hyper::Version::HTTP_11);
+    }
+
+    /// `scheme="h2c"` used to affect only the upgrade-bridge tunnel;
+    /// ordinary forwarded requests silently fell back to HTTP/1.1.
+    /// It now selects the protocol for every request on the pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scheme_h2c_applies_to_ordinary_requests() {
+        use std::sync::Mutex;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider()
+            .install_default();
+        let seen: SeenRequest = Arc::new(Mutex::new(None));
+        let backend_addr = spawn_recording_backend(seen.clone()).await;
+
+        let template = format!(
+            r#"
+            listener "tcp://{{addr}}" {{ }}
+            vhost "example.com" {{
+                location "/" {{
+                    proxy scheme="h2c" {{
+                        upstream "http://{backend_addr}"
+                    }}
+                }}
+            }}
+            "#,
+        );
+        let srv = crate::test::TestServer::start(&template).await;
+        let (status, _, _) =
+            crate::test::http_get(srv.addr, "example.com", "/x").await;
+        assert_eq!(status, 200);
+
+        let (version, _) = seen
+            .lock()
+            .expect("test mutex")
+            .clone()
+            .expect("backend saw a request");
+        assert_eq!(version, hyper::Version::HTTP_2);
     }
 
     // -- Multi-upstream retry tests --------------------------------
@@ -1247,6 +1556,7 @@ mod tests {
             None,
             false,
             None,
+            None,
             metrics.clone(),
         )
         .unwrap();
@@ -1294,6 +1604,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             metrics.clone(),
         )
@@ -1343,6 +1654,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             metrics.clone(),
         )
@@ -1475,6 +1787,7 @@ mod tests {
             None,
             false,
             None,
+            None,
             metrics.clone(),
         )
         .unwrap();
@@ -1536,6 +1849,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             metrics.clone(),
         )
@@ -1608,6 +1922,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             metrics.clone(),
         )

@@ -534,6 +534,24 @@ pub struct RetryConfig {
     pub on_status: Vec<u16>,
 }
 
+/// gRPC mode for a `proxy` handler.  Presence of the block is the
+/// opt-in; the fields tune HTTP/2 keepalive on the upstream
+/// connection.  Enabling gRPC forces HTTP/2 to the upstream
+/// (prior-knowledge h2c for `http://`, ALPN-pinned h2 for
+/// `https://`), because gRPC has no HTTP/1.1 wire format.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrpcConfig {
+    /// Seconds between HTTP/2 PING frames sent to the upstream.
+    /// `None` disables keepalive entirely.
+    pub keepalive_interval_secs: Option<u64>,
+    /// Seconds to wait for a PING ACK before the connection is
+    /// considered dead.  Only meaningful with an interval set.
+    pub keepalive_timeout_secs: Option<u64>,
+    /// Keep pinging even when no streams are open.  Off by default,
+    /// matching hyper-util, so an idle pool does not generate traffic.
+    pub keepalive_while_idle: bool,
+}
+
 /// Wire protocol used by the reverse proxy to reach its upstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProxyUpstreamScheme {
@@ -543,10 +561,10 @@ pub enum ProxyUpstreamScheme {
     /// Force HTTP/3 over QUIC.  Requires an `https://` upstream URL.
     H3,
     /// Force HTTP/2 prior-knowledge over plaintext TCP (RFC 7540
-    /// §3.4).  Used today only by the upgrade-bridge to open
-    /// extended-CONNECT tunnels (RFC 8441) against `http://`
-    /// upstreams that speak h2 directly; non-upgrade requests on
-    /// `Auto` will keep negotiating via the hyper-util pool.
+    /// s.3.4).  Applies both to ordinary forwarded requests and to
+    /// the upgrade-bridge's extended-CONNECT tunnels (RFC 8441).
+    /// Required to reach an `http://` backend that speaks h2 only,
+    /// since ALPN cannot negotiate on a plaintext connection.
     H2c,
 }
 
@@ -915,6 +933,11 @@ pub enum HandlerConfig {
         // connections accepts any certificate.  Only intended for
         // internal upstreams with self-signed certs.
         upstream_tls: Option<UpstreamTlsConfig>,
+        // gRPC mode.  `Some` forces HTTP/2 to the upstream and
+        // carries the upstream keepalive tuning.  Mutually exclusive
+        // with `retry max>0`, `proxy-protocol=`, and `scheme="h3"`
+        // -- none of those can carry a gRPC stream.
+        grpc: Option<GrpcConfig>,
         // Maximum seconds to wait for the upstream connect step.
         // For h1/h2: passed to hyper-util's
         // `HttpConnector::set_connect_timeout`.  For h3: bounds the

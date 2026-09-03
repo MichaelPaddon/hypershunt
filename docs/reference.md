@@ -2920,7 +2920,8 @@ Handler-mode `proxy` carries:
 - Children: [`upstream`](#upstream), [`tls`](#tls-proxy-upstream),
   [`lb-policy`](#lb-policy), [`group-by`](#group-by),
   [`active-health`](#active-health),
-  [`passive-health`](#passive-health), [`retry`](#retry).
+  [`passive-health`](#passive-health), [`retry`](#retry),
+  [`grpc`](#grpc).
 
 ##### upstream
 
@@ -2991,10 +2992,79 @@ Forces a particular wire protocol to the upstream.  One of:
 - `"auto"` (default) — the hyper-util client negotiates HTTP/1.1
   vs HTTP/2 via ALPN.
 - `"h2c"` — HTTP/2 prior-knowledge over plaintext.  Requires
-  `http://` upstreams.  Used by the cross-protocol WebSocket
-  bridge.
+  `http://` upstreams.  Applies to ordinary forwarded requests as
+  well as to the cross-protocol WebSocket bridge.  A `grpc` block
+  implies this, so setting both is redundant.
 - `"h3"` (alias `"http3"`) — HTTP/3 over QUIC.  Requires
   `https://` upstreams.
+
+##### grpc
+
+**Child** of [`proxy`](#proxy-handler).  Optional.
+
+Marks the pool as a gRPC backend.  Presence of the node is the
+opt-in; an explicit `grpc #false` is the same as omitting it.
+
+Enabling gRPC forces HTTP/2 to the upstream -- prior-knowledge
+h2c for `http://` upstreams, ALPN-pinned h2 for `https://` --
+because gRPC has no HTTP/1.1 wire format.  Without it a plaintext
+upstream is reached over HTTP/1.1, since ALPN cannot negotiate on
+a cleartext connection.
+
+`TE: trailers` is forwarded to the upstream and the upstream's
+response trailers (where a gRPC call's `grpc-status` lives) are
+returned to the client.  Those two are not gated on this node --
+hypershunt preserves them for every proxied request.
+
+Rejected at parse time in combination with:
+
+- [`retry`](#retry) `max` > 0 -- retry buffers the whole request
+  body, which never completes for a client-streaming RPC;
+- [`proxy-protocol=`](#proxy-protocol) -- that upstream path
+  speaks HTTP/1.1 only;
+- [`scheme="h3"`](#scheme) -- gRPC over HTTP/3 is not supported.
+
+```kdl
+location "/pkg.Service/" {
+    proxy {
+        upstream "http://grpc1.internal:9000"
+        upstream "http://grpc2.internal:9000"
+        grpc keepalive-interval=30 keepalive-timeout=10
+    }
+}
+```
+
+###### keepalive-interval
+
+**Property** on [`grpc`](#grpc).  Optional integer.
+
+Seconds between HTTP/2 PING frames sent on the upstream
+connection.  A long-lived streaming RPC can sit silent long
+enough for a NAT or idle-timing middlebox to drop the connection
+without either end noticing until the next write fails; PINGs
+keep it alive and surface a dead peer promptly.
+
+**Default:** unset -- no keepalive.  Must be greater than zero.
+
+###### keepalive-timeout
+
+**Property** on [`grpc`](#grpc).  Optional integer.
+
+Seconds to wait for a PING acknowledgement before treating the
+upstream connection as dead.  Requires
+[`keepalive-interval`](#keepalive-interval): without it no PING
+is ever sent, so the timeout could never fire, and setting one
+alone is rejected.
+
+###### keepalive-while-idle
+
+**Property** on [`grpc`](#grpc).  Optional boolean.
+
+Keep sending PINGs even when no streams are open on the
+connection.  Off by default, so an idle pool generates no
+traffic.
+
+**Default:** `#false`.
 
 ##### pool-idle-timeout
 

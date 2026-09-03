@@ -614,6 +614,7 @@ All repeating single-argument children (rule 4).
 - [`<active-health-block>`](#active-health-block)
 - [`<passive-health-block>`](#passive-health-block)
 - [`<retry-block>`](#retry-block)
+- [`<grpc-block>`](#grpc-block)
 
 `upstream` is the only required child (at least one).  It is a
 repeating single-argument child (rule 4); `weight=` is an
@@ -644,6 +645,17 @@ optional per-upstream property.
 ( `"on-status"` [`<integer>`](#integer) )* `}`
 
 `on-status` is a repeating single-argument child (rule 4).
+
+### `grpc-block`
+
+`"grpc"` ( [`<boolean>`](#boolean) )?
+( `keepalive-interval=`[`<integer>`](#integer) )?
+( `keepalive-timeout=`[`<integer>`](#integer) )?
+( `keepalive-while-idle=`[`<boolean>`](#boolean) )?
+
+The boolean argument is optional; a bare `grpc` means `#true`, and
+`grpc #false` is equivalent to omitting the node.
+`keepalive-timeout` requires `keepalive-interval`.
 
 ### `redirect-handler`
 
