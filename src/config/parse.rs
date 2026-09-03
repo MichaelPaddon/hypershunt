@@ -588,6 +588,12 @@ pub(super) fn parse_listener(
                  listeners"
             );
         }
+        if children.iter().any(|n| n.name().value() == "http2") {
+            bail!(
+                "{name}:{proxy_line}: 'http2' is only valid in HTTP \
+                 listeners"
+            );
+        }
         let upstream_str = req_arg_str(proxy, 0)
             .with_context(|| format!("{name}:{proxy_line}"))?;
         let upstream = BoundAddr::parse(&upstream_str).with_context(
@@ -652,6 +658,7 @@ pub(super) fn parse_listener(
             reject_unknown_host: false,
             health: None,
             timeouts: Timeouts::default(),
+            http2: Default::default(),
             max_connections,
             max_request_body: None,
             auto_alt_svc: None,
@@ -699,6 +706,12 @@ pub(super) fn parse_listener(
         .find(|n| n.name().value() == "timeouts")
         .map(parse_timeouts)
         .unwrap_or_default();
+    let http2 = children
+        .iter()
+        .find(|n| n.name().value() == "http2")
+        .map(|n| parse_http2(n, src, name))
+        .transpose()?
+        .unwrap_or_default();
     let accept_proxy_protocol = prop_str(node, "accept-proxy-protocol")
         .map(|v| parse_proxy_protocol(&v, name, line))
         .transpose()?;
@@ -723,6 +736,7 @@ pub(super) fn parse_listener(
         reject_unknown_host,
         health: prop_bool(node, "health"),
         timeouts,
+        http2,
         max_connections,
         max_request_body,
         auto_alt_svc: None,
@@ -793,6 +807,52 @@ fn parse_timeouts(node: &KdlNode) -> Timeouts {
         handler_secs: prop_i64(node, "handler").map(|n| n as u64),
         keepalive_secs: prop_i64(node, "keepalive").map(|n| n as u64),
     }
+}
+
+/// Parse the listener's optional `http2` child.
+///
+/// These are HTTP/2 connection knobs with no HTTP/1.1 equivalent,
+/// which is why they do not live on `timeouts`.
+fn parse_http2(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<crate::config::Http2Config> {
+    let line = node_line(src, node);
+    let keepalive_interval_secs =
+        prop_i64(node, "keepalive-interval").map(|n| n as u64);
+    let keepalive_timeout_secs =
+        prop_i64(node, "keepalive-timeout").map(|n| n as u64);
+    // A timeout with no interval would never fire: no PING is ever
+    // sent, so nothing can time out waiting for its ACK.  Reject it
+    // rather than silently ignore the value the operator set.
+    if keepalive_timeout_secs.is_some()
+        && keepalive_interval_secs.is_none()
+    {
+        bail!(
+            "{name}:{line}: http2 'keepalive-timeout' requires \
+             keepalive-interval= (without it no PING is ever sent)"
+        );
+    }
+    if keepalive_interval_secs == Some(0) {
+        bail!(
+            "{name}:{line}: http2 'keepalive-interval' must be greater \
+             than zero; omit the property to disable keepalive"
+        );
+    }
+    let max_concurrent_streams =
+        prop_i64(node, "max-concurrent-streams").map(|n| n as u32);
+    if max_concurrent_streams == Some(0) {
+        bail!(
+            "{name}:{line}: http2 'max-concurrent-streams' must be \
+             greater than zero; zero would stall every connection"
+        );
+    }
+    Ok(crate::config::Http2Config {
+        keepalive_interval_secs,
+        keepalive_timeout_secs,
+        max_concurrent_streams,
+    })
 }
 
 pub(super) fn parse_vhost(

@@ -54,6 +54,7 @@
             reject_unknown_host: false,
             health: None,
             timeouts: Default::default(),
+            http2: Default::default(),
             max_connections: None,
             max_request_body: None,
             auto_alt_svc: None,
@@ -94,6 +95,7 @@
             reject_unknown_host: false,
             health: None,
             timeouts: Default::default(),
+            http2: Default::default(),
             max_connections: None,
             max_request_body: None,
             auto_alt_svc: None,
@@ -193,6 +195,140 @@
             tokio::net::TcpStream::connect(addr).await.is_err(),
             "connect to closed listener unexpectedly succeeded"
         );
+    }
+
+    /// Read the value the server advertises for one HTTP/2 SETTINGS
+    /// identifier on a fresh connection.  Sends the client preface
+    /// plus an empty SETTINGS frame, then parses the server's own
+    /// SETTINGS frame.  Returns `None` when the identifier is absent,
+    /// which is how hyper reports "left at the protocol default".
+    async fn server_setting(addr: SocketAddr, want_id: u16) -> Option<u32> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SETTINGS: u8 = 0x4;
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Client preface, then a SETTINGS frame with an empty payload:
+        // 3-byte length, type, flags, 4-byte stream id.
+        sock.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        sock.write_all(&[0, 0, 0, SETTINGS, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+
+        let mut head = [0u8; 9];
+        sock.read_exact(&mut head).await.unwrap();
+        let len =
+            u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        assert_eq!(head[3], SETTINGS, "expected SETTINGS first");
+        let mut payload = vec![0u8; len];
+        sock.read_exact(&mut payload).await.unwrap();
+
+        // Each setting is a 2-byte identifier and a 4-byte value.
+        payload.as_chunks::<6>().0.iter().find_map(|c| {
+            let id = u16::from_be_bytes([c[0], c[1]]);
+            (id == want_id).then(|| {
+                u32::from_be_bytes([c[2], c[3], c[4], c[5]])
+            })
+        })
+    }
+
+    // The listener `http2` block must reach hyper's server builder.
+    // hyper exposes no getters, so this reads the value back off the
+    // wire: `max-concurrent-streams` is advertised in the server's
+    // SETTINGS frame, which makes it the one knob in the block that
+    // can be observed directly.  The keepalive PINGs are not visible
+    // this way; they share the same code path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http2_max_concurrent_streams_is_advertised() {
+        const MAX_CONCURRENT_STREAMS: u16 = 0x3;
+
+        let srv = crate::test::TestServer::start(
+            r#"
+            listener "tcp://{addr}" {
+                http2 keepalive-interval=1 keepalive-timeout=1 \
+                      max-concurrent-streams=3
+            }
+            vhost "x" {
+                location "/" { respond status=200 body="ok" }
+            }
+            "#,
+        )
+        .await;
+        assert_eq!(
+            server_setting(srv.addr, MAX_CONCURRENT_STREAMS).await,
+            Some(3)
+        );
+    }
+
+    // Without the block, hyper's own default stands (currently 200).
+    // Asserted as "not the configured value" rather than as the exact
+    // number, so a hyper upgrade that changes its default does not
+    // fail this test; what is being pinned is that an absent `http2`
+    // block leaves the setting alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_http2_block_leaves_stream_cap_at_default() {
+        const MAX_CONCURRENT_STREAMS: u16 = 0x3;
+
+        let srv = crate::test::TestServer::start(
+            r#"
+            listener "tcp://{addr}"
+            vhost "x" {
+                location "/" { respond status=200 body="ok" }
+            }
+            "#,
+        )
+        .await;
+        let advertised =
+            server_setting(srv.addr, MAX_CONCURRENT_STREAMS).await;
+        assert!(
+            !matches!(advertised, Some(3)),
+            "unconfigured listener must not carry the tuned value; \
+             got {advertised:?}"
+        );
+    }
+
+    // A tuned listener must still serve normally: a bad value or a
+    // missing PING timer would break the connection rather than the
+    // setting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http2_tuning_still_serves_requests() {
+        use bytes::Bytes;
+        use http_body_util::{BodyExt as _, Empty};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let srv = crate::test::TestServer::start(
+            r#"
+            listener "tcp://{addr}" {
+                http2 keepalive-interval=1 keepalive-timeout=1 \
+                      max-concurrent-streams=8
+            }
+            vhost "x" {
+                location "/" { respond status=200 body="ok" }
+            }
+            "#,
+        )
+        .await;
+
+        let stream =
+            tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2 handshake");
+        tokio::spawn(conn);
+
+        let req = hyper::Request::builder()
+            .uri("/")
+            .header("host", "x")
+            .body(Empty::<Bytes>::new())
+            .expect("valid request");
+        let resp = sender.send_request(req).await.expect("request");
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"ok"));
     }
 
     // An HTTP/2 connection that completes the protocol handshake but never
@@ -2862,6 +2998,7 @@ index-file "index.html";
             reject_unknown_host: false,
             health: None,
             timeouts: Timeouts::default(),
+            http2: Default::default(),
             max_connections: None,
             max_request_body: None,
             auto_alt_svc: None,

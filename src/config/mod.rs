@@ -301,6 +301,25 @@ pub struct GeoIpConfig {
 mod types_auth;
 pub use types_auth::*;
 
+/// HTTP/2 tuning for an HTTP listener.  All fields are optional;
+/// unset fields leave hyper's defaults in place.
+///
+/// Separate from [`Timeouts`] because those knobs are HTTP/1.1
+/// concepts that hyper maps onto the h1 codec; these apply to the
+/// HTTP/2 connection and have no h1 equivalent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Http2Config {
+    /// Seconds between HTTP/2 PING frames sent to the client.
+    /// `None` disables keepalive entirely.
+    pub keepalive_interval_secs: Option<u64>,
+    /// Seconds to wait for a PING ACK before the connection is
+    /// considered dead.  Only meaningful with an interval set.
+    pub keepalive_timeout_secs: Option<u64>,
+    /// Maximum concurrent streams one client may open on a single
+    /// HTTP/2 connection.
+    pub max_concurrent_streams: Option<u32>,
+}
+
 /// Per-listener connection and request timeout configuration.
 /// All durations are in whole seconds.  `None` means no limit.
 #[derive(Debug, Clone, Default)]
@@ -440,6 +459,9 @@ pub struct ListenerConfig {
     // forces it on.  Ignored on L4 proxy listeners.
     pub health: Option<bool>,
     pub timeouts: Timeouts,
+    // HTTP/2 connection tuning.  Rejected on L4 proxy listeners,
+    // which never speak HTTP.
+    pub http2: Http2Config,
     // Cap on simultaneous open connections; None = unlimited.
     // New connections are deferred (not dropped) at the limit.
     pub max_connections: Option<u32>,

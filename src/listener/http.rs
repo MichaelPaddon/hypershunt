@@ -27,7 +27,10 @@ use tokio::task::JoinSet;
 use tracing::debug;
 
 // Build a hyper auto::Builder with the configured timeout settings.
-fn make_builder(timeouts: &Timeouts) -> auto::Builder<TokioExecutor> {
+fn make_builder(
+    timeouts: &Timeouts,
+    http2: &crate::config::Http2Config,
+) -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
     {
         let mut h1 = builder.http1();
@@ -71,6 +74,27 @@ fn make_builder(timeouts: &Timeouts) -> auto::Builder<TokioExecutor> {
     // `handler::proxy::upgrade` for the matching reverse-proxy
     // side that bridges these tunnels to upstreams.
     builder.http2().enable_connect_protocol();
+    {
+        let mut h2 = builder.http2();
+        // The PING timers need a timer to fire on; only the h1
+        // sub-builder was given one above.
+        h2.timer(TokioTimer::new());
+        // Keepalive PINGs.  A long-lived stream -- a gRPC server
+        // stream, an SSE feed -- can sit silent long enough for a NAT
+        // or an idle-timing middlebox to drop the connection with
+        // neither end noticing until the next write fails.  Off unless
+        // configured: pinging every client that connects is a cost the
+        // operator should choose.
+        if let Some(secs) = http2.keepalive_interval_secs {
+            h2.keep_alive_interval(Duration::from_secs(secs));
+        }
+        if let Some(secs) = http2.keepalive_timeout_secs {
+            h2.keep_alive_timeout(Duration::from_secs(secs));
+        }
+        if let Some(n) = http2.max_concurrent_streams {
+            h2.max_concurrent_streams(n);
+        }
+    }
     builder
 }
 
@@ -110,6 +134,7 @@ pub async fn run_plain(
                         let bind        = name.clone();
                         let lm          = lmetrics.clone();
                         let timeouts    = cfg.timeouts.clone();
+                        let http2       = cfg.http2.clone();
                         let conn_shutdown = shutdown.clone();
                         let proxy_ver   = cfg.accept_proxy_protocol;
                         let trusted_p   = trusted_proxies.clone();
@@ -140,7 +165,7 @@ pub async fn run_plain(
                             let svc = HypershuntService {
                                 state, bind, peer_addr,
                                 local_addr, local_unix: lux,
-                                timeouts, is_tls: false,
+                                timeouts, http2, is_tls: false,
                                 max_body_bytes: max_body,
                                 auto_alt_svc: alt_svc,
                                 client_cert: None,
@@ -225,6 +250,7 @@ pub async fn run_tls(
                         let lm = lmetrics.clone();
                         let bind = name.clone();
                         let svc_timeouts = cfg.timeouts.clone();
+                        let svc_http2 = cfg.http2.clone();
                         let conn_shutdown = shutdown.clone();
                         let proxy_ver = cfg.accept_proxy_protocol;
                         let trusted_p = trusted_proxies.clone();
@@ -323,6 +349,7 @@ pub async fn run_tls(
                                 local_addr,
                                 local_unix: lux,
                                 timeouts: svc_timeouts,
+                                http2: svc_http2,
                                 is_tls: true,
                                 max_body_bytes: max_body,
                                 auto_alt_svc: alt_svc,
@@ -408,7 +435,7 @@ async fn serve_connection<I>(
         svc.lmetrics.clone(),
     );
     debug!(%peer_addr, "accepted connection");
-    let builder = make_builder(&svc.timeouts);
+    let builder = make_builder(&svc.timeouts, &svc.http2);
     // Bound the accept->first-request window so a peer can't hold a
     // connection open without ever completing a request's headers
     // (Slowloris).  HTTP/1 also has hyper's per-request

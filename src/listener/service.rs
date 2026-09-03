@@ -108,6 +108,10 @@ pub struct HypershuntService {
     // Unix domain socket path of the listener; None for TCP listeners.
     pub(super) local_unix: Option<std::path::PathBuf>,
     pub(super) timeouts: Timeouts,
+    // HTTP/2 connection tuning, applied to the hyper server builder
+    // once per connection.  Carried here beside `timeouts` so both
+    // the plaintext and TLS accept loops get it for free.
+    pub(super) http2: crate::config::Http2Config,
     // True for TLS listeners; used to populate the {scheme} template
     // variable in header rules.
     pub(super) is_tls: bool,
@@ -1322,6 +1326,9 @@ impl HypershuntService {
             local_addr: None,
             local_unix: None,
             timeouts,
+            // Unused on this transport: QUIC has its own stream and
+            // keepalive controls, configured via `quic-transport`.
+            http2: crate::config::Http2Config::default(),
             is_tls: true,
             max_body_bytes,
             auto_alt_svc,

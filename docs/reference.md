@@ -2095,6 +2095,63 @@ torn down.  Has no effect on byte-stream listeners.
 
 **Default:** `30`.
 
+### http2
+
+**Child** of [`listener`](#listener).  Optional.  HTTP mode only;
+rejected on an L4 [`proxy`](#proxy-listener) listener, which never
+speaks HTTP.
+
+Tunes the HTTP/2 connection.  All knobs are properties on the node,
+and all are unset by default, leaving hyper's own defaults in place.
+These have no HTTP/1.1 equivalent, which is why they do not live on
+[`timeouts`](#timeouts).  HTTP/3 connections are unaffected; QUIC
+has its own controls under
+[`quic-transport`](#quic-transport).
+
+```kdl
+listener "tcp://[::]:443" {
+    http2 keepalive-interval=30 keepalive-timeout=10 \
+          max-concurrent-streams=250
+}
+```
+
+##### keepalive-interval (http2)
+
+**Property** on [`http2`](#http2).  Optional integer.
+
+Seconds between HTTP/2 PING frames sent to the client.  A
+long-lived stream -- a gRPC server stream, a Server-Sent Events
+feed -- can sit silent long enough for a NAT or an idle-timing
+middlebox to drop the connection without either end noticing
+until the next write fails.  PINGs hold it open and surface a
+dead peer promptly.
+
+**Default:** unset -- no keepalive.  Must be greater than zero.
+
+##### keepalive-timeout (http2)
+
+**Property** on [`http2`](#http2).  Optional integer.
+
+Seconds to wait for a PING acknowledgement before the connection
+is closed as dead.  Requires
+[`keepalive-interval`](#keepalive-interval-http2): without it no
+PING is ever sent, so the timeout could never fire, and setting
+one alone is rejected.
+
+##### max-concurrent-streams
+
+**Property** on [`http2`](#http2).  Optional integer.
+
+Maximum number of concurrent streams one client may open on a
+single HTTP/2 connection.  Caps the per-connection work a single
+peer can demand; requests beyond the limit wait rather than fail.
+Must be greater than zero.
+
+**Default:** the underlying HTTP/2 implementation's own default,
+currently `200`.  Unlike the keepalive knobs, this one is always
+advertised in the server's `SETTINGS` frame whether or not you
+configure it.
+
 ### timeouts
 
 **Child** of [`listener`](#listener).  Optional.  HTTP mode only.
