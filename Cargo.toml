@@ -22,7 +22,7 @@ categories = ["network-programming", "web-programming::http-server"]
 include = [
     "/src/**/*",
     "/build.rs",
-    "/examples/**/*",   # h3get / h2c_connect_echo are declared [[example]] targets
+    "/examples/**/*",   # every example is a declared [[example]] target
     "/README.md",
     "/LICENSE",
     # Embedded at compile time by src/handler/status/render_html.rs
@@ -51,6 +51,14 @@ path = "examples/h3get.rs"
 [[example]]
 name = "h2c_connect_echo"
 path = "examples/h2c_connect_echo.rs"
+
+# Test-only gRPC-shaped h2c backend: answers `application/grpc` with
+# a `grpc-status` trailer.  Used by the shell integration suite to
+# prove hypershunt reaches an h2c backend and passes its trailers
+# through.  Same shipping pattern as the two examples above.
+[[example]]
+name = "grpc_echo"
+path = "examples/grpc_echo.rs"
 
 [dependencies]
 hyper              = { version = "1",    features = ["http1", "http2", "server"] }
