@@ -25,6 +25,7 @@ use hyper_util::rt::TokioExecutor;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tracing::Instrument as _;
 
 // Body type used for requests sent to the upstream.
 // UnsyncBoxBody matches ReqBody's looser bound (Send, !Sync) so the
@@ -288,6 +289,21 @@ impl ProxyHandler {
 
 }
 
+
+/// One client span per upstream attempt, so a retry shows up as its
+/// own row under the request rather than being folded into it.
+fn upstream_span(
+    upstream: &crate::lb::Upstream,
+    attempt: u32,
+) -> tracing::Span {
+    tracing::info_span!(
+        "proxy_upstream",
+        otel.kind = "client",
+        server.address = %upstream.url,
+        attempt,
+    )
+}
+
 #[async_trait]
 impl Handler for ProxyHandler {
     async fn handle(
@@ -351,7 +367,10 @@ impl Handler for ProxyHandler {
             let _guard = upstream.in_flight_guard();
             let req_bytes = content_length(req.headers());
             let start = std::time::Instant::now();
-            let resp = self.inners[idx].serve(req, matched_prefix).await;
+            let resp = self.inners[idx]
+                .serve(req, matched_prefix)
+                .instrument(upstream_span(&upstream, 0))
+                .await;
             self.record_upstream(&upstream, start, req_bytes, &resp);
             self.record_outcome(&upstream, resp.status().as_u16());
             return resp;
@@ -396,6 +415,7 @@ impl Handler for ProxyHandler {
             let start = std::time::Instant::now();
             let resp = self.inners[idx]
                 .serve(attempt_req, matched_prefix)
+                .instrument(upstream_span(&upstream, attempt))
                 .await;
             self.record_upstream(
                 &upstream,

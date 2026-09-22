@@ -432,3 +432,41 @@ upstream error ratio
 `rate(hypershunt_upstream_errors_total[5m]) / rate(hypershunt_upstream_requests_total[5m])`.
 
 **See also:** [Reference — metrics](reference.md#metrics).
+
+## Distributed tracing to Jaeger or Tempo
+
+Export a span per request, plus one per upstream attempt, and hand
+the backend a `traceparent` so its own spans join the same trace:
+
+```kdl
+server {
+    tracing endpoint="http://otel-collector:4318/v1/traces" \
+            sample-ratio=0.1 service-name="edge"
+}
+
+listener "tcp://0.0.0.0:443" { tls acme { domain "example.com" } }
+
+vhost "example.com" {
+    location "/api" { proxy { upstream "http://10.0.0.5:8080" } }
+    location "/" { static root="/var/www/example" }
+}
+```
+
+Try it locally against Jaeger's all-in-one image, which accepts OTLP
+directly and needs no collector:
+
+```
+podman run --rm -p 16686:16686 -p 4318:4318 \
+    docker.io/jaegertracing/all-in-one
+```
+
+Point `endpoint` at `http://127.0.0.1:4318/v1/traces`, send a request
+through hypershunt, then open the Jaeger UI on
+`http://127.0.0.1:16686` and pick the `edge` service.
+
+At the public edge add `trust-incoming=#false`, so a stranger cannot
+choose your trace ids or force their requests to be sampled.  Leave
+it on for an instance that sits behind your own load balancer, where
+continuing the caller's trace is the point.
+
+**See also:** [Reference -- tracing](reference.md#tracing).

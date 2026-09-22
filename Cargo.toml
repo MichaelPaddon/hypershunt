@@ -145,6 +145,18 @@ argon2        = "0.5"
 # is a chrono::DateTime alias).  Name it directly here so src/ocsp.rs
 # can translate the GeneralizedTime into a std::time::SystemTime.
 chrono        = { version = "0.4", default-features = false, features = ["alloc"] }
+# OpenTelemetry span export (`server { tracing ... }`).  OTLP over
+# HTTP/protobuf only: gRPC would pull in tonic + a second HTTP/2 stack
+# for the few collectors that accept nothing else, and a Collector in
+# front covers those.  `hyper-client` reuses the hyper + rustls stack
+# already here rather than adding reqwest's.  The 0.32 line is pinned
+# by tracing-opentelemetry 0.33, which is built against it; the three
+# opentelemetry crates must move together with it.
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "hyper-client"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
+opentelemetry-http = { version = "0.32", default-features = false, features = ["hyper"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["user", "fs", "socket", "process", "signal"] }

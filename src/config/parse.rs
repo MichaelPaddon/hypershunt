@@ -305,6 +305,14 @@ pub(super) fn parse_server(
         .map(|n| parse_cache_global(n, src, name))
         .transpose()?;
 
+    let tracing = node
+        .children()
+        .and_then(|doc| {
+            doc.nodes().iter().find(|n| n.name().value() == "tracing")
+        })
+        .map(|n| parse_tracing(n, src, name))
+        .transpose()?;
+
     Ok(ServerConfig {
         state_dir: prop_str(node, "state-dir"),
         tls_defaults,
@@ -328,6 +336,7 @@ pub(super) fn parse_server(
         graceful_drain_timeout,
         upgrade_startup_timeout,
         lame_duck_timeout,
+        tracing,
     })
 }
 
@@ -458,6 +467,93 @@ fn parse_file_mode(node: &KdlNode, key: &str) -> anyhow::Result<Option<u32>> {
     u32::from_str_radix(digits, 8)
         .map(Some)
         .map_err(|_| anyhow::anyhow!("invalid octal mode: {s:?}"))
+}
+
+// Parse the optional `server { tracing ... }` node.  Scalars are
+// properties (design rule 2); `header` is a child because it carries
+// two arguments and repeats.  `endpoint` has no default: exporting a
+// service's traffic to a guessed collector is worse than not starting.
+fn parse_tracing(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<crate::config::TracingConfig> {
+    use crate::config::TracingConfig;
+
+    let line = node_line(src, node);
+    let endpoint = prop_str(node, "endpoint").ok_or_else(|| {
+        anyhow!(
+            "{name}:{line}: tracing requires \
+             endpoint=\"http://host:4318/v1/traces\""
+        )
+    })?;
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://")
+    {
+        bail!(
+            "{name}:{line}: tracing endpoint {endpoint:?} must be an \
+             http:// or https:// URL"
+        );
+    }
+
+    // KDL types a bare `1` as an integer, so accept both rather than
+    // make the operator remember to write `1.0`.
+    let sample_ratio = match node.get("sample-ratio") {
+        Some(e) => {
+            let raw = e
+                .as_float()
+                .or_else(|| e.as_integer().map(|i| i as f64))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{name}:{line}: sample-ratio must be a number \
+                         between 0 and 1"
+                    )
+                })?;
+            if !(0.0..=1.0).contains(&raw) {
+                bail!(
+                    "{name}:{line}: sample-ratio {raw} out of range; \
+                     expected 0.0 to 1.0"
+                );
+            }
+            raw
+        }
+        None => 1.0,
+    };
+
+    let timeout_secs =
+        parse_nonneg_u32(node, "timeout", 10).context("server.tracing")?;
+    if timeout_secs == 0 {
+        bail!("{name}:{line}: tracing timeout must be at least 1 second");
+    }
+
+    let mut headers = Vec::new();
+    for child in node.children().map(|d| d.nodes()).unwrap_or_default() {
+        let cl = node_line(src, child);
+        let cn = child.name().value();
+        if cn != "header" {
+            bail!(
+                "{name}:{cl}: unknown node '{cn}' in tracing{}",
+                did_you_mean(cn, &["header"])
+            );
+        }
+        let args = arg_strs(child);
+        let [hname, hvalue] = args.as_slice() else {
+            bail!(
+                "{name}:{cl}: tracing header takes exactly two \
+                 arguments: header \"Name\" \"value\""
+            );
+        };
+        headers.push((hname.clone(), hvalue.clone()));
+    }
+
+    Ok(TracingConfig {
+        endpoint,
+        sample_ratio,
+        service_name: prop_str(node, "service-name")
+            .unwrap_or_else(|| "hypershunt".to_string()),
+        trust_incoming: prop_bool(node, "trust-incoming").unwrap_or(true),
+        headers,
+        timeout_secs: timeout_secs as u64,
+    })
 }
 
 fn parse_geoip(

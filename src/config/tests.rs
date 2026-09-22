@@ -3262,3 +3262,156 @@ fn metrics_handler_parses() {
         HandlerConfig::Metrics
     ));
 }
+
+// -- server tracing block -------------------------------------------
+
+#[test]
+fn tracing_node_parses_defaults() {
+    let cfg = Config::parse(
+        r#"
+        server {
+            tracing endpoint="http://127.0.0.1:4318/v1/traces"
+}
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    let t = cfg.server.tracing.as_ref().expect("present");
+    assert_eq!(t.endpoint, "http://127.0.0.1:4318/v1/traces");
+    assert_eq!(t.sample_ratio, 1.0);
+    assert_eq!(t.service_name, "hypershunt");
+    assert!(t.trust_incoming);
+    assert!(t.headers.is_empty());
+    assert_eq!(t.timeout_secs, 10);
+}
+
+#[test]
+fn tracing_node_parses_every_knob() {
+    let cfg = Config::parse(
+        r#"
+        server {
+            tracing endpoint="https://otlp.example.com/v1/traces" \
+                    sample-ratio=0.25 service-name="edge" \
+                    trust-incoming=#false timeout=3 {
+                header "Authorization" "Bearer t"
+                header "X-Tenant" "acme"
+            }
+}
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    let t = cfg.server.tracing.as_ref().expect("present");
+    assert_eq!(t.sample_ratio, 0.25);
+    assert_eq!(t.service_name, "edge");
+    assert!(!t.trust_incoming);
+    assert_eq!(
+        t.headers,
+        vec![
+            ("Authorization".to_string(), "Bearer t".to_string()),
+            ("X-Tenant".to_string(), "acme".to_string()),
+        ]
+    );
+    assert_eq!(t.timeout_secs, 3);
+}
+
+// A bare `1` is an integer in KDL; operators shouldn't have to know
+// that when they mean "sample everything".
+#[test]
+fn tracing_sample_ratio_accepts_integer() {
+    let cfg = Config::parse(
+        r#"
+        server {
+            tracing endpoint="http://127.0.0.1:4318/v1/traces" \
+                    sample-ratio=1
+}
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.server.tracing.as_ref().expect("present").sample_ratio,
+        1.0
+    );
+}
+
+#[test]
+fn tracing_absent_by_default() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap();
+    assert!(cfg.server.tracing.is_none());
+}
+
+#[test]
+fn tracing_requires_endpoint() {
+    let err = Config::parse(
+        r#"
+        server { tracing sample-ratio=0.5 }
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("endpoint"), "{err}");
+}
+
+#[test]
+fn tracing_rejects_non_http_endpoint() {
+    let err = Config::parse(
+        r#"
+        server { tracing endpoint="127.0.0.1:4318" }
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("http://"), "{err}");
+}
+
+#[test]
+fn tracing_rejects_out_of_range_ratio() {
+    let err = Config::parse(
+        r#"
+        server {
+            tracing endpoint="http://127.0.0.1:4318/v1/traces" \
+                    sample-ratio=1.5
+}
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("out of range"), "{err}");
+}
+
+// A silently ignored typo means no traces and no explanation, so an
+// unknown child fails the parse with a suggestion.
+#[test]
+fn tracing_rejects_unknown_child_with_suggestion() {
+    let err = Config::parse(
+        r#"
+        server {
+            tracing endpoint="http://127.0.0.1:4318/v1/traces" {
+                headers "Authorization" "Bearer t"
+            }
+}
+        listener "tcp://0.0.0.0:80"
+        vhost "h" { location "/" { static root="." } }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("headers"), "{err}");
+    assert!(err.contains("header"), "{err}");
+}

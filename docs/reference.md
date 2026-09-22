@@ -1443,6 +1443,117 @@ JSON shape stay constant for downstream parsers.
 Each declared field is one more value rendered per request; declare
 the ones you intend to query, not everything that might be useful.
 
+### tracing
+
+**Child** of [`server`](#server).  Optional.
+
+Exports one span per request over OTLP so requests can be followed
+across services in a tracing backend (Jaeger, Tempo, an OpenTelemetry
+Collector, and so on).  Absent, hypershunt creates no spans, exports
+nothing, and forwards any trace headers a client sends untouched.
+
+```kdl
+server {
+    tracing endpoint="http://127.0.0.1:4318/v1/traces" sample-ratio=0.1
+}
+```
+
+Transport is OTLP over HTTP with protobuf encoding, which collectors
+conventionally serve on port 4318.  OTLP over gRPC (port 4317) is not
+supported; point hypershunt at a Collector if your backend accepts
+gRPC only.
+
+Spans are emitted for:
+
+| Span | Covers |
+|---|---|
+| `request` | One per request, on every transport (HTTP/1.1, HTTP/2, HTTP/3), including built-in endpoints.  Carries method, path, protocol version and response status. |
+| `proxy_upstream` | One per [`proxy`](#proxy-handler) attempt, so each [retry](#retry) is its own span.  Carries the upstream address and the attempt number. |
+| `auth_subrequest` | One per [subrequest auth](#auth-subrequest) call. |
+
+hypershunt adds a W3C `traceparent` header to everything it calls
+onward during a request: proxied requests (including gRPC and
+WebSocket upgrades), [CGI](#cgi), [FastCGI](#fastcgi) and
+[SCGI](#scgi) applications (which see it as `HTTP_TRACEPARENT`), and
+the subrequest auth call.  A backend that also traces attaches its
+spans to the same trace.  Any `traceparent` the client supplied is
+replaced, never forwarded.
+
+Only 5xx responses mark a span as failed; a 404 or a 401 is a correct
+answer, not an error.
+
+The exporter is built once at startup.  A `tracing` node changed and
+reloaded with SIGHUP logs a warning and keeps the old settings;
+restart hypershunt to apply it.
+
+##### endpoint (tracing)
+
+**Property** on [`tracing`](#tracing).  Required.
+
+Full URL of the collector's OTLP/HTTP traces endpoint, including the
+path.  Must be `http://` or `https://`.  There is no default: a
+guessed endpoint would export a service's traffic somewhere nobody
+asked for.
+
+##### sample-ratio (tracing)
+
+**Property** on [`tracing`](#tracing).  Default `1.0`.
+
+Fraction of traces recorded, from `0.0` to `1.0`.  Sampling is
+parent-based: a request arriving with a sampled parent is always
+recorded, so a trace is never half-captured.  The ratio therefore
+governs only the traces hypershunt starts itself.
+
+On a busy server, recording everything costs bandwidth and collector
+storage for little extra insight; `0.1` is a reasonable starting
+point.
+
+##### service-name (tracing)
+
+**Property** on [`tracing`](#tracing).  Default `"hypershunt"`.
+
+The `service.name` resource attribute, which is how this process is
+labelled in the tracing UI.  Give each instance its own name when
+several report to one collector.
+
+##### trust-incoming (tracing)
+
+**Property** on [`tracing`](#tracing).  Default `#true`.
+
+Whether to continue a trace named by the client's `traceparent`
+header.  Continuing it is what joins hypershunt's spans to a caller
+already inside your infrastructure.
+
+Set `#false` at the public edge.  An untrusted client can otherwise
+choose your trace ids, force its requests to be sampled, or attach
+traffic to a trace it has no business joining.  With it off, every
+request starts a fresh trace at hypershunt.
+
+##### timeout (tracing)
+
+**Property** on [`tracing`](#tracing).  Default `10`.
+
+Seconds to wait for one export request before abandoning it.  A
+collector that stops answering never blocks request handling: export
+runs on a background worker, and a failed export is logged and
+dropped, not retried forever.
+
+##### header (tracing)
+
+**Child** of [`tracing`](#tracing).  Repeatable.
+
+An extra header sent on every export request, for collectors that
+authenticate.  The first argument is the header name, the second its
+value.
+
+```kdl
+server {
+    tracing endpoint="https://otlp.example.com/v1/traces" {
+        header "Authorization" "Bearer <token>"
+    }
+}
+```
+
 ---
 
 ## certificate

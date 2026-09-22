@@ -176,7 +176,54 @@ impl HypershuntService {
     /// request whose body has already been adapted to `ReqBody`.
     /// Shared by the hyper TCP path and the QUIC/h3 path so both
     /// transports see identical semantics.
+    /// Wrap the pipeline in one server span per request.
+    ///
+    /// Every transport (h1, h2, h3) and every exit path -- built-in
+    /// endpoints, the 408 timeout, routed handlers -- funnels through
+    /// here, so the span's status is recorded once rather than at each
+    /// of the dozen `return`s inside `dispatch_inner`.
     pub(super) async fn dispatch(
+        self,
+        req: Request<ReqBody>,
+    ) -> Result<Response<BoxBody>, anyhow::Error> {
+        let span = tracing::info_span!(
+            "request",
+            otel.kind = "server",
+            http.request.method = %req.method(),
+            url.path = req.uri().path(),
+            network.protocol.version = http_version_str(req.version()),
+            http.response.status_code = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        );
+        // An untrusted client can name any trace it likes, so joining
+        // its trace is opt-out at the edge (`trust-incoming #false`).
+        if crate::otel::trust_incoming() {
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            // Fails only when no OTel layer is installed, i.e. when
+            // tracing is off and the parent is moot.
+            let _ = span.set_parent(crate::otel::extract(req.headers()));
+        }
+
+        let result = {
+            let span = span.clone();
+            use tracing::Instrument as _;
+            self.dispatch_inner(req).instrument(span).await
+        };
+
+        if let Ok(ref resp) = result {
+            let status = resp.status().as_u16();
+            span.record("http.response.status_code", status);
+            // Only 5xx marks the span itself failed: a 404 or a 401 is
+            // a correct answer, and marking those as errors would make
+            // every trace view red for normal traffic.
+            if resp.status().is_server_error() {
+                span.record("otel.status_code", "ERROR");
+            }
+        }
+        result
+    }
+
+    async fn dispatch_inner(
         self,
         mut req: Request<ReqBody>,
     ) -> Result<Response<BoxBody>, anyhow::Error> {

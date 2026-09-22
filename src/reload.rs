@@ -165,6 +165,21 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
         );
     }
 
+    // Tracing is built once at startup: the exporter owns a batch
+    // worker and a connection pool that a config-only reload can't
+    // safely swap.  Unlike auth this doesn't abort the reload -- the
+    // rest of the new config is still worth applying -- but the
+    // operator needs to know their edit didn't land.
+    if crate::otel::fingerprint_of(new_config.server.tracing.as_ref())
+        != crate::otel::fingerprint()
+    {
+        tracing::warn!(target: TARGET,
+            "SIGHUP: server.tracing changed; the OTLP exporter is not \
+             rebuilt on reload.  Restart hypershunt to apply the new \
+             tracing configuration."
+        );
+    }
+
     // Rebuild the named-cert registry against the new config.
     // Unchanged entries are cloned forward (no ACME re-issue);
     // added entries trigger a fresh build_cert_source_from_source

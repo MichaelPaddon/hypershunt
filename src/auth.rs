@@ -138,7 +138,7 @@ impl SubrequestAuthenticator {
                 builder = builder.header(name.clone(), val.clone());
             }
         }
-        let req = match builder.body(Empty::new()) {
+        let mut req = match builder.body(Empty::new()) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -148,7 +148,20 @@ impl SubrequestAuthenticator {
                 return Principal::Anonymous;
             }
         };
-        let resp = match self.client.request(req).await {
+        // The auth service is part of the request's critical path,
+        // so its latency belongs on the same trace as the request it
+        // is gating.  Injection happens inside the span so the auth
+        // service sees this subrequest as its parent, not the request.
+        let span = tracing::info_span!(
+            "auth_subrequest",
+            otel.kind = "client",
+            server.address = %self.url,
+        );
+        let send = async {
+            crate::otel::inject_current(req.headers_mut());
+            self.client.request(req).await
+        };
+        let resp = match tracing::Instrument::instrument(send, span).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(

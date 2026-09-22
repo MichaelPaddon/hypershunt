@@ -29,6 +29,7 @@ mod listener;
 mod matcher;
 mod metrics;
 mod oidc;
+mod otel;
 #[cfg(unix)]
 mod privdrop;
 mod proxy_proto;
@@ -55,6 +56,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 use bootstrap::{
     build_authenticator, build_cert_registry, build_cert_source,
@@ -72,7 +75,7 @@ pub(crate) type Result<T> = anyhow::Result<T>;
 /// log levels.  `EnvFilter` silently treats such a word as a *target
 /// name* (e.g. the syslog level "notice", which tracing does not know),
 /// so the filter ends up enabling only that non-existent target and
-/// disabling everything else — a baffling way to lose every log line.
+/// disabling everything else -- a baffling way to lose every log line.
 /// Directives of the form `target=level` are intentional and skipped.
 fn invalid_log_levels(raw: &str) -> Vec<&str> {
     use tracing_subscriber::filter::LevelFilter;
@@ -103,16 +106,6 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .ok(); // Err just means it was already installed.
 
-    // Disable ANSI escapes unconditionally: journald and fail2ban need
-    // plain text; journalctl adds its own colour when viewed in a terminal.
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "hypershunt=info".parse().unwrap()),
-        )
-        .init();
-
     // Warn about RUST_LOG words that aren't log levels.  This must go
     // straight to stderr, not through `tracing`: an invalid filter like
     // RUST_LOG=notice suppresses our own log targets, so a tracing
@@ -128,10 +121,67 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Disable ANSI escapes unconditionally: journald and fail2ban need
+    // plain text; journalctl adds its own colour when viewed in a
+    // terminal.  EnvFilter isn't Clone, so build one per subscriber.
+    let make_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            // A literal directive: a parse failure here would be our
+            // bug, not operator input, so fall back to the default.
+            .unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("hypershunt=info")
+            })
+    };
+    let fmt_layer = || tracing_subscriber::fmt::layer().with_ansi(false);
+
+    // The global subscriber can only be set once, and the OTLP layer
+    // needs config that hasn't been read yet -- while config loading
+    // itself emits warnings worth seeing.  So load the config under a
+    // scoped log-only subscriber, then install the real one.  (A
+    // `reload` layer would be the obvious alternative, but it refuses
+    // the downcast `tracing-opentelemetry` needs to attach trace
+    // context, which silently disables propagation.)
     let config_path = args.config;
-    let config = config::Config::load(&config_path).with_context(|| {
+    let config = {
+        let bootstrap = tracing_subscriber::registry()
+            .with(make_filter())
+            .with(fmt_layer());
+        tracing::subscriber::with_default(bootstrap, || {
+            config::Config::load(&config_path)
+        })
+    }
+    .with_context(|| {
         format!("loading config from {}", config_path.display())
     })?;
+
+    // Held until the end of main: dropping it flushes the last batch
+    // of spans.  `None` (no `tracing` block) means no exporter, no
+    // layer, and no trace-context propagation anywhere.
+    let otel = match config.server.tracing {
+        Some(ref tcfg) => Some(otel::init(tcfg)?),
+        None => None,
+    };
+    let (_otel_guard, otel_layer) = match otel {
+        Some((guard, tracer)) => (
+            Some(guard),
+            Some(tracing_opentelemetry::layer().with_tracer(tracer)),
+        ),
+        None => (None, None),
+    };
+    tracing_subscriber::registry()
+        .with(make_filter())
+        .with(fmt_layer())
+        .with(otel_layer)
+        .init();
+
+    if let Some(ref tcfg) = config.server.tracing {
+        tracing::info!(
+            endpoint = %tcfg.endpoint,
+            sample_ratio = tcfg.sample_ratio,
+            trust_incoming = tcfg.trust_incoming,
+            "tracing: exporting spans over OTLP"
+        );
+    }
 
     let proxy_count = config
         .listeners
@@ -729,6 +779,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("shutdown: drain timeout; exiting");
     }
     tracing::info!("shutdown: complete");
+    // Explicit: the guard's Drop flushes batched spans, and dropping
+    // it here (rather than at the end of scope) keeps that flush
+    // after the final log line rather than tangled up with it.
+    drop(_otel_guard);
     Ok(())
 }
 

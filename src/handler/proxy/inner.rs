@@ -834,6 +834,10 @@ impl InnerProxyClient {
             strip_hop_by_hop(&mut parts.headers);
         }
         set_forwarding_headers(&mut parts.headers, peer_ip.as_deref());
+        // Hand the backend our span, so its own spans join this trace.
+        // Every proxy transport (h1, h2, h3, gRPC, upgrades, PROXY
+        // protocol) passes through here.
+        crate::otel::inject_current(&mut parts.headers);
         parts.uri = backend_uri;
         // Don't pin the request version: hyper-util's Client picks
         // h1 or h2 based on the ALPN negotiated with the upstream.
@@ -1012,5 +1016,72 @@ mod tests {
         let key = HeaderValue::from_bytes(b"key\xff").unwrap();
         assert!(compute_ws_accept(&key).is_none());
     }
-}
 
+    fn test_client() -> InnerProxyClient {
+        // The connector builds a rustls ClientConfig even for a
+        // plaintext upstream, which needs a process-wide provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider()
+            .install_default();
+        InnerProxyClient::new(
+            "http://127.0.0.1:9999",
+            false,
+            None,
+            crate::config::ProxyUpstreamScheme::Auto,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("static upstream URL is valid")
+    }
+
+    fn empty_req(traceparent: Option<&str>) -> Request<ReqBody> {
+        use http_body_util::BodyExt;
+        let mut b = Request::builder().uri("http://example.com/app");
+        if let Some(tp) = traceparent {
+            b = b.header("traceparent", tp);
+        }
+        b.body(
+            http_body_util::Empty::<bytes::Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+        )
+        .expect("static request builds")
+    }
+
+    const CLIENT_TP: &str =
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    // The backend must be told which trace it is serving, and told by
+    // us: the client's own claim is replaced, not forwarded.
+    #[test]
+    fn backend_request_carries_our_trace_context() {
+        crate::otel::testing::with_tracing(|| {
+            let span = tracing::info_span!("request");
+            let _e = span.enter();
+            let out = test_client()
+                .prepare_backend_request(empty_req(Some(CLIENT_TP)), "/")
+                .expect("prepared");
+            let tp = out
+                .headers()
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok())
+                .expect("traceparent injected");
+            assert_ne!(tp, CLIENT_TP, "client traceparent was forwarded");
+        });
+    }
+
+    // With no collector configured hypershunt is a transparent hop:
+    // whatever the client sent goes on unchanged.
+    #[test]
+    fn backend_request_passes_client_context_when_disabled() {
+        let out = test_client()
+            .prepare_backend_request(empty_req(Some(CLIENT_TP)), "/")
+            .expect("prepared");
+        assert_eq!(
+            out.headers().get("traceparent").and_then(|v| v.to_str().ok()),
+            Some(CLIENT_TP),
+        );
+    }
+}
