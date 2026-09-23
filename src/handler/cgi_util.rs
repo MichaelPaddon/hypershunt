@@ -227,7 +227,9 @@ pub(crate) fn split_host_port(host: &str) -> (&str, &str) {
 // Parse a CGI-format response (headers + blank line + body) into a
 // hyper Response.  The Status header sets the code (default 200).
 // All other headers are forwarded verbatim.
-pub(crate) fn parse_cgi_response(stdout: &[u8]) -> anyhow::Result<HttpResponse> {
+pub(crate) fn parse_cgi_response(
+    stdout: &[u8],
+) -> anyhow::Result<HttpResponse> {
     let (header_bytes, body) =
         find_header_boundary(stdout).ok_or_else(|| {
             anyhow::anyhow!("CGI response has no header/body separator")
@@ -282,7 +284,10 @@ pub(crate) fn find_header_boundary(data: &[u8]) -> Option<(&[u8], &[u8])> {
     None
 }
 
-pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_subsequence(
+    haystack: &[u8],
+    needle: &[u8],
+) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 

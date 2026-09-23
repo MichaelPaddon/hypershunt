@@ -354,8 +354,15 @@ impl HypershuntService {
             if let Some(token) =
                 path.strip_prefix("/.well-known/acme-challenge/")
             {
-                let key_auth =
-                    state.acme_challenges.lock().expect("acme challenges mutex").get(token).cloned();
+                // A poisoned challenge map is still readable, and
+                // failing the ACME challenge here would block a cert
+                // renewal over an unrelated panic.
+                let key_auth = state
+                    .acme_challenges
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(token)
+                    .cloned();
                 if let Some(body) = key_auth {
                     let resp = Response::builder()
                         .status(StatusCode::OK)
@@ -927,10 +934,10 @@ impl HypershuntService {
                                         req.headers(),
                                         session_cookie,
                                     ) {
-                                        state.metrics.auth_failures.fetch_add(
-                                            1,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
+                                        state
+                                            .metrics
+                                            .auth_failures
+                                            .fetch_add(1, Ordering::Relaxed);
                                         crate::security::auth_failure(
                                             peer, &method, &path, &host,
                                         );
@@ -1253,11 +1260,10 @@ impl HypershuntService {
                                             hyper::header::SET_COOKIE,
                                             hval,
                                         );
-                                        state.metrics.jwt_issued
-                                            .fetch_add(
-                                                1,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
+                                        state
+                                            .metrics
+                                            .jwt_issued
+                                            .fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 Err(e) => tracing::warn!(

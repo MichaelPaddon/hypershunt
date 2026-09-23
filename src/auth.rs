@@ -24,7 +24,7 @@ pub enum Principal {
 /// Pluggable authentication mechanism.  `AnonymousAuthenticator` is
 /// the default until a real mechanism is configured.
 ///
-/// Takes only the request headers — authenticators (Basic auth, etc.)
+/// Takes only the request headers -- authenticators (Basic auth, etc.)
 /// never need the body, and restricting the input makes unit testing
 /// straightforward without requiring a real `Incoming` connection.
 #[async_trait]
@@ -60,8 +60,8 @@ impl Authenticator for OidcAuthenticator {
 // -- Subrequest auth -----------------------------------------------
 
 /// Authenticates by making an HTTP GET to a configured endpoint.
-/// Mirrors the nginx `auth_request` module: HTTP 200 → Authenticated,
-/// any other status or network error → Anonymous.
+/// Mirrors the nginx `auth_request` module: HTTP 200 -> Authenticated,
+/// any other status or network error -> Anonymous.
 ///
 /// Selected request headers (e.g. `Authorization`) are forwarded to the
 /// auth endpoint.  The authenticated identity is read from optional
@@ -298,7 +298,7 @@ impl Authenticator for LdapAuthenticator {
 /// `/` encoded as `%2F`.  An already-encoded URL (authority starts with
 /// `%2F` or `%2f`) is returned unchanged, as is any non-`ldapi://` URL.
 ///
-/// `ldapi:///var/run/slapd/ldapi`  →  `ldapi://%2Fvar%2Frun%2Fslapd%2Fldapi`
+/// `ldapi:///var/run/slapd/ldapi`  ->  `ldapi://%2Fvar%2Frun%2Fslapd%2Fldapi`
 fn normalize_ldapi_url(url: &str) -> String {
     let Some(rest) = url.strip_prefix("ldapi://") else {
         return url.to_owned();
@@ -459,14 +459,20 @@ impl FileAuthenticator {
     /// place -- operators see them in the log but auth keeps working.
     fn maybe_refresh(&self) {
         // Cheap read-lock fast-path: nothing to do if still fresh.
+        // A poisoned lock is recovered rather than propagated: the
+        // guarded table is rebuilt from the file, so a panic elsewhere
+        // must not lock every future request out.
         {
-            let s = self.state.read().unwrap();
+            let s = self.state.read().unwrap_or_else(|e| e.into_inner());
             if s.last_check.elapsed() < self.cache_ttl {
                 return;
             }
         }
-        let now_mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
-        let mut s = self.state.write().unwrap();
+        let now_mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
+        let mut s =
+            self.state.write().unwrap_or_else(|e| e.into_inner());
         // Another thread may have refreshed between the read and write
         // locks; re-check to avoid duplicate I/O.
         if s.last_check.elapsed() < self.cache_ttl {
@@ -488,7 +494,7 @@ impl FileAuthenticator {
     }
 
     fn lookup(&self, username: &str) -> Option<FileAuthEntry> {
-        let s = self.state.read().unwrap();
+        let s = self.state.read().unwrap_or_else(|e| e.into_inner());
         s.entries.get(username).cloned()
     }
 }

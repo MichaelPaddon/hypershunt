@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(binds(&d.removed), vec!["tcp://0.0.0.0:8080"]);
     }
 
-    // ── reload() end-to-end ────────────────────────────────────────
+    // -- reload() end-to-end -------------------------------------------
 
     use crate::auth::AnonymousAuthenticator;
     use crate::error::ErrorPages;
@@ -1148,7 +1148,7 @@ key "client-ip"
         assert_eq!(after_rules.len(), 0);
     }
 
-    // ── SIGUSR2 ready-pipe protocol ────────────────────────────────
+    // -- SIGUSR2 ready-pipe protocol -----------------------------------
 
     // signal_upgrade_ready() is a no-op when the env var is absent:
     // a fresh hypershunt startup (not a SIGUSR2 child) must not write

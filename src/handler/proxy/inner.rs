@@ -24,14 +24,14 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// RFC 6455 §1.3 magic string concatenated with the client's
+/// RFC 6455 section 1.3 magic string concatenated with the client's
 /// `Sec-WebSocket-Key` to derive `Sec-WebSocket-Accept`.
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// Compute the RFC 6455 `Sec-WebSocket-Accept` value for a given
 /// client-supplied `Sec-WebSocket-Key`.  Used by the upgrade-bridge
 /// only when synthesising the h1-side 101 response from an h2/h3
-/// upstream that elided the Key/Accept round-trip (RFC 8441 §5.1).
+/// upstream that elided the Key/Accept round-trip (RFC 8441 section 5.1).
 fn compute_ws_accept(key: &HeaderValue) -> Option<HeaderValue> {
     use base64::Engine as _;
     use sha1::{Digest, Sha1};
@@ -363,7 +363,10 @@ impl InnerProxyClient {
     /// increment the outbound handshake counter.  A no-op for h1/h2 +
     /// Unix variants; metrics for those flow through the request
     /// pipeline elsewhere.
-    pub(crate) fn set_metrics(&mut self, metrics: Arc<crate::metrics::Metrics>) {
+    pub(crate) fn set_metrics(
+        &mut self,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) {
         if let ProxyClient::H3(h) = &mut self.client {
             h.metrics = Some(metrics.clone());
         }
@@ -487,7 +490,8 @@ impl InnerProxyClient {
         }
         // Decide whether the tunnel must translate WebSocket frame
         // masking (issue #35).  h1 client frames are masked (RFC 6455
-        // §5.3); h2/h3 client frames are not (RFC 8441/9220 §5.5).
+        // section 5.3); h2/h3 client frames are not (RFC 8441/9220
+        // section 5.5).
         // When the inbound and outbound sides disagree on that for a
         // `websocket` upgrade, the client-to-server frames cross the
         // masking boundary and must be rewritten; otherwise the plain
@@ -520,7 +524,14 @@ impl InnerProxyClient {
         let on_upgrade_arc = marker.on_upgrade.clone();
         let inbound = marker.inbound;
         tokio::spawn(async move {
-            let inbound_on = match on_upgrade_arc.lock().expect("proxy upgrade mutex").take() {
+            // Recover a poisoned lock: the guarded value is an
+            // Option we are taking anyway, so a panic in another
+            // task must not strand this upgrade.
+            let inbound_on = match on_upgrade_arc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
                 Some(f) => f,
                 None => return,
             };
@@ -593,7 +604,7 @@ impl InnerProxyClient {
                 hyper::header::UPGRADE,
                 marker.protocol.clone(),
             );
-            // RFC 8441 §5.1: WebSocket-over-h2 omits the
+            // RFC 8441 section 5.1: WebSocket-over-h2 omits the
             // `Sec-WebSocket-Accept` round-trip (the `:protocol`
             // pseudo-header replaces it).  When bridging an h1
             // client back through, we must compute Accept
@@ -1003,7 +1014,7 @@ where
 mod tests {
     use super::*;
 
-    /// RFC 6455 §1.3 worked example.
+    /// RFC 6455 section 1.3 worked example.
     #[test]
     fn ws_accept_matches_rfc6455_example() {
         let key = HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ==");
