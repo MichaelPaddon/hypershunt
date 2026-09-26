@@ -157,7 +157,7 @@ pub struct ServerConfig {
     // acme_account.json is always written 0o600 regardless of this setting.
     pub cert_key_mode: Option<u32>,
     /// Access-log format + sink.  None means the historical default
-    /// (`tracing` format, no file sink — lines flow through the global
+    /// (`tracing` format, no file sink -- lines flow through the global
     /// tracing subscriber).
     pub access_log: Option<AccessLogConfig>,
     /// Seconds the *parent* process lingers after a successful
@@ -181,6 +181,9 @@ pub struct ServerConfig {
     /// connections start being refused.  `0` (the default) stops
     /// accepting immediately.
     pub lame_duck_timeout: u32,
+    /// OpenTelemetry span export.  `None` (no `tracing` block) means
+    /// no exporter is built and no trace context is propagated.
+    pub tracing: Option<TracingConfig>,
 }
 
 impl Default for ServerConfig {
@@ -204,6 +207,7 @@ impl Default for ServerConfig {
             // Mirror parse_server()'s default for the same key.
             upgrade_startup_timeout: 60,
             lame_duck_timeout: 0,
+            tracing: None,
         }
     }
 }
@@ -288,6 +292,31 @@ impl Default for HealthConfig {
                 .collect(),
         }
     }
+}
+
+/// OpenTelemetry (OTLP) span export.  Present only when the operator
+/// writes a `tracing` block; absence disables span creation, export
+/// and trace-context propagation alike.
+#[derive(Debug, Clone)]
+pub struct TracingConfig {
+    /// OTLP/HTTP traces endpoint, e.g.
+    /// `http://127.0.0.1:4318/v1/traces`.
+    pub endpoint: String,
+    /// Fraction of *root* traces recorded, 0.0..=1.0.  A request that
+    /// arrives with a sampled parent is always recorded (parent-based
+    /// sampling), so this only governs traces hypershunt starts.
+    pub sample_ratio: f64,
+    /// `service.name` resource attribute reported to the collector.
+    pub service_name: String,
+    /// Continue a trace advertised by an incoming `traceparent`
+    /// header.  Turn this off at the public edge, where an untrusted
+    /// client could otherwise choose our trace ids and force sampling.
+    pub trust_incoming: bool,
+    /// Extra headers sent on every export request, for collectors
+    /// that authenticate (e.g. `Authorization: Bearer ...`).
+    pub headers: Vec<(String, String)>,
+    /// Per-export timeout, in seconds.
+    pub timeout_secs: u64,
 }
 
 /// Path to a MaxMind MMDB database used for country lookups.
@@ -605,7 +634,7 @@ pub struct QuicTransport {
     /// `Some(0)` disables.  Quinn default is no keep-alive.
     pub keep_alive_interval_secs: Option<u64>,
     /// Enable 0-RTT (early data) on the TLS layer.  Per RFC 9001
-    /// §4.6.1 the NewSessionTicket `max_early_data_size` for QUIC is
+    /// section 4.6.1 the NewSessionTicket `max_early_data_size` for QUIC is
     /// fixed at `0xFFFFFFFF`; actual byte-level bounding of replayed
     /// data is performed by the QUIC `initial_max_data` transport
     /// parameter, not by the TLS layer.  The application is

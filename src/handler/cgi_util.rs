@@ -165,11 +165,35 @@ pub(crate) fn build_cgi_env(
         ("REMOTE_ADDR".into(), "0.0.0.0".into()),
     ];
 
+    // Trace context for the app: the app's own spans then join this
+    // request's trace.  Built from the active span rather than copied
+    // from the client, and emitted before the header loop so the loop
+    // can skip the client's version instead of producing a duplicate.
+    let mut trace_headers = hyper::header::HeaderMap::new();
+    crate::otel::inject_current(&mut trace_headers);
+    for (name, value) in &trace_headers {
+        if let Ok(v) = value.to_str() {
+            env.push((
+                format!(
+                    "HTTP_{}",
+                    name.as_str().to_ascii_uppercase().replace('-', "_")
+                ),
+                v.to_owned(),
+            ));
+        }
+    }
+
     // Translate HTTP headers to HTTP_* CGI variables.
     // Skip Content-Type and Content-Length; they have dedicated vars.
     for (name, value) in &parts.headers {
         let lower = name.as_str();
         if lower == "content-type" || lower == "content-length" {
+            continue;
+        }
+        // Ours already covers these; the client's claim is dropped.
+        if !trace_headers.is_empty()
+            && (lower == "traceparent" || lower == "tracestate")
+        {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -203,7 +227,9 @@ pub(crate) fn split_host_port(host: &str) -> (&str, &str) {
 // Parse a CGI-format response (headers + blank line + body) into a
 // hyper Response.  The Status header sets the code (default 200).
 // All other headers are forwarded verbatim.
-pub(crate) fn parse_cgi_response(stdout: &[u8]) -> anyhow::Result<HttpResponse> {
+pub(crate) fn parse_cgi_response(
+    stdout: &[u8],
+) -> anyhow::Result<HttpResponse> {
     let (header_bytes, body) =
         find_header_boundary(stdout).ok_or_else(|| {
             anyhow::anyhow!("CGI response has no header/body separator")
@@ -258,7 +284,10 @@ pub(crate) fn find_header_boundary(data: &[u8]) -> Option<(&[u8], &[u8])> {
     None
 }
 
-pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_subsequence(
+    haystack: &[u8],
+    needle: &[u8],
+) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
@@ -464,5 +493,60 @@ mod tests {
         let m = env_map(build_cgi_env(&p, "/var/www", "/", &None, b""));
         assert_eq!(m["SERVER_NAME"], "[::1]");
         assert_eq!(m["SERVER_PORT"], "8080");
+    }
+
+    // The app server sees the trace context as an ordinary header
+    // variable, which is all a CGI/FastCGI/SCGI app can read.
+    #[test]
+    fn build_cgi_env_carries_trace_context() {
+        crate::otel::testing::with_tracing(|| {
+            let span = tracing::info_span!("request");
+            let _e = span.enter();
+            let p = parts(
+                "GET",
+                "/app",
+                &[
+                    ("host", "example.com"),
+                    (
+                        "traceparent",
+                        "00-4bf92f3577b34da6a3ce929d0e0e4736-\
+                         00f067aa0ba902b7-01",
+                    ),
+                ],
+            );
+            let env = build_cgi_env(&p, "/var/www", "/", &None, b"");
+            // Exactly one: ours replaces the client's rather than
+            // joining it, so the app can't see two conflicting values.
+            let traceparents: Vec<_> = env
+                .iter()
+                .filter(|(k, _)| k == "HTTP_TRACEPARENT")
+                .collect();
+            assert_eq!(traceparents.len(), 1, "{env:?}");
+            assert!(
+                !traceparents[0].1.contains("00f067aa0ba902b7"),
+                "client parent id was forwarded: {:?}",
+                traceparents[0].1
+            );
+        });
+    }
+
+    // Without tracing configured the header is passed through like any
+    // other, and no variable is invented.
+    #[test]
+    fn build_cgi_env_passes_client_trace_context_when_disabled() {
+        let p = parts(
+            "GET",
+            "/app",
+            &[
+                ("host", "example.com"),
+                (
+                    "traceparent",
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-\
+                     00f067aa0ba902b7-01",
+                ),
+            ],
+        );
+        let m = env_map(build_cgi_env(&p, "/var/www", "/", &None, b""));
+        assert!(m["HTTP_TRACEPARENT"].contains("00f067aa0ba902b7"));
     }
 }

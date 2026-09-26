@@ -7,6 +7,7 @@ defaults, semantics, validation rules, and worked examples.
 Each named production below is a heading.  Nonterminals and the
 abstract terminal types ([`<string>`](#string),
 [`<integer>`](#integer), [`<boolean>`](#boolean),
+[`<number>`](#number),
 [`<bind-url>`](#bind-url), [`<host>`](#host)) link to their
 definition.
 
@@ -68,6 +69,11 @@ A KDL integer.
 ### `<boolean>`
 
 `#true` or `#false`.
+
+### `<number>`
+
+A KDL decimal, or an integer where a whole value is meant
+(`1` and `1.0` are equivalent).
 
 ---
 
@@ -164,6 +170,7 @@ Examples:
 - [`<variable-def>`](#variable-def)
 - [`<error-page-def>`](#error-page-def)
 - [`<access-log-block>`](#access-log-block)
+- [`<tracing-block>`](#tracing-block)
 
 ### `health-child`
 
@@ -259,6 +266,23 @@ value template.
 ### `access-log-format`
 
 `"tracing"` | `"json"` | `"common"` | `"combined"`
+
+### `tracing-block`
+
+- `"tracing"` `endpoint=`[`<string>`](#string) (
+  `sample-ratio=`[`<number>`](#number) )? (
+  `service-name=`[`<string>`](#string) )? (
+  `trust-incoming=`[`<boolean>`](#boolean) )? (
+  `timeout=`[`<integer>`](#integer) )? ( `{`
+  [`<tracing-header>`](#tracing-header)* `}` )?
+
+`endpoint` is required.
+
+### `tracing-header`
+
+`"header"` [`<string>`](#string) [`<string>`](#string)
+
+The first argument is the header name, the second its value.
 
 ---
 

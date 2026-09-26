@@ -24,14 +24,14 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// RFC 6455 §1.3 magic string concatenated with the client's
+/// RFC 6455 section 1.3 magic string concatenated with the client's
 /// `Sec-WebSocket-Key` to derive `Sec-WebSocket-Accept`.
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// Compute the RFC 6455 `Sec-WebSocket-Accept` value for a given
 /// client-supplied `Sec-WebSocket-Key`.  Used by the upgrade-bridge
 /// only when synthesising the h1-side 101 response from an h2/h3
-/// upstream that elided the Key/Accept round-trip (RFC 8441 §5.1).
+/// upstream that elided the Key/Accept round-trip (RFC 8441 section 5.1).
 fn compute_ws_accept(key: &HeaderValue) -> Option<HeaderValue> {
     use base64::Engine as _;
     use sha1::{Digest, Sha1};
@@ -363,7 +363,10 @@ impl InnerProxyClient {
     /// increment the outbound handshake counter.  A no-op for h1/h2 +
     /// Unix variants; metrics for those flow through the request
     /// pipeline elsewhere.
-    pub(crate) fn set_metrics(&mut self, metrics: Arc<crate::metrics::Metrics>) {
+    pub(crate) fn set_metrics(
+        &mut self,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) {
         if let ProxyClient::H3(h) = &mut self.client {
             h.metrics = Some(metrics.clone());
         }
@@ -487,7 +490,8 @@ impl InnerProxyClient {
         }
         // Decide whether the tunnel must translate WebSocket frame
         // masking (issue #35).  h1 client frames are masked (RFC 6455
-        // §5.3); h2/h3 client frames are not (RFC 8441/9220 §5.5).
+        // section 5.3); h2/h3 client frames are not (RFC 8441/9220
+        // section 5.5).
         // When the inbound and outbound sides disagree on that for a
         // `websocket` upgrade, the client-to-server frames cross the
         // masking boundary and must be rewritten; otherwise the plain
@@ -520,7 +524,14 @@ impl InnerProxyClient {
         let on_upgrade_arc = marker.on_upgrade.clone();
         let inbound = marker.inbound;
         tokio::spawn(async move {
-            let inbound_on = match on_upgrade_arc.lock().expect("proxy upgrade mutex").take() {
+            // Recover a poisoned lock: the guarded value is an
+            // Option we are taking anyway, so a panic in another
+            // task must not strand this upgrade.
+            let inbound_on = match on_upgrade_arc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
                 Some(f) => f,
                 None => return,
             };
@@ -593,7 +604,7 @@ impl InnerProxyClient {
                 hyper::header::UPGRADE,
                 marker.protocol.clone(),
             );
-            // RFC 8441 §5.1: WebSocket-over-h2 omits the
+            // RFC 8441 section 5.1: WebSocket-over-h2 omits the
             // `Sec-WebSocket-Accept` round-trip (the `:protocol`
             // pseudo-header replaces it).  When bridging an h1
             // client back through, we must compute Accept
@@ -834,6 +845,10 @@ impl InnerProxyClient {
             strip_hop_by_hop(&mut parts.headers);
         }
         set_forwarding_headers(&mut parts.headers, peer_ip.as_deref());
+        // Hand the backend our span, so its own spans join this trace.
+        // Every proxy transport (h1, h2, h3, gRPC, upgrades, PROXY
+        // protocol) passes through here.
+        crate::otel::inject_current(&mut parts.headers);
         parts.uri = backend_uri;
         // Don't pin the request version: hyper-util's Client picks
         // h1 or h2 based on the ALPN negotiated with the upstream.
@@ -999,7 +1014,7 @@ where
 mod tests {
     use super::*;
 
-    /// RFC 6455 §1.3 worked example.
+    /// RFC 6455 section 1.3 worked example.
     #[test]
     fn ws_accept_matches_rfc6455_example() {
         let key = HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ==");
@@ -1012,5 +1027,72 @@ mod tests {
         let key = HeaderValue::from_bytes(b"key\xff").unwrap();
         assert!(compute_ws_accept(&key).is_none());
     }
-}
 
+    fn test_client() -> InnerProxyClient {
+        // The connector builds a rustls ClientConfig even for a
+        // plaintext upstream, which needs a process-wide provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider()
+            .install_default();
+        InnerProxyClient::new(
+            "http://127.0.0.1:9999",
+            false,
+            None,
+            crate::config::ProxyUpstreamScheme::Auto,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("static upstream URL is valid")
+    }
+
+    fn empty_req(traceparent: Option<&str>) -> Request<ReqBody> {
+        use http_body_util::BodyExt;
+        let mut b = Request::builder().uri("http://example.com/app");
+        if let Some(tp) = traceparent {
+            b = b.header("traceparent", tp);
+        }
+        b.body(
+            http_body_util::Empty::<bytes::Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+        )
+        .expect("static request builds")
+    }
+
+    const CLIENT_TP: &str =
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    // The backend must be told which trace it is serving, and told by
+    // us: the client's own claim is replaced, not forwarded.
+    #[test]
+    fn backend_request_carries_our_trace_context() {
+        crate::otel::testing::with_tracing(|| {
+            let span = tracing::info_span!("request");
+            let _e = span.enter();
+            let out = test_client()
+                .prepare_backend_request(empty_req(Some(CLIENT_TP)), "/")
+                .expect("prepared");
+            let tp = out
+                .headers()
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok())
+                .expect("traceparent injected");
+            assert_ne!(tp, CLIENT_TP, "client traceparent was forwarded");
+        });
+    }
+
+    // With no collector configured hypershunt is a transparent hop:
+    // whatever the client sent goes on unchanged.
+    #[test]
+    fn backend_request_passes_client_context_when_disabled() {
+        let out = test_client()
+            .prepare_backend_request(empty_req(Some(CLIENT_TP)), "/")
+            .expect("prepared");
+        assert_eq!(
+            out.headers().get("traceparent").and_then(|v| v.to_str().ok()),
+            Some(CLIENT_TP),
+        );
+    }
+}

@@ -25,6 +25,7 @@ use hyper_util::rt::TokioExecutor;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tracing::Instrument as _;
 
 // Body type used for requests sent to the upstream.
 // UnsyncBoxBody matches ReqBody's looser bound (Send, !Sync) so the
@@ -288,6 +289,21 @@ impl ProxyHandler {
 
 }
 
+
+/// One client span per upstream attempt, so a retry shows up as its
+/// own row under the request rather than being folded into it.
+fn upstream_span(
+    upstream: &crate::lb::Upstream,
+    attempt: u32,
+) -> tracing::Span {
+    tracing::info_span!(
+        "proxy_upstream",
+        otel.kind = "client",
+        server.address = %upstream.url,
+        attempt,
+    )
+}
+
 #[async_trait]
 impl Handler for ProxyHandler {
     async fn handle(
@@ -351,7 +367,10 @@ impl Handler for ProxyHandler {
             let _guard = upstream.in_flight_guard();
             let req_bytes = content_length(req.headers());
             let start = std::time::Instant::now();
-            let resp = self.inners[idx].serve(req, matched_prefix).await;
+            let resp = self.inners[idx]
+                .serve(req, matched_prefix)
+                .instrument(upstream_span(&upstream, 0))
+                .await;
             self.record_upstream(&upstream, start, req_bytes, &resp);
             self.record_outcome(&upstream, resp.status().as_u16());
             return resp;
@@ -396,6 +415,7 @@ impl Handler for ProxyHandler {
             let start = std::time::Instant::now();
             let resp = self.inners[idx]
                 .serve(attempt_req, matched_prefix)
+                .instrument(upstream_span(&upstream, attempt))
                 .await;
             self.record_upstream(
                 &upstream,
@@ -788,17 +808,40 @@ mod tests {
         }
     }
 
+    // ProxyHandler::new takes nine arguments, most of which no test
+    // varies; these keep the call sites readable.
+    fn handler_for(upstream: &str) -> anyhow::Result<ProxyHandler> {
+        handler_with_proxy_protocol(upstream, None)
+    }
+
+    fn handler_with_proxy_protocol(
+        upstream: &str,
+        proxy_protocol: Option<ProxyProtocolVersion>,
+    ) -> anyhow::Result<ProxyHandler> {
+        ProxyHandler::new(
+            upstream,
+            false,
+            proxy_protocol,
+            crate::config::ProxyUpstreamScheme::Auto,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+    }
+
     // -- ProxyHandler::new scheme validation ----------------------
 
     #[test]
     fn new_accepts_http_upstream() {
-        assert!(ProxyHandler::new("http://backend:8080", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None).is_ok());
+        assert!(handler_for("http://backend:8080").is_ok());
     }
 
     #[test]
     fn new_accepts_https_upstream() {
         assert!(
-            ProxyHandler::new("https://backend:8443", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None).is_ok(),
+            handler_for("https://backend:8443").is_ok(),
             "https upstream should be accepted"
         );
     }
@@ -806,7 +849,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn new_accepts_unix_upstream() {
-        let h = ProxyHandler::new("unix:/run/app.sock", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None);
+        let h = handler_for("unix:/run/app.sock");
         assert!(h.is_ok(), "unix: upstream should be accepted on unix");
         // The internal URI collapses to localhost so that Host header
         // is a sensible value for the backend.
@@ -817,18 +860,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn new_unix_upstream_uses_http_localhost_uri() {
-        let h = ProxyHandler::new("unix:/run/app.sock", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None).unwrap();
+        let h = handler_for("unix:/run/app.sock").unwrap();
         assert_eq!(h.upstream().scheme_str(), Some("http"));
     }
 
     #[test]
     fn new_rejects_invalid_scheme() {
-        assert!(ProxyHandler::new("ftp://backend", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None).is_err());
+        assert!(handler_for("ftp://backend").is_err());
     }
 
     #[test]
     fn new_rejects_missing_host() {
-        assert!(ProxyHandler::new("http:///path", false, None, crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None).is_err());
+        assert!(handler_for("http:///path").is_err());
     }
 
     // -- build_backend_uri -----------------------------------------
@@ -1019,10 +1062,10 @@ mod tests {
     fn proxy_protocol_accepted_for_unix_upstream() {
         use crate::config::ProxyProtocolVersion;
         // unix: + proxy-protocol is now supported; new() must succeed.
-        let h = ProxyHandler::new(
+        let h = handler_with_proxy_protocol(
             "unix:/run/app.sock",
-            false,
-            Some(ProxyProtocolVersion::V2), crate::config::ProxyUpstreamScheme::Auto, None, None, false, None, None);
+            Some(ProxyProtocolVersion::V2),
+        );
         assert!(h.is_ok(), "unix + proxy-protocol should be accepted");
     }
 
@@ -1212,8 +1255,14 @@ mod tests {
     #[test]
     fn parse_alt_svc_h3_basic() {
         use super::inner::parse_alt_svc_h3;
-        assert_eq!(parse_alt_svc_h3("h3=\":443\"; ma=86400"), Some((443, 86400)));
-        assert_eq!(parse_alt_svc_h3("h3=\":8443\"; ma=3600; persist=1"), Some((8443, 3600)));
+        assert_eq!(
+            parse_alt_svc_h3("h3=\":443\"; ma=86400"),
+            Some((443, 86400))
+        );
+        assert_eq!(
+            parse_alt_svc_h3("h3=\":8443\"; ma=3600; persist=1"),
+            Some((8443, 3600))
+        );
         // First h3 entry wins when multiple are advertised.
         assert_eq!(
             parse_alt_svc_h3("h3-29=\":443\"; ma=3600, h3=\":443\"; ma=7200"),
@@ -1413,7 +1462,10 @@ mod tests {
         );
 
         let (version, te) =
-            seen.lock().expect("test mutex").clone().expect("backend saw a request");
+            seen.lock()
+                .expect("test mutex")
+                .clone()
+                .expect("backend saw a request");
         assert_eq!(version, hyper::Version::HTTP_2);
         assert_eq!(te.as_deref(), Some("trailers"));
     }
